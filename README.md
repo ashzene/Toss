@@ -44,4 +44,4 @@ Needs an Apple silicon Mac with macOS 14+, and an iPad with iPadOS 17+ (17.4+ fo
 
 ## License
 
-GPL-3.0
+[MIT](LICENSE)
