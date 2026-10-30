@@ -1,17 +1,11 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/banner-dark.png">
-    <img src="docs/images/banner-light.png" alt="Toss. Press two keys. Your iPad right in the chat." width="880">
-  </picture>
+  <img src="docs/images/banner-dark.png" alt="Toss. Press two keys. Your iPad right in the chat." width="880">
 </p>
 
 Toss is a Mac menu-bar app that drops a screenshot of your iPad into the ChatGPT, Codex or Claude chat you have open. It only adds the picture to your draft; you still press Send.
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/demo-shortcut-dark.gif">
-    <img src="docs/images/demo-shortcut.gif" alt="Left and right Option together add the iPad screenshot to the open ChatGPT draft; left and right Shift together do the same in Claude." width="792">
-  </picture>
+  <img src="docs/images/demo-shortcut-dark.gif" alt="Left and right Option together add the iPad screenshot to the open ChatGPT draft; left and right Shift together do the same in Claude." width="792">
 </p>
 
 ## Shortcuts
@@ -28,10 +22,7 @@ Works over USB or Wi‑Fi, whichever is connected.
 Toss brings the right window forward first, then captures and attaches.
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/demo-any-window-dark.gif">
-    <img src="docs/images/demo-any-window.gif" alt="Both Option keys go down, ChatGPT comes to the front and the iPad screenshot lands in its input box. Then both Shift keys go down, Claude comes to the front and a new screenshot lands in its input box." width="792">
-  </picture>
+  <img src="docs/images/demo-any-window-dark.gif" alt="Both Option keys go down, ChatGPT comes to the front and the iPad screenshot lands in its input box. Then both Shift keys go down, Claude comes to the front and a new screenshot lands in its input box." width="792">
 </p>
 
 ## Get started
