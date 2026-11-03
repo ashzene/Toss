@@ -1,0 +1,45 @@
+Wireless transport provenance
+
+vendor/remote_pairing_transport.py and vendor/system_bonjour.py are derived from
+an earlier, device-tested local prototype. On 2026-10-15 the companion copies gained a
+dual-stack DNS-SD settle optimization and per-request endpoint deduplication;
+they are no longer byte-for-byte copies. These two changes have synthetic test
+coverage but no new real-device timing validation. Authentication, route checks,
+timeouts and screenshot freshness checks were not weakened.
+The companion exposes only the Wi-Fi capture
+entry point. The transport module retains its original initial USB bootstrap
+implementation for source fidelity, but capture_once.py never calls it and no
+bootstrap command is exposed by this backend.
+
+vendor/ipad_probe.py contains only the original ProbeFailure and fingerprint
+helpers. vendor/wifi_transport.py contains only the host LAN interface lookup
+(Wi-Fi first, then active Ethernet), extended from the original wifi_interface
+helper. Older direct-lockdown/USB transport and setup commands are not included
+in these minimal support modules. No upstream files were modified.
+
+pymobiledevice3 11.31.0
+Project: https://github.com/doronz88/pymobiledevice3
+Inspected commit: 06f3c1c786e11b94c5e20f7d31a3b283f133fa0c
+License: GNU General Public License v3.0, included at
+licenses/pymobiledevice3-LICENSE. The new transport uses and subclasses its
+protocol types. It is not an Apple-supported screenshot API guarantee.
+The original source can be obtained from the URL and exact commit above.
+No prebuilt pymobiledevice3 library is embedded; requirements-tested.txt records
+the exact installed dependency set. Installed libraries retain their own license
+and source metadata in the configured Python environment.
+
+Other directly used runtime libraries:
+- Pillow 13.0.0: https://github.com/python-pillow/Pillow (HPND / MIT-CMU)
+- cryptography 50.0.2: https://github.com/pyca/cryptography (Apache-2.0 OR BSD-3-Clause)
+- psutil 7.2.2: https://github.com/giampaolo/psutil (BSD-3-Clause)
+
+The native application and this backend are separate processes; no third-party
+native app or automatic-paste GitHub binary is downloaded or embedded here.
+
+Bundled runtime (0.6.0)
+The app includes CPython 3.13.15 from python-build-standalone release 20260929
+(https://github.com/astral-sh/python-build-standalone), distributed under the
+Python Software Foundation License; it statically includes OpenSSL 3.5.9
+(Apache License 2.0) and other libraries listed in that project's
+distribution metadata. The Python packages pinned in requirements-tested.txt
+are included unmodified under their own licenses.

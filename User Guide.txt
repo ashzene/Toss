@@ -1,0 +1,52 @@
+Toss 1.0.0 — User Guide
+
+One app, one installation
+The menu bar icon, connection panel, screenshot service, and runtime are all included in Toss.app. No separate menu bar component or installer is needed. The icon appears whenever Toss is running; closing Settings keeps it running.
+
+Install
+1. Open the disk image and open Toss, or drag Toss into Applications.
+2. This test build is not notarized by Apple. If macOS blocks it, review the notice in System Settings → Privacy & Security and use Open Anyway if you trust this build.
+3. If Toss asks, click Install and Open. It copies the complete app to Applications and removes the download quarantine flag from this app only. macOS may ask for your Mac password. If administrator access is declined, Toss can use your personal Applications folder.
+4. The menu bar feature is ready as soon as Toss opens. No extra install is required.
+
+Requirements
+• Apple Silicon Mac (M1 or later), macOS 14 or later.
+• iPad running iPadOS 17 or later.
+• A USB data cable for the first pairing.
+• Both devices on the same local network. Your Mac may use Wi-Fi or Ethernet; your iPad may use Wi-Fi or a hotspot. Guest and campus networks may block device discovery.
+• ChatGPT / Codex and/or Claude desktop app.
+
+First setup
+Connect your iPad via USB and unlock it. Toss begins pairing automatically. Tap Trust and enter the passcode if your iPad asks. Developer Mode is also required: follow Toss's prompts on the iPad, including restarting and confirming Developer Mode. Keep USB connected until pairing is complete. The first developer image download needs internet access.
+
+Allow Accessibility access for Toss in System Settings → Privacy & Security → Accessibility. Confirm with Touch ID or your password. Input Monitoring is not required. Allow local network access if macOS asks. Shortcuts enable automatically when pairing and permissions are ready.
+
+Capture into the current chat
+• Press left and right Option together for ChatGPT / Codex.
+• Press left and right Shift together for Claude.
+• Release the keys after pressing. Keep your iPad unlocked.
+Toss brings the target app forward and adds one new screenshot to its current chat. It preserves the existing draft and attachments. Review the attachment and send the message yourself. It never sends automatically or retries a paste that may already have happened.
+
+Menu bar status
+Click the Toss icon to see iPad connection status and screenshot progress. The icon is the ⌥ symbol with a solid up arrow. While a screenshot is uploading, only the arrow moves up and down, blue when sending to Codex and orange when sending to Claude; the ⌥ stays still. When processing ends, the arrow stops and returns to its normal colour.
+
+Check Connection checks the existing pairing without taking or pasting a screenshot. Connection errors appear inside the panel. Use Settings for pairing and permissions, or Diagnostics for technical details. Right-click the icon to access the full menu, including Quit Toss.
+
+Close the status panel with its × button, Escape, another click on the icon, or a click outside. It also closes when you switch apps. If a crowded menu bar or the camera housing hides the icon, Connection Status in Toss's application menu opens the panel near the top-right corner instead of anchoring it to an invisible icon.
+
+Launch at Login
+Toss remembers whether shortcuts are enabled and offers Launch at Login. Disabling shortcuts stops automatic resumption; quitting preserves your setting. Turning off Launch at Login does not turn off shortcuts in the current session. No screenshot is taken on launch, reconnect, or wake.
+
+If a capture fails
+Open Diagnostics, or choose Copy Diagnostics when you want to share the report. It contains status, permission checks, timings, and sanitized error codes, not chat text, screenshots, or device keys. Capture failures do not show an alert; a failed keypress plays one soft, low two-note sound (a cancel caused by your own typing or clicking stays silent). If paste was requested but not confirmed, inspect the draft before trying again.
+
+Limitations
+The target chat, composer, and draft must be verifiable. Unsupported layouts, ambiguous windows, selected text, an open modal, or changes during capture may stop the operation. Claude project pages are not supported. Wait for a Codex response to finish before capturing. Keep the iPad unlocked; lock-screen detection cannot reliably identify every locked or protected screen.
+
+The menu panel and English UI were checked on this Mac. This update does not establish a fresh end-to-end iPad capture test; wireless capture must be verified with a reachable iPad. Network changes, long idle periods, and other device models may need additional testing.
+
+Privacy and files
+Toss requests one screenshot per shortcut; it does not continuously record the iPad screen. It uses authenticated pairing and local communication. Pairing files are stored in ~/Library/Application Support/Toss/DeviceState and should not be shared. Screenshot caches are in ~/Library/Caches/Toss. Do not share these folders in diagnostics.
+
+Uninstall
+Open Toss → Settings → Uninstall Toss… and confirm Uninstall. Toss stops its capture and pairing processes, attempts to unregister its login item, removes its local pairing files, settings and screenshot cache, then moves itself to the Trash and quits. If it cannot move itself, Finder selects the app and asks you to drag Toss to the Trash. The Accessibility permission is kept so a reinstall works at once; you can remove it in System Settings → Privacy & Security → Accessibility. Trust and Developer Mode settings on your iPad are unchanged.

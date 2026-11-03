@@ -1,0 +1,44 @@
+Rebuilding the Python environment (instructions only; not executed)
+
+The known working interpreter is:
+  /Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13
+Verified locally: Python 3.13.15, OpenSSL 3.0.21,
+  hasattr(ssl.SSLContext, "set_psk_client_callback") == True
+The Python version alone is insufficient: this PSK callback must exist.
+Do not use Apple's /usr/bin/python3 or a system interpreter with unknown SSL
+support for this transport. Tested with a Python 3.13 virtual environment built from requirements-tested.txt.
+
+From the unpacked source folder Toss, these commands create a
+separate environment. Choose an unused directory if python-3.13-rebuilt exists:
+
+  /Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13 -m venv \
+    "$HOME/Library/Application Support/Toss/python-3.13-rebuilt"
+
+  "$HOME/Library/Application Support/Toss/python-3.13-rebuilt/bin/python" \
+    -m pip install -r "Backend/requirements-tested.txt"
+
+  "$HOME/Library/Application Support/Toss/python-3.13-rebuilt/bin/python" \
+    -c 'import ssl,sys,importlib.metadata; assert sys.version_info[:2] == (3,13); assert hasattr(ssl.SSLContext,"set_psk_client_callback"); assert importlib.metadata.version("pymobiledevice3") == "11.31.0"; print(sys.version, ssl.OPENSSL_VERSION)'
+
+  TOSS_PYTHON="$HOME/Library/Application Support/Toss/python-3.13-rebuilt/bin/python" \
+    ./scripts/test-backend.sh
+
+The exact requirement file is Backend/requirements-tested.txt, shipped beside
+capture_once.py. It pins the complete previously working dependency set. A
+fresh download/rebuild is not verified here; package availability and build
+support can change. The app bundle does not embed or copy this virtualenv.
+
+For a release, pass the prepared runtime to scripts/build-release.py --runtime.
+The standalone backend can use the new environment's absolute
+bin/python path after those checks pass. Keep "state_dir" pointing to the
+original owner-only initial setup state. Do not put pairing records in the
+source/release bundle and do not print them for diagnostics. Rebuilding Python
+does not pair the iPad, install/mount the developer image or restore dev-mode.
+
+Required app resource files:
+- Resources/Backend/capture_once.py
+- Resources/Backend/vendor/{remote_pairing_transport,system_bonjour,ipad_probe,wifi_transport}.py
+- Resources/Backend/requirements-tested.txt and documentation/license notices
+
+No dependency or source file uses an absolute source-workspace path at runtime;
+the app resolves its bundled interpreter and its own Application Support state directory.
