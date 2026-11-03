@@ -7,20 +7,16 @@ Toss is a Mac menu-bar app that drops a screenshot of your iPad into the ChatGPT
 ### Press two keys. Your iPad right in the chat.
 
 <p align="center">
-  <img src="docs/images/demo-shortcut-dark.gif" alt="Left and right Option together add the iPad screenshot to the open ChatGPT draft." width="792">
+  <img src="docs/images/demo-shortcut-dark.gif" alt="Left and right Option add the iPad screenshot to ChatGPT; left and right Shift add it to Claude." width="792">
 </p>
 
 ### Works wherever the chat window is
 
-<p align="center">
-  <img src="docs/images/demo-any-window-dark.gif" alt="A past paper is in front. Both Shift keys go down, Claude comes to the front and the iPad screenshot lands in its input box." width="792">
-</p>
+The chat does not have to be in front. Press the shortcut while you are reading a past paper or anything else, and Toss brings the right window forward, attaches the screenshot and leaves you in the chat.
 
 ### Wired or wireless, your call
 
-<p align="center">
-  <img src="docs/images/demo-usb-wifi-dark.gif" alt="A USB cable plugs into the Mac and the Toss menu shows the iPad connected over USB; unplug it and Toss is back on Wi-Fi." width="792">
-</p>
+The same two keys work either way. Plug the iPad in and Toss uses the cable; unplug it and Toss goes back to Wi‑Fi on its own. The menu-bar icon shows which one is in use.
 
 ## Shortcuts
 

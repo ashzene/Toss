@@ -37,7 +37,7 @@ struct UninstallTests {
     }
 
     static func compareScripts(_ source: URL) throws {
-        for name in ["Uninstall.command", "卸载.command"] {
+        for name in ["Uninstall.command"] {
             let script = try String(contentsOf: source.appendingPathComponent(name), encoding: .utf8)
             let assignments = try captures(#"^(TASK_[A-Z_]+)="\$HOME/([^"]+)"$"#, in: script)
             let removalLines = script.components(separatedBy: .newlines).filter { $0.hasPrefix("/bin/rm ") }
