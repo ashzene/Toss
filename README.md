@@ -27,6 +27,8 @@ The same two keys work either way. Plug the iPad in and Toss uses the cable; unp
 
 Toss brings the right chat window forward first, then captures and attaches. Works over USB or Wi‑Fi, whichever is connected.
 
+Since 1.0.4, you can also add an iPad screenshot to ChatGPT’s Dot. Open Dot and press both Option keys together; the screenshot stays in the draft until you send it.
+
 ## Get started
 
 1. Download the latest [release](https://github.com/ashzene/Toss/releases/latest) and drag Toss into Applications.
