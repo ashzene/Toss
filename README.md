@@ -31,9 +31,11 @@ Since 1.0.4, you can also add an iPad screenshot to ChatGPT’s Dot. Open Dot an
 
 ## Get started
 
-1. Download the latest [release](https://github.com/ashzene/Toss/releases/latest) and drag Toss into Applications.
+1. Download the latest [release](https://github.com/ashzene/Toss/releases/latest), open the disk image, and double-click **Toss Installer**. In its window, drag Toss into Applications; Toss installs and opens its setup guide automatically.
 2. Connect your iPad with a USB data cable the first time, tap **Trust** and turn on **Developer Mode**. Toss guides you through it.
 3. After that, pairing is done. Toss reconnects by itself.
+
+Until an iPad is paired, opening Toss from the Dock or clicking its menu-bar icon brings the setup guide back, even if you closed it earlier.
 
 Needs an Apple silicon Mac with macOS 14+, and an iPad with iPadOS 17+ (17.4+ for USB).
 
