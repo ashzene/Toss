@@ -23,7 +23,28 @@ enum CaptureProgressPolicy {
 // retains no screenshot for reuse. All results still pass CaptureReceipt before
 // any target focus or paste. Cancelling invalidates the whole process generation.
 @MainActor
+// USB data dropped while the device still has power: the cable is in, so say so. At most every ten minutes.
+struct USBDropNotice {
+    static let quietSeconds = 600.0
+    private var lastShown: Double?
+    mutating func shouldShow(externalConnected: Bool?, usbBack: Bool, at now: Double) -> Bool {
+        guard externalConnected == true, !usbBack else { return false }
+        if let lastShown, now - lastShown < Self.quietSeconds { return false }
+        lastShown = now
+        return true
+    }
+}
+
 final class CaptureWorkerProcess {
+    // The bundled runtime must not pick up anything from the launching environment.
+    static var backendEnvironment: [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        environment["PYTHONNOUSERSITE"] = "1"
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        environment.removeValue(forKey: "PYTHONPATH")
+        environment.removeValue(forKey: "PYTHONHOME")
+        return environment
+    }
     // Keep even recently retired children until they exit. Uninstall must drain
     // the whole owned process pool, not just the current dictionary of workers.
     private static var ownedProcesses: [Process] = []
@@ -73,12 +94,15 @@ final class CaptureWorkerProcess {
     static let reconnectingFailures: Set<String> = ["timeout", "first_byte_timeout", "stall_timeout", "too_slow",
                                                     "disconnected", "slow_threshold"]
 
-    // Wi-Fi's first-byte threshold remains advisory. Once bytes have arrived, a
-    // 1.2 s stall ends a serial transfer; this does not discard later keypresses.
+    // Wi-Fi's first-byte threshold remains advisory. Once bytes have arrived, a stall
+    // ends a serial transfer (2.5 s, 1.2 s on USB); this does not discard later keypresses.
+    // Keep in sync with CaptureReceipt and Backend/capture_timing.py. The 30 s cap
+    // is only reached while real bytes keep arriving; silence still expires early.
+    static let maximumTransferDuration: Double = 30
     static let progressLimitDefaults: [(key: String, field: String, value: Double, range: ClosedRange<Double>)] = [
         ("firstByteLimitMs", "first_byte", 800, 200...5000),
-        ("stallLimitMs", "stall", 1200, 200...5000),
-        ("pressCapMs", "press_cap", 8000, 800...8000)]
+        ("stallLimitMs", "stall", 2500, 200...5000),
+        ("pressCapMs", "press_cap", maximumTransferDuration * 1000, 800...(maximumTransferDuration * 1000))]
     static func progressLimits(_ defaults: UserDefaults = .standard) -> [String: Double] {
         var limits: [String: Double] = [:]
         for item in progressLimitDefaults {
@@ -193,12 +217,7 @@ final class CaptureWorkerProcess {
         process.arguments? += ["--transport", role.transport, "--worker-role", role.rawValue]
         if role == .wifiPrimary { process.arguments?.append("--watch-usb") }
         if preconnect { process.arguments?.append("--preconnect") }
-        var environment = ProcessInfo.processInfo.environment
-        environment["PYTHONNOUSERSITE"] = "1"
-        environment["PYTHONDONTWRITEBYTECODE"] = "1"
-        environment.removeValue(forKey: "PYTHONPATH")
-        environment.removeValue(forKey: "PYTHONHOME")
-        process.environment = environment
+        process.environment = Self.backendEnvironment
         process.standardInput = incoming
         process.standardOutput = outgoing
         process.standardError = FileHandle.nullDevice
@@ -412,7 +431,8 @@ final class CaptureWorker {
         let id: String, file: URL, configuration: Configuration, timeout: Double
         let limits: [String: Double], started = ProcessInfo.processInfo.systemUptime
         let completion: (Data, Int32) -> Void
-        var hardDeadline: Double { started + min(8, timeout, (limits["press_cap"] ?? 8000) / 1000) }
+        var hardDeadline: Double { started + min(CaptureWorkerProcess.maximumTransferDuration, timeout,
+            (limits["press_cap"] ?? CaptureWorkerProcess.maximumTransferDuration * 1000) / 1000) }
         var normalDeadline: Double { min(hardDeadline, started + 4.5) }
         var lastByteAt: Double?
         var receivedByAttempt: [String: Double] = [:]
@@ -457,6 +477,8 @@ final class CaptureWorker {
     private var workers: [CaptureWorkerRole: CaptureWorkerProcess] = [:]
     private var configuration: Configuration?
     private var usbPresent = false
+    var usbConnected: Bool { usbPresent }
+    var onUSBLost: (() -> Void)?
     private var usbFatalReason: String?
     private var usbRetry: DispatchWorkItem?
     private var wifiRetry: DispatchWorkItem?
@@ -583,7 +605,7 @@ final class CaptureWorker {
               let exempt = value["slow_threshold_exempt"] as? Bool,
               started >= transaction.started - 0.05,
               started <= ProcessInfo.processInfo.systemUptime + 0.05,
-              end >= started, end <= started + 8.05 else {
+              end >= started, end <= started + CaptureWorkerProcess.maximumTransferDuration + 0.05 else {
             finishFailure(transaction, reason: "capture_integrity_failed"); return
         }
         let ownEnd = transaction.hardDeadline
@@ -641,13 +663,16 @@ final class CaptureWorker {
 
     private func usbPresence(_ present: Bool) {
         guard !wifiOnly else { return }
+        let lost = usbPresent && !present
         usbPresent = present
+        if lost { onUSBLost?() }
         if present, let configuration {
             let usb = worker(.usbPrimary)
             if !usb.isBusy {
                 do { try usb.prepare(configuration: configuration) }
                 catch { /* Its connection status, or the Wi-Fi route, remains visible. */ }
             }
+            moveDirectPressToUSB()
         } else {
             usbFatalReason = nil; usbRetry?.cancel(); usbRetry = nil
             // Invalidate the attempt before closing its process. A queued USB
@@ -661,6 +686,25 @@ final class CaptureWorker {
             cleanStoppedFiles(role: .usbPrimary)
         }
         refreshConnection()
+    }
+
+    // A cable arrived while a press waits on Wi-Fi. USB answers in a fraction of a second, and a weak
+    // Wi-Fi press would otherwise run out its budget and fail with the cable already in. The Wi-Fi child
+    // is retired first, so its reply can never race this attempt for the press's single image.
+    private func moveDirectPressToUSB() {
+        guard let transaction = pending, !transaction.routed, usbFatalReason == nil,
+              transaction.deadline - ProcessInfo.processInfo.systemUptime >= 0.05,
+              let configuration,
+              transaction.file.deletingLastPathComponent().standardizedFileURL.path ==
+                URL(fileURLWithPath: configuration.outputDirectory).standardizedFileURL.path else { return }
+        transaction.routed = true
+        workers.removeValue(forKey: .wifiPrimary)?.stop()
+        cleanStoppedFiles(role: .wifiPrimary)
+        // Only attempt files belong in this set once routed; finish() deletes all of them.
+        transaction.files.remove(transaction.file)
+        Self.discard(transaction.file)
+        replenish(.wifiPrimary) // It also watches for the cable leaving again.
+        startUSBWhenIdle(transaction)
     }
 
     private func scheduleUSBRecovery() {
@@ -760,7 +804,8 @@ final class CaptureWorker {
             do {
                 try worker(.wifiPrimary).capture(configuration: configuration, requestID: requestID,
                     file: file, timeout: timeout, limits: transaction.limits, pressStarted: transaction.started) { [weak self] data, exit in
-                    guard let self, self.pending === transaction else { return }
+                    // The press may have moved to a cable that just appeared (moveDirectPressToUSB).
+                    guard let self, self.pending === transaction, !transaction.routed else { return }
                     guard ProcessInfo.processInfo.systemUptime < transaction.deadline else {
                         self.finishFailure(transaction, reason: "timeout"); return
                     }
@@ -801,7 +846,7 @@ final class CaptureWorker {
     // messages cannot renew it, and a completed RPC needs no further bytes while
     // PNG validation runs. The normal/hard budgets retain their original origin.
     private func watchStall(_ transaction: Transaction, key: String, role: CaptureWorkerRole, lastByte: Double) {
-        let end = lastByte + (transaction.limits["stall"] ?? 1200) / 1000
+        let end = lastByte + (Self.attemptLimits(transaction.limits, role: role)["stall"] ?? 2500) / 1000
         DispatchQueue.main.asyncAfter(deadline: .now() + max(0, end - ProcessInfo.processInfo.systemUptime)) { [weak self, weak transaction] in
             guard let self, let transaction, self.pending === transaction,
                   transaction.lastByteByAttempt[key] == lastByte,
@@ -837,6 +882,12 @@ final class CaptureWorker {
         return .wifiPrimary
     }
 
+    // A cable has no retransmit wait, so USB keeps the short stall limit and falls back to Wi-Fi sooner.
+    static func attemptLimits(_ limits: [String: Double], role: CaptureWorkerRole) -> [String: Double] {
+        guard role == .usbPrimary, let stall = limits["stall"] else { return limits }
+        return limits.merging(["stall": min(stall, 1200)]) { _, new in new }
+    }
+
     private func startAttempt(_ transaction: Transaction, role: CaptureWorkerRole) {
         guard pending === transaction, !transaction.usedRoles.contains(role) else { return }
         let now = ProcessInfo.processInfo.systemUptime
@@ -852,7 +903,7 @@ final class CaptureWorker {
         do {
             try worker(role).capture(configuration: transaction.configuration, requestID: transaction.id,
                 file: path, timeout: transaction.timeout, attemptID: id, deadline: transaction.hardDeadline,
-                limits: transaction.limits,
+                limits: Self.attemptLimits(transaction.limits, role: role),
                 screenshotDeadline: role.transport == "wifi" ? transaction.wifiDeadline : nil,
                 pressStarted: transaction.started) { [weak self] data, exit in
                 guard let self, self.pending === transaction, transaction.active[id] != nil else {

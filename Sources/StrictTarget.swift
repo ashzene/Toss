@@ -110,9 +110,15 @@ enum ComposerLabelPolicy {
         "Do anything", "随心输入", "想做什麼都可以", "輸入任何任務",
         "New chat in this project", "此项目中的新聊天", "此專案中的新對話", "在此項目中開始新對話"
     ]
+    // ChatGPT's "Your Dot" page: restricted.aeonMessaging.roomUi.messageInput in app 26.1027.
+    // "Message" is a generic word, so it only counts together with the Dot row's proof
+    // (SidebarIdentityPolicy) and only where no ordinary composer is present.
+    // Only the languages whose attachment labels isRemoveMarker can read: elsewhere a paste could never be confirmed.
+    static let dotLabels: Set<String> = ["Message", "消息", "訊息"]
+    static func dot(_ label: String) -> Bool { dotLabels.contains(label) }
     static func existing(_ label: String) -> Bool { established.contains(label) }
     static func accepts(_ label: String) -> Bool {
-        if existing(label) || newLabels.contains(label) { return true }
+        if existing(label) || newLabels.contains(label) || dot(label) { return true }
         return [("New chat in ", ""), ("在“", "”中新建聊天"), ("在 ", " 中開始新對話")].contains {
             label.hasPrefix($0.0) && label.hasSuffix($0.1) && label.count > $0.0.count + $0.1.count
         }
@@ -188,7 +194,7 @@ enum NewDraftIdentityPolicy {
     }
 }
 
-enum ThreadListKind: String { case chats, pinned, threadRows }
+enum ThreadListKind: String { case chats, pinned, threadRows, dot }
 
 // This projection is also used by the pure tests. It contains no AX operations.
 struct SidebarIdentityNode<Key: Equatable> {
@@ -228,7 +234,8 @@ enum SidebarIdentityPolicy {
     static let pinnedLabels: Set<String> = ["Pinned", "置顶", "已固定", "已釘選"]
 
     static func analyze<Key: Equatable>(nodes: [SidebarIdentityNode<Key>], webArea: Int,
-                                        composer: Int, documentRoutes: Set<String>) -> SidebarIdentityAnalysis<Key> {
+                                        composer: Int, documentRoutes: Set<String>,
+                                        dotComposer: Bool = false, documentTitle: String? = nil) -> SidebarIdentityAnalysis<Key> {
         var kinds = Set<ThreadListKind>()
         var lists = Set<Int>()
         var candidates: [(button: Int, list: Int, kind: ThreadListKind)] = []
@@ -263,6 +270,20 @@ enum SidebarIdentityPolicy {
         }
         for index in nodes.indices where nodes[index].role == "AXButton" {
             let node = nodes[index]
+            // The Dot's row is not a thread row: page-current inside a sidebar list, named like the open
+            // document, is its proof (the label may add an unread count after the name, and the Dot can be
+            // renamed, so no fixed name). The nav rail's Home button is also current, but not in a list.
+            if dotComposer, !node.hidden, node.current == "page", !node.classes.contains(threadClass),
+               let title = documentTitle, !title.isEmpty, node.labels.contains(where: { $0.hasPrefix(title) }),
+               let chain = ancestors(index), !chain.contains(composer),
+               !chain.contains(where: { nodes[$0].hidden }),
+               chain.first(where: { nodes[$0].role == "AXWebArea" }) == webArea,
+               let listPosition = chain.firstIndex(where: { nodes[$0].role == "AXList" }),
+               let webPosition = chain.firstIndex(of: webArea), listPosition < webPosition {
+                kinds.insert(.dot); lists.insert(chain[listPosition])
+                candidates.append((index, chain[listPosition], .dot))
+                continue
+            }
             guard !node.hidden, node.classes.contains("sidebar-item"), node.classes.contains(threadClass),
                   let chain = ancestors(index), !chain.contains(composer),
                   !chain.contains(where: { nodes[$0].hidden }),
@@ -281,6 +302,10 @@ enum SidebarIdentityPolicy {
         }
         guard candidates.count <= 1 else { return result(nil, .currentThreadsAmbiguous) }
         guard documentRoutes.count <= 1 else { return result(nil, .conversationConflict) }
+        // A composer labelled like the Dot's is only accepted on the Dot's page.
+        if dotComposer, candidates.first?.kind != .dot {
+            return result(nil, lists.isEmpty ? .threadListUnavailable : .currentThreadUnavailable)
+        }
         guard let current = candidates.first else {
             if let route = documentRoutes.first { return result(.route(route)) }
             return result(nil, lists.isEmpty ? .threadListUnavailable : .currentThreadUnavailable)
@@ -290,7 +315,9 @@ enum SidebarIdentityPolicy {
         guard routes.count <= 1 else { return result(nil, .conversationConflict, routes: routes.count) }
         return result(.sidebar(SidebarConversationProof(button: nodes[current.button].key,
             list: nodes[current.list].key, webArea: nodes[webArea].key, kind: current.kind,
-            buttonLabel: nodes[current.button].labels, routeEvidence: routes.sorted())), routes: routes.count)
+            // The Dot's row label carries its unread count, which changes while the press runs.
+            buttonLabel: current.kind == .dot ? [] : nodes[current.button].labels,
+            routeEvidence: routes.sorted())), routes: routes.count)
     }
 }
 
@@ -509,7 +536,7 @@ final class StrictTarget {
     // may use it to restore its clipboard after a user edit, never to claim success.
     private(set) var latestPasteConsumptionConfirmed = false
     // Text the user typed into the leased composer while the screenshot was on its way
-    // (2026-10-28: never give up, paste in the original place). The readback compares
+    // (Ashley 2026-10-28: never give up, paste in the original place). The readback compares
     // against it instead of the text at the keypress.
     private var acceptedDraftText: String?
     private(set) var latestPasteConsumptionFilename: String?
@@ -741,6 +768,9 @@ final class StrictTarget {
                   let webIndex = chain.first(where: { nodes[$0].role == "AXWebArea" }),
                   CFEqual(nodes[webIndex].element, lease.webArea) else { return false }
             switch lease.conversation {
+            case .sidebar(let proof) where proof.kind == .dot:
+                return CFEqual(node.element, proof.button.element) &&
+                    chain.contains(where: { CFEqual(nodes[$0].element, proof.list.element) })
             case .sidebar(let proof):
                 let labels = ["AXDescription", "AXTitle"].compactMap { string(node.element, $0) }
                 let classes = value(node.element, "AXDOMClassList") as? [String] ?? []
@@ -1021,6 +1051,7 @@ final class StrictTarget {
             }
         }
         var composers: [Int] = []
+        var dotComposers: [Int] = []
         for index in nodes.indices {
             let node = nodes[index]
             guard ["AXTextArea", "AXTextField"].contains(node.role) else { continue }
@@ -1028,11 +1059,13 @@ final class StrictTarget {
             let values = try inspectionAttributes(index, nodes: nodes,
                 names: ["AXEnabled", "AXHidden"] + labels, cache: &attributes)
             guard values["AXEnabled"] as? Bool == true, values["AXHidden"] as? Bool != true else { continue }
-            if labels.contains(where: { (values[$0] as? String).map(ComposerLabelPolicy.accepts) ?? false }) {
-                composers.append(index)
-            }
+            let found = labels.compactMap { values[$0] as? String }.filter(ComposerLabelPolicy.accepts)
+            if found.contains(where: { !ComposerLabelPolicy.dot($0) }) { composers.append(index) }
+            else if !found.isEmpty { dotComposers.append(index) }
         }
         try checkInspectionBudget()
+        // A stray "Message" field never competes with an ordinary composer.
+        if composers.isEmpty { composers = dotComposers }
         diagnosticSummary += "; composers=\(composers.count)"
         guard composers.count == 1, let index = composers.first else { throw TargetFailure.composerUnavailable }
         let composer = nodes[index].element
@@ -1105,6 +1138,7 @@ final class StrictTarget {
         var projected = nodes.map {
             SidebarIdentityNode(key: AXIdentityKey(element: $0.element), parent: $0.parent, role: $0.role)
         }
+        let dotComposer = !composerLabels.isEmpty && composerLabels.allSatisfy(ComposerLabelPolicy.dot)
         var classesSupported = 0; var classesUnavailable = 0
         var currentSupported = 0; var currentUnavailable = 0
         func belongsToComposerDocument(_ index: Int) -> Bool {
@@ -1147,11 +1181,16 @@ final class StrictTarget {
                 if let raw = Self.urlString(from: threadValues["AXURL"]) {
                     projected[index].route = Self.conversationRoute(raw)
                 }
+            } else if dotComposer {
+                let rowValues = try inspectionAttributes(index, nodes: nodes, names: ["AXARIACurrent"], cache: &cache)
+                projected[index].current = rowValues["AXARIACurrent"] as? String
             }
         }
         try checkInspectionBudget()
         let analysis = SidebarIdentityPolicy.analyze(nodes: projected, webArea: webAreaIndex,
-                                                     composer: composerIndex, documentRoutes: documentIDs)
+                                                     composer: composerIndex, documentRoutes: documentIDs,
+                                                     dotComposer: dotComposer,
+                                                     documentTitle: string(nodes[webAreaIndex].element, "AXTitle"))
         diagnosticSummary = "stage=identity; \(analysis.diagnostic); buttonClassSupported=\(classesSupported); buttonClassUnavailable=\(classesUnavailable); threadCurrentSupported=\(currentSupported); threadCurrentUnavailable=\(currentUnavailable)"
         // A stale selected sidebar row must not turn a visible new-home page
         // into an established-chat identity. Inspect only actual main landmarks.
@@ -1167,13 +1206,13 @@ final class StrictTarget {
             projected[index].hidden = values["AXHidden"] as? Bool == true
         }
         if let identity = analysis.identity {
-            guard composerLabels.contains(where: ComposerLabelPolicy.existing),
+            guard composerLabels.contains(where: { ComposerLabelPolicy.existing($0) || ComposerLabelPolicy.dot($0) }),
                   !mainLandmarks.contains(where: {
                       projected[$0].classes.contains(NewDraftIdentityPolicy.homeClass) && !projected[$0].hidden
                   }) else { throw TargetFailure.conversationConflict }
             return (identity, projected)
         }
-        guard [.threadListUnavailable, .currentThreadUnavailable].contains(analysis.failure) else {
+        guard !dotComposer, [.threadListUnavailable, .currentThreadUnavailable].contains(analysis.failure) else {
             throw analysis.failure ?? TargetFailure.conversationUnavailable
         }
         // Existing chats only add the main-landmark conflict check above. For an unthreaded composer,

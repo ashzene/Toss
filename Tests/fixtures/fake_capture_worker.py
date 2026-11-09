@@ -88,9 +88,9 @@ def main():
             identity = {"schema_version": 1, "request_id": request["request_id"]}
             if "attempt_id" in request: identity["attempt_id"] = request["attempt_id"]
             emit({**identity, "event": "capture_started", "capture_started_monotonic": started,
-                  "screenshot_deadline_monotonic": request.get("deadline_monotonic", request.get("press_started_monotonic", started) + 8),
+                  "screenshot_deadline_monotonic": request.get("deadline_monotonic", request.get("press_started_monotonic", started) + request.get("limits_ms", {}).get("press_cap", 30000) / 1000),
                   "slow_threshold_ms": 1000, "slow_sample_count": 20, "slow_threshold_exempt": False})
-            duration = 5.6 if mode == "flow-12mb" else 10 if mode == "flow-too-long" else 1.3
+            duration = {"flow-12mb": 5.6, "flow-slow-wifi": 10, "flow-too-long": 32}.get(mode, 1.3)
             total = 12 * 1024 * 1024
             while time.monotonic() - started < duration:
                 elapsed = time.monotonic() - started
@@ -247,6 +247,8 @@ def main():
                 time.sleep(30)
             if mode == "usb-version-delayed" and args.transport == "wifi":
                 time.sleep(0.3)
+            if mode == "usb-arrives" and args.transport == "wifi":
+                time.sleep(30)
             if args.transport == "usb":
                 if mode in ("usb-progress-late", "usb-stall-late", "usb-tooslow-late", "usb-budget", "usb-held-after-fallback"):
                     time.sleep(1.25 if mode == "usb-budget" else 0.08)

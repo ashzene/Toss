@@ -3,9 +3,13 @@ import asyncio
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -104,7 +108,7 @@ class RedactionTests(unittest.TestCase):
 
     def test_normalized_and_apostrophe_device_names(self):
         from urllib.parse import quote
-        for name in ("Alex's iPhone", "Ａｌｅｘ的手机", "Cafe\u0301 iPad", "Ａ"):
+        for name in ("Ashley's iPhone", "Ａｓｈｌｅｙ的手机", "Cafe\u0301 iPad", "Ａ"):
             self.client.all_values["DeviceName"] = name
             for form in (name, json.dumps(name)[1:-1], repr(name)[1:-1], quote(name, safe="")):
                 with self.subTest(name=name, form=form):
@@ -133,6 +137,7 @@ class EnableFixture:
         self.events = []
         self.reveal_error = None
         self.enable_hook = None
+        self.reveal_hook = None
         owner = self
 
         class FakeAMFI:
@@ -149,6 +154,8 @@ class EnableFixture:
 
             async def reveal_developer_mode_option_in_ui(self):
                 owner.calls.append(("reveal", owner.now))
+                if owner.reveal_hook:
+                    owner.reveal_hook()
                 if owner.reveal_error:
                     raise owner.reveal_error
 
@@ -156,9 +163,12 @@ class EnableFixture:
                 owner.calls.append(("accept", owner.now))
                 owner.client.status = True
 
+        real_sleep = asyncio.sleep
+
         async def sleep(seconds):
             self.sleeps.append(seconds)
             self.now += seconds
+            await real_sleep(0)
 
         for patcher in (mock.patch("pymobiledevice3.services.amfi.AmfiService", FakeAMFI),
                         mock.patch.object(dm, "time", SimpleNamespace(monotonic=lambda: self.now)),
@@ -329,6 +339,85 @@ class EnableTests(EnableFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.logs()[-1]["event"], "devmode_enable_failed")
 
 
+class RevealTests(EnableFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_return_value_and_changed_errors_only(self):
+        failures = dm.RevealFailures()
+        self.assertTrue(await dm.reveal(self.client, state=self.state, failures=failures))
+        for message in ["one", "one", "two", "two"]:
+            self.reveal_error = AmfiError(message)
+            self.assertFalse(await dm.reveal(self.client, state=self.state, failures=failures))
+        self.assertEqual([line["devmode_reveal_error"] for line in self.logs()], ["AmfiError: one", "AmfiError: two"])
+        self.assertEqual(self.diagnostics, {})
+
+    async def test_first_answer_is_logged_once_per_run(self):
+        repeater = dm.RevealRepeater(self.state)
+        for _ in range(2):
+            self.assertTrue(await repeater.first(self.client))
+        self.assertEqual([line["event"] for line in self.logs()], ["devmode_reveal_ok"])
+
+    async def test_slow_reveal_never_blocks_tick_or_overlaps_and_is_cancelled(self):
+        repeater = dm.RevealRepeater(self.state)
+        gate = asyncio.Event()
+        async def blocked():
+            await gate.wait()
+        # Use a blocked reconnect instead, to exercise the entire timeout scope.
+        factory = mock.AsyncMock(side_effect=blocked)
+        repeater.tick(factory)
+        await asyncio.sleep(0)
+        first = repeater.task
+        for _ in range(5):
+            self.now += 3
+            repeater.tick(factory)
+            self.assertIs(repeater.task, first)
+        await repeater.close()
+        self.assertTrue(first.cancelled())
+        self.assertEqual(factory.await_count, 1)
+
+    async def test_request_timeout_is_logged_and_retries(self):
+        repeater = dm.RevealRepeater(self.state)
+        async def blocked():
+            await asyncio.Event().wait()
+        with mock.patch.object(dm, "REQUEST_TIMEOUT", 0.005):
+            repeater.tick(blocked)
+            await repeater.task
+        self.assertIn("TimeoutError", self.logs()[-1]["devmode_reveal_error"])
+        self.now = 3
+        repeater.tick(mock.AsyncMock(return_value=self.client))
+        await repeater.task
+        self.assertEqual([call[0] for call in self.calls], ["reveal"])
+        await repeater.close()
+
+
+class ParentWatchTests(unittest.TestCase):
+    PARENT = ("import subprocess, sys; p = subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]], "
+              "stdout=subprocess.PIPE, text=True); print(p.stdout.readline().strip(), flush=True)")
+
+    def assert_child_ends_with_parent(self, child):
+        """Real processes: the parent exits once the child has printed its pid."""
+        backend = str(Path(setup.__file__).parent)
+        result = subprocess.run([sys.executable, "-c", self.PARENT, child, backend], capture_output=True, text=True, timeout=30)
+        pid = int(result.stdout.strip())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        os.kill(pid, signal.SIGKILL)
+        self.fail("setup process outlived its parent")
+
+    def test_setup_process_ends_with_its_parent(self):
+        self.assert_child_ends_with_parent(
+            "import os, sys, time; sys.path.insert(0, sys.argv[1]); import setup_device as s; "
+            "s.exit_with_parent(poll_seconds=0.05); print(os.getpid(), flush=True); time.sleep(30)")
+
+    def test_setup_process_ends_if_parent_left_before_the_watch_started(self):
+        self.assert_child_ends_with_parent(
+            "import os, sys, time; sys.path.insert(0, sys.argv[1]); import setup_device as s; "
+            "print(os.getpid(), flush=True); time.sleep(1); s.exit_with_parent(poll_seconds=0.05); time.sleep(30)")
+
+
 class SetupIntegrationTests(EnableFixture, unittest.IsolatedAsyncioTestCase):
     """Run actual auto/next/Emitter with fake USB, lockdown and AMFI edges."""
     async def asyncSetUp(self):
@@ -353,6 +442,7 @@ class SetupIntegrationTests(EnableFixture, unittest.IsolatedAsyncioTestCase):
         self.outcomes = [DeviceHasPasscodeSetError()]
         with contextlib.redirect_stdout(self.output):
             self.assertEqual(await setup.next_step(self.state), "developer_mode_needed")
+        self.assertEqual([call[0] for call in self.calls], ["enable", "reveal"])
         line = self.lines()[-1]
         self.assertEqual((line["schema_version"], line["ok"], line["final"], line["devmode_passcode"]), (1, False, True, 1))
         self.assertEqual(line["model"], self.client.product_type)
@@ -391,13 +481,27 @@ class SetupIntegrationTests(EnableFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.lines()[-1]["devmode_passcode"], 0)
         self.assertIn("PasswordRequiredError", self.lines()[-1]["devmode_enable_error"])
 
-    async def test_auto_manual_fallback_runs_once_and_timeout_keeps_diagnostics(self):
+    async def test_auto_enable_runs_once_reveal_repeats_and_timeout_keeps_diagnostics(self):
         self.outcomes = [AmfiError("Busy")] * 3
         with contextlib.redirect_stdout(self.output):
             self.assertEqual(await setup.auto(self.state), "setup_timeout")
-        self.assertEqual([call[0] for call in self.calls], ["enable", "enable", "enable", "reveal"])
+        self.assertEqual([call[0] for call in self.calls].count("enable"), 3)
+        reveals = [call[1] for call in self.calls if call[0] == "reveal"]
+        self.assertGreaterEqual(len(reveals), 2)
+        # The first reveal is awaited inside enable; the repeats run every 3 s after it.
+        self.assertLessEqual(reveals[1] - reveals[0], 4.5)
+        self.assertTrue(all(b - a == 3 for a, b in zip(reveals[1:], reveals[2:])))
         self.assertEqual([line["code"] for line in self.lines()], ["developer_mode_needed", "setup_timeout"])
         self.assertEqual(self.lines()[-1]["devmode_enable_error"], "AmfiError: Busy")
+
+    async def test_auto_guide_says_look_only_after_the_first_reveal_answered(self):
+        self.outcomes = [DeviceHasPasscodeSetError()]
+        seen = []
+        self.reveal_hook = lambda: seen.append(self.output.getvalue())
+        with contextlib.redirect_stdout(self.output):
+            await setup.auto(self.state)
+        self.assertNotIn("developer_mode_needed", seen[0])
+        self.assertIn("developer_mode_needed", self.output.getvalue())
 
     async def test_auto_permanently_locked_stops_at_setup_deadline(self):
         self.outcomes = [PasswordRequiredError()]
@@ -406,6 +510,87 @@ class SetupIntegrationTests(EnableFixture, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await setup.auto(self.state), "setup_timeout")
         self.assertEqual([line["code"] for line in self.lines()], ["unlock_needed", "setup_timeout"])
         self.assertEqual(len(self.calls), 1)
+
+    async def run_manual_reconnect(self, absence, *, enabled_after=None, accept_success=False,
+                                   locked_after_return=0):
+        self.outcomes = [DeviceHasPasscodeSetError()]
+        disappeared = 1.5
+        returned = disappeared + absence
+        observations = []
+        emitter = setup.Emitter()
+        def progress(ok, code, **fields):
+            observations.append((self.now, code))
+            emitter(ok, code, **fields)
+        async def devices(_):
+            return [] if disappeared <= self.now < returned else [self.entry]
+        async def connect(*_):
+            if returned <= self.now < returned + locked_after_return:
+                raise ConnectionError("locked")
+            if enabled_after is not None and self.now >= returned + enabled_after:
+                self.client.status = True
+            return self.client
+        setup.usb_ipads.side_effect = devices
+        setup.lockdown_for.side_effect = connect
+        with mock.patch.object(setup, "emit", progress), \
+             mock.patch.object(setup, "try_accept_developer_mode", mock.AsyncMock(return_value=accept_success)) as accept, \
+             mock.patch.object(setup, "AUTO_LIMIT_SECONDS", returned + 99), contextlib.redirect_stdout(self.output):
+            result = await setup.auto(self.state)
+        return returned, observations, accept.await_count, result
+
+    async def test_three_second_replug_never_confirms_and_keeps_revealing(self):
+        returned, events, accepts, _ = await self.run_manual_reconnect(3)
+        self.assertEqual(accepts, 0)
+        self.assertNotIn("developer_mode_confirm", [code for _, code in events])
+        self.assertIn((returned, "developer_mode_needed"), events)
+        self.assertTrue(any(call[0] == "reveal" and call[1] >= returned for call in self.calls))
+
+    async def test_thirty_second_restart_holds_confirm_for_ninety_seconds(self):
+        returned, events, accepts, _ = await self.run_manual_reconnect(30)
+        self.assertEqual(accepts, 5)
+        waiting = [(t, code) for t, code in events if returned <= t < returned + 90]
+        self.assertTrue(waiting)
+        self.assertTrue(all(code == "developer_mode_confirm" for _, code in waiting))
+        self.assertIn((returned + 90, "developer_mode_needed"), events)
+        reveals = [call[1] for call in self.calls if call[0] == "reveal"]
+        self.assertTrue(any(returned <= t < returned + 90 for t in reveals))
+        self.assertTrue(any(t >= returned + 90 for t in reveals))
+
+    async def test_accept_success_without_status_change_does_not_shorten_confirm(self):
+        returned, events, accepts, _ = await self.run_manual_reconnect(30, accept_success=True)
+        self.assertEqual(accepts, 5)
+        self.assertFalse(any(code == "developer_mode_needed" and returned <= t < returned + 90
+                             for t, code in events))
+        self.assertIn((returned + 90, "developer_mode_needed"), events)
+
+    async def test_developer_mode_enabled_during_confirm_finishes_pairing(self):
+        returned, events, accepts, result = await self.run_manual_reconnect(30, enabled_after=21)
+        self.assertEqual(result, "ready")
+        self.assertEqual(accepts, 5)
+        self.assertIn((returned + 21, "ready"), events)
+        setup.finish_pairing.assert_awaited_once()
+        self.assertFalse(any(code == "developer_mode_needed" and t >= returned for t, code in events))
+
+    async def test_exact_fifteen_seconds_counts_as_restart(self):
+        returned, events, accepts, _ = await self.run_manual_reconnect(15)
+        self.assertEqual(accepts, 5)
+        self.assertIn((returned, "developer_mode_confirm"), events)
+
+    async def test_confirm_deadline_starts_at_usb_return_before_unlock(self):
+        returned, events, accepts, _ = await self.run_manual_reconnect(30, locked_after_return=30)
+        self.assertEqual(accepts, 5)
+        self.assertIn((returned + 30, "developer_mode_confirm"), events)
+        self.assertIn((returned + 90, "developer_mode_needed"), events)
+
+    async def test_reveal_failure_is_redacted_deduplicated_and_enable_reason_kept(self):
+        self.outcomes = [DeviceHasPasscodeSetError()]
+        self.reveal_error = AmfiError("failed " + self.client.udid + "; DeviceName=" + json.dumps(self.client.all_values["DeviceName"]))
+        with contextlib.redirect_stdout(self.output):
+            await setup.auto(self.state)
+        failures = [line for line in self.logs() if line["event"] == "devmode_reveal_failed"]
+        self.assertEqual(len(failures), 1)
+        self.assertNotIn(self.client.udid, failures[0]["devmode_reveal_error"])
+        self.assertNotIn(self.client.all_values["DeviceName"], failures[0]["devmode_reveal_error"])
+        self.assertIn("DeviceHasPasscodeSetError", self.lines()[-1]["devmode_enable_error"])
 
     async def test_emitter_bounds_fields_deduplicates_and_keeps_final(self):
         emitter = setup.Emitter()

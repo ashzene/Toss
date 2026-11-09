@@ -1,6 +1,6 @@
 import AppKit
 
-// Step-by-step first setup (2026-10-29: one step at a time, not everything at once). One step per
+// Step-by-step first setup (Ashley 2026-10-29: 「应该是一步步引导而不是全部一起显示」). One step per
 // screen in the Settings look. Steps 3–7 follow Backend/setup_device.py `auto` codes unchanged; the
 // pairing flow itself (cable, Trust, one Developer Mode restart) is the existing one. USB alone never
 // counts as set up: the wireless step turns green only on the final "ready" code.
@@ -12,7 +12,7 @@ enum OnboardingStep: Int, CaseIterable {
 
 enum OnboardingMark: Equatable { case none, wait, ok, fail }
 
-// Whether Toss's menu-bar icon can be seen (2026-10-30). macOS 26 has no API to
+// Whether Toss's menu-bar icon can be seen (Ashley 2026-10-30: 「顶上没有 toss」). macOS 26 has no API to
 // turn on an app's own "Allow in the Menu Bar" switch, so Toss detects it and walks the user to it.
 enum MenuIconVisibility: Equatable { case visible, hidden, notch }
 enum MenuIconPolicy {
@@ -27,23 +27,31 @@ enum MenuIconPolicy {
 }
 
 enum OnboardingLanguage: Equatable {
-    case chinese, english
-    // Settings → Language (default: follow the system), like the rest of Toss.
-    static func current() -> Self { AppLanguage.isChinese ? .chinese : .english }
-    // Following the system: Chinese only when the first preferred language is Chinese.
-    static func current(_ preferred: [String]) -> Self {
-        AppLanguage.resolvesToChinese(choice: .system, preferred: preferred) ? .chinese : .english
+    case chinese, english, other(AppLanguage)
+    init(_ language: AppLanguage) {
+        switch language {
+        case .chinese: self = .chinese
+        case .english, .system: self = .english
+        default: self = .other(language)
+        }
     }
+    // Settings → Language (default: follow the system), like the rest of Toss.
+    static func current() -> Self { Self(AppLanguage.current) }
+    // Following the system: its first language, or English when Toss doesn't have it.
+    static func current(_ preferred: [String]) -> Self { Self(AppLanguage.resolve(choice: .system, preferred: preferred)) }
 }
 
 // Pure state of the onboarding; no AppKit, so the rules are tested on their own.
 struct OnboardingFlow: Equatable {
-    var step: OnboardingStep = .welcome
+    var step: OnboardingStep = .welcome {
+        didSet { if step != oldValue { developerModeNeededSince = nil } }
+    }
     var accessibility = false
     var code: String?            // latest setup_device.py code
     var final = false            // that code ended the run
     var ipados: String?
     var waitingForUSBSince: Double?
+    var developerModeNeededSince: Double?
     var trustSince: Double?      // first trust_needed, for the replug hint after 30 s
     var tossed = false
     var menuIcon: MenuIconVisibility = .visible
@@ -52,12 +60,23 @@ struct OnboardingFlow: Equatable {
     var standaloneMenuBar = false    // shown alone at a later launch, not as part of setup
     var relaunching = false     // step 2: granted, Toss is reopening itself
     var accessRequestedAt: Double? // when System Settings was opened for step 2
+    static let developerModeHintAfter = 15.0
+    mutating func updateTime(at now: Double) {
+        if step == .devmode && code == "developer_mode_needed" && !final {
+            if developerModeNeededSince == nil { developerModeNeededSince = now }
+        } else { developerModeNeededSince = nil }
+    }
+    func showsDeveloperModeHint(at now: Double) -> Bool {
+        guard step == .devmode, code == "developer_mode_needed", !final,
+              let since = developerModeNeededSince else { return false }
+        return now - since >= Self.developerModeHintAfter
+    }
     static let chargeOnlyHintAfter = 20.0
     static let staleAccessHintAfter = 30.0
 
     // Fallback only: a running Toss may not see a new grant until it relaunches (2026-10-29). Toss
     // checks from a fresh process and relaunches by itself; this button covers the rare miss.
-    // No manual remove/re-add instructions (they made people uninstall).
+    // No manual remove/re-add instructions (Ashley: 「我看到这个以后我直接就卸载了」).
     func showsStaleAccessHint(at now: Double) -> Bool {
         guard step == .access, !accessibility, !relaunching, let since = accessRequestedAt else { return false }
         return now - since >= Self.staleAccessHintAfter
@@ -88,8 +107,10 @@ struct OnboardingFlow: Equatable {
     var number: Int { step.rawValue + 1 - (!includesMenuBar && step.rawValue > OnboardingStep.menubar.rawValue ? 1 : 0) }
 
     mutating func receive(code: String, final: Bool, ipados: String?, at now: Double) {
+        if self.code != code || self.final != final { developerModeNeededSince = nil }
         self.code = code
         self.final = final
+        updateTime(at: now)
         if let ipados { self.ipados = ipados }
         if code == "no_usb_ipad" { if waitingForUSBSince == nil { waitingForUSBSince = now } } else { waitingForUSBSince = nil }
         if code == "trust_needed" { if trustSince == nil { trustSince = now } } else { trustSince = nil }
@@ -101,7 +122,7 @@ struct OnboardingFlow: Equatable {
         guard step.isSetup, step != .wifi, let stage = setupStage else { return false }
         return stage.rawValue > step.rawValue
     }
-    // Every step the Mac can detect moves on by itself (2026-10-29);
+    // Every step the Mac can detect moves on by itself (Ashley 2026-10-29: 「最好都是全自动的」);
     // only what macOS or the iPad makes the user do by hand waits for them.
     var autoNext: OnboardingStep? {
         if advancesBySetup { return setupStage }
@@ -151,17 +172,20 @@ struct OnboardingFlow: Equatable {
     }
     var showsBack: Bool { !standaloneMenuBar && [.access, .menubar, .cable, .tryIt, .done].contains(step) }
     var skippable: Bool { step == .tryIt && !tossed }
+    // A waiting pairing step has no other button, so it can always be stopped.
+    func showsCancel(setupRunning: Bool, at now: Double) -> Bool { setupRunning && step.isSetup && mark(at: now) == .wait }
 }
 
-// When the onboarding opens by itself: on first run or while no iPad is paired, but only until it
-// was closed once (finished, cable only, or dismissed); after that "Set Up iPad…" opens it.
+// Launch-time policy. USBSetupPolicy separately offers each newly inserted,
+// trusted, unpaired device once per insertion; manual setup remains available.
 enum OnboardingPolicy {
     static let seenKey = "Toss.onboardingSeen"
     static let wirelessKey = "Toss.wirelessSetUp" // false after a failed wireless step or "cable only"
     static let resumeAccessKey = "Toss.onboardingResumeAccess" // set just before a relaunch from step 2
     static let autoRelaunchKey = "Toss.accessAutoRelaunchAt" // last automatic relaunch for Accessibility
-    static func opensAutomatically(paired: Bool, firstRun: Bool, seen: Bool) -> Bool { !seen && (!paired || firstRun) }
-    // Closed on the welcome step before Start (2026-11-02: a stray close while working in another
+    static func opensAutomatically(paired: Bool, firstRun: Bool, seen: Bool) -> Bool { !paired || (firstRun && !seen) }
+    static func opensFromIcon(paired: Bool, guideVisible: Bool) -> Bool { !paired || guideVisible }
+    // Closed on the welcome step before Start (2026-11-02: a stray close while Ashley worked in another
     // app) is not "seen": the guide is offered again at the next launch. Any later step counts.
     static func closeMarksSeen(step: OnboardingStep) -> Bool { step != .welcome }
 }
@@ -169,7 +193,13 @@ enum OnboardingPolicy {
 // Every visible string in both languages.
 struct OnboardingCopy {
     let language: OnboardingLanguage
-    private func t(_ zh: String, _ en: String) -> String { language == .chinese ? zh : en }
+    private func t(_ zh: String, _ en: String) -> String {
+        switch language {
+        case .chinese: return zh
+        case .english: return en
+        case .other(let code): return Translations.text(en, language: code)
+        }
+    }
 
     var windowTitle: String { t("设置 Toss", "Set Up Toss") }
     func stepLine(_ flow: OnboardingFlow) -> String {
@@ -179,7 +209,9 @@ struct OnboardingCopy {
     }
     var back: String { t("返回", "Back") }
     var skip: String { t("跳过", "Skip") }
+    var cancel: String { t("取消", "Cancel") }
     var cableOnly: String { t("先只用数据线", "Use cable only for now") }
+    var developerModeHint: String { t("没看到「开发者模式」？把 iPad 上的「设置」从后台划掉再打开。", "Don't see Developer Mode? Swipe Settings away and open it again.") }
     var reopen: String { t("重新打开 Toss", "Reopen Toss") }
     var cableOnlyStatus: String { t("只能插线用，无线还没设好", "Cable only · wireless isn't set up yet") }
     func settingUpStatus(code: String) -> String {
@@ -200,7 +232,7 @@ struct OnboardingCopy {
         case .done: return t("设置完成", "You're All Set")
         }
     }
-    // One short grey line under each title (2026-10-30).
+    // One short grey line under each title (Ashley 2026-10-30: 「所有这种灰色的字还是一行吧」).
     func why(_ step: OnboardingStep) -> String {
         switch step {
         case .welcome: return t("按一下快捷键，iPad 屏幕就贴进 ChatGPT、Codex 或 Claude。",
@@ -210,7 +242,7 @@ struct OnboardingCopy {
         case .cable: return t("第一次配对要用线，之后不插线也能用。", "The first pairing needs a cable. After that, no cable needed.")
         case .trust: return t("让这台 iPad 允许这台 Mac 连接它。", "This lets your iPad accept this Mac.")
         case .devmode: return t("截图需要它，只开一次。iPad 会重启一次，数据线别拔。", "Screenshots need it. Your iPad restarts once; keep the cable in.")
-        case .prepare: return t("正在建立无线配对、装截图组件，需要联网，约 1 分钟。", "Setting up wireless and screenshots. Needs internet, about a minute.")
+        case .prepare: return t("正在建立无线配对、下载截图组件，可能要几分钟。", "Setting up wireless and screenshots. Can take a few minutes.")
         case .wifi: return t("拔掉线也能用。Mac 和 iPad 要连同一个 Wi-Fi。", "Works without the cable. Mac and iPad need the same Wi-Fi.")
         case .tryIt: return t("打开一个聊天按快捷键，截图只进草稿，不会发送。", "Open a chat and press a shortcut. It only goes into the draft.")
         case .done: return t("以后直接按快捷键，点菜单栏的 Toss 图标看状态。", "Just press a shortcut. Click Toss in the menu bar for status.")
@@ -218,7 +250,7 @@ struct OnboardingCopy {
     }
 
     // "Main line\nextra" shows the extra part as a smaller, muted second line, like a Settings row
-    // and its note (2026-10-30). No parentheses in the UI text.
+    // and its note (Ashley 2026-10-30, p1/p2). No parentheses in the UI text.
     static func split(_ text: String) -> (main: String, extra: String?) {
         guard let cut = text.firstIndex(of: "\n") else { return (text, nil) }
         let extra = String(text[text.index(after: cut)...])
@@ -238,8 +270,8 @@ struct OnboardingCopy {
         case .cable: return [t("用数据线把 iPad 连到这台 Mac", "Connect the iPad to this Mac with the cable"), t("解锁 iPad", "Unlock the iPad")]
         case .trust: return [t("iPad 上会弹出「要信任此电脑吗？」", "Your iPad asks \u{201C}Trust This Computer?\u{201D}"),
                              t("点「信任」，再输入 iPad 密码", "Tap Trust, then enter the iPad passcode")]
-        case .devmode: return [t("打开「设置」，点「隐私与安全性」", "Open Settings, tap Privacy & Security"),
-                               t("滑到最下面，点「开发者模式」\nToss 已经帮你把它显示出来了", "Scroll to the bottom, tap Developer Mode\nToss has already made it visible"),
+        case .devmode: return [t("把「设置」从后台划掉，再重新打开\n「设置」重开后才会显示开关", "Swipe Settings away, then open it again\nSettings shows the switch only after a reopen"),
+                               t("点「隐私与安全性」，滑到最下面\n点「开发者模式」", "Tap Privacy & Security, scroll to the bottom\nThen tap Developer Mode"),
                                t("打开开关，点「重新启动」", "Switch it on, tap Restart"),
                                t("重启后解锁，在弹窗里点「打开」\n再输入一次锁屏密码", "After the restart, unlock and tap Turn On\nThen enter your passcode once")]
         case .wifi: return [t("macOS 问「Toss 想要查找本地网络上的设备」时，点「允许」", "If macOS asks to find devices on your network, click Allow"),
@@ -248,7 +280,7 @@ struct OnboardingCopy {
         }
     }
     // Steps 8 and 9 reuse the Settings rows: title, grey note, keycaps or status on the right
-    // (2026-10-30).
+    // (Ashley 2026-10-30: 「这两个太奇怪了」).
     var shortcutRows: [(title: String, note: String, key: String)] {
         [("ChatGPT / Codex", t("左右两个 Option 一起按", "Left and right Option together"), "⌥"),
          ("Claude", t("左右两个 Shift 一起按", "Left and right Shift together"), "⇧")]
@@ -341,7 +373,7 @@ struct OnboardingCopy {
         case "developer_mode_confirm": return (.wait, t("在 iPad 的弹窗里点「打开」，输入锁屏密码", "On your iPad, tap Turn On and enter your passcode"),
                                                    t("输完 Toss 会自动继续。", "Toss continues by itself."))
         case "pairing_wireless": return (.wait, t("正在建立无线配对…", "Setting up wireless pairing…"), nil)
-        case "preparing_image": return (.wait, t("正在安装截图组件…\n第一次要联网，约 1 分钟", "Installing the screenshot component…\nNeeds internet the first time, about a minute"), nil)
+        case "preparing_image": return (.wait, t("正在下载并安装截图组件…\n第一次要联网，网慢时要几分钟", "Downloading the screenshot component…\nNeeds internet the first time; can take a few minutes"), nil)
         case "wifi_waiting": return (.wait, t("USB 已连接，正在设置无线连接…", "USB is connected; setting up wireless…"),
                                      t("插着线已经能截图，但这一步要等无线好了才算完成。", "USB already works, but this step needs wireless."))
         default: return (.wait, t("正在等待 iPad…", "Waiting for the iPad…"), nil)
@@ -358,6 +390,8 @@ final class OnboardingController: NSObject, NSWindowDelegate {
     var onReopen: () -> Void = {}
     var onOpenMenuBarSettings: () -> Void = {}
     var menuIconProbe: (() -> MenuIconVisibility)?
+    var setupRunningProbe: (() -> Bool)?
+    var onCancelSetup: () -> Void = {}
     var onFinish: () -> Void = {}
     var onClose: () -> Void = {}
 
@@ -398,6 +432,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
     }
 
     func show() {
+        if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
         tick?.invalidate()
         // Re-evaluates time-based hints (charge-only cable) once a second.
@@ -499,6 +534,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         }
         render()
     }
+    @objc private func cancelSetup() { onCancelSetup() }
     @objc private func back() {
         let target: OnboardingStep = flow.step == .tryIt ? .wifi : OnboardingStep(rawValue: max(0, flow.step.rawValue - 1)) ?? .welcome
         flow.step = flow.step == .cable ? (flow.includesMenuBar ? .menubar : .access) : target
@@ -519,7 +555,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
     private func label(_ text: String, _ font: NSFont, _ color: NSColor, width: CGFloat? = nil) -> NSTextField {
         let l = NSTextField(wrappingLabelWithString: text)
         l.font = font; l.textColor = color; l.isSelectable = false
-        // A little air between wrapped lines (2026-10-30).
+        // A little air between wrapped lines (Ashley 2026-10-30: 「太紧凑了」).
         let paragraph = NSMutableParagraphStyle(); paragraph.lineSpacing = 3
         l.attributedStringValue = NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: color, .paragraphStyle: paragraph])
         if let width { l.preferredMaxLayoutWidth = width; l.widthAnchor.constraint(equalToConstant: width).isActive = true }
@@ -555,9 +591,12 @@ final class OnboardingController: NSObject, NSWindowDelegate {
 
     func render() {
         let t = now()
+        flow.updateTime(at: t)
         // Rebuild only when something visible changed, so the pulsing dot and the activity bar keep running.
         let (mark, text, sub) = copy.status(flow, at: t)
-        let signature = "\(flow.step) \(mark) \(text) \(sub ?? "") \(copy.primary(flow, at: t)) \(flow.showsPrimary(at: t)) \(flow.skippable) \(transport ?? "")"
+        let developerHint = flow.showsDeveloperModeHint(at: t) ? copy.developerModeHint : ""
+        let cancellable = flow.showsCancel(setupRunning: setupRunningProbe?() == true, at: t)
+        let signature = "\(developerHint) \(flow.step) \(mark) \(text) \(sub ?? "") \(copy.primary(flow, at: t)) \(flow.showsPrimary(at: t)) \(flow.skippable) \(cancellable) \(transport ?? "")"
         guard signature != shown else { return }
         shown = signature
         let inner = SettingsStyle.width - 2 * SettingsStyle.margin
@@ -638,9 +677,16 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         }
         stack.addArrangedSubview(hairline(inner))
         stack.addArrangedSubview(gap(SettingsStyle.footerGap))
+        // Fixed footer slot: revealing the hint cannot move the steps or resize the window.
+        if flow.step == .devmode {
+            let hint = label(developerHint.isEmpty ? " " : developerHint, SettingsStyle.sans(12.5), SettingsStyle.muted, width: inner)
+            hint.heightAnchor.constraint(equalToConstant: 20).isActive = true
+            stack.addArrangedSubview(hint)
+        }
         let backButton = SettingsPill(copy.back, kind: .quiet, target: self, action: #selector(back))
         backButton.isHidden = !flow.showsBack
         var right: [NSView] = []
+        if cancellable { right.append(SettingsPill(copy.cancel, kind: .quiet, target: self, action: #selector(cancelSetup))) }
         if flow.skippable { right.append(SettingsPill(copy.skip, kind: .quiet, target: self, action: #selector(skip))) }
         if flow.showsStaleAccessHint(at: t) {
             right.append(SettingsPill(copy.reopen, kind: .quiet, target: self, action: #selector(reopen)))
@@ -674,8 +720,8 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         window.setFrame(frame, display: true)
     }
     static var minimumHeight: CGFloat { SettingsStyle.guideHeight }
-    // Sizes of the ink lines in the list and the status (2026-10-30: kept at 14 / 13.5
-    // after a size comparison).
+    // Sizes of the ink lines in the list and the status (Ashley 2026-10-30 kept the 14 / 13.5 she
+    // saw in 字号对比: 「就用这个吧不改了」).
     static let mainSize: CGFloat = 14
     static let statusSize: CGFloat = 13.5
 }

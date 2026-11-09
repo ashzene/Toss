@@ -31,10 +31,21 @@ class TransferBudgetTests(unittest.TestCase):
         for tick in range(1, 30): budget.observe(4 + tick * 0.05, 1000)
         self.assertEqual(budget.deadline, 5.2)
 
-    def test_ten_second_stream_cannot_move_eight_second_hard_cap(self):
+    def test_ten_second_stream_finishes_despite_half_second_retransmission_pauses(self):
+        budget = TransferBudget(0, stall=2.5)
+        received = 0
+        for tick in range(1, 201):
+            now = tick * 0.05
+            if tick % 20 >= 10:
+                received += 65504
+            budget.observe(now, received)
+            self.assertLess(now, budget.deadline)
+        self.assertGreater(budget.deadline, 10)
+
+    def test_continuous_stream_cannot_move_thirty_second_hard_cap(self):
         budget = TransferBudget(0)
-        for tick in range(1, 161): budget.observe(tick * 0.05, tick * 5000)
-        self.assertEqual(budget.deadline, 8)
+        for tick in range(1, 601): budget.observe(tick * 0.05, tick * 5000)
+        self.assertEqual(budget.deadline, 30)
 
     def test_stale_progress_uses_last_packet_time(self):
         budget = TransferBudget(0)

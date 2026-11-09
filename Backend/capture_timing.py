@@ -19,6 +19,7 @@ import time
 MAX_BYTES = 128 * 1024
 MAX_SAMPLES = 200
 WINDOW = 100
+MAX_TRANSFER_BUDGET = 30.0
 
 
 @dataclass(frozen=True)
@@ -77,7 +78,7 @@ class SuccessTimingStore:
                     if any(type(row[key]) not in (float, int) or not math.isfinite(row[key])
                            for key in ("seconds", "timestamp")):
                         return empty
-                    if not 0 <= row["seconds"] <= 8 or row["timestamp"] <= 0:
+                    if not 0 <= row["seconds"] <= MAX_TRANSFER_BUDGET or row["timestamp"] <= 0:
                         return empty
             return {lane: sorted(value[lane], key=lambda row: row["timestamp"]) for lane in ("usb", "wifi")}
         except (OSError, ValueError, TypeError, RecursionError):
@@ -90,7 +91,7 @@ class SuccessTimingStore:
         """Best-effort durable write; no unbounded lock wait on the capture path."""
         timestamp = time.time() if timestamp is None else timestamp
         if (transport not in ("usb", "wifi") or type(seconds) not in (float, int)
-                or not math.isfinite(seconds) or not 0 <= seconds <= 8
+                or not math.isfinite(seconds) or not 0 <= seconds <= MAX_TRANSFER_BUDGET
                 or type(timestamp) not in (float, int) or not math.isfinite(timestamp) or timestamp <= 0):
             return False
         lock_fd = None
@@ -144,7 +145,7 @@ class SuccessTimingStore:
 
 class TransferBudget:
     """A fixed press origin, extended only by observed incoming data; never by ETA."""
-    def __init__(self, started, normal=4.5, hard=8.0, stall=1.2):
+    def __init__(self, started, normal=4.5, hard=MAX_TRANSFER_BUDGET, stall=1.2):
         self.normal_end = started + normal
         self.hard_end = started + hard
         self.stall = stall

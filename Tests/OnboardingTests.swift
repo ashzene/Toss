@@ -18,6 +18,19 @@ struct OnboardingTests {
         for code in ["cancelled", "setup_timeout", "setup_failed", "setup_unavailable"] { check(OnboardingFlow.stage(for: code) == nil) }
         check(OnboardingFlow().counted == 8 && OnboardingStep.done.rawValue == 9)
 
+        // Every waiting pairing step can be stopped; a finished or failed one has its own buttons.
+        var stoppable = OnboardingFlow()
+        check(!stoppable.showsCancel(setupRunning: true, at: 0))
+        for step in [OnboardingStep.cable, .trust, .devmode, .prepare, .wifi] {
+            stoppable = OnboardingFlow(); stoppable.step = step
+            check(stoppable.showsCancel(setupRunning: true, at: 0))
+            check(!stoppable.showsCancel(setupRunning: false, at: 0))
+            stoppable.final = true
+            check(!stoppable.showsCancel(setupRunning: true, at: 0))
+        }
+        stoppable = OnboardingFlow(); stoppable.step = .tryIt
+        check(!stoppable.showsCancel(setupRunning: true, at: 0))
+
         // A whole first pairing: each step turns green, then moves on; never backward.
         var flow = OnboardingFlow()
         check(flow.mark(at: 0) == .none && flow.canContinue(at: 0))
@@ -46,6 +59,22 @@ struct OnboardingTests {
         flow.advance(); check(flow.step == .wifi && flow.mark(at: 70) == .wait && !flow.canContinue(at: 70))
         check(!flow.advancesBySetup)
         let zh = OnboardingCopy(language: .chinese), en = OnboardingCopy(language: .english)
+        if CommandLine.arguments.count > 1 {
+            Translations.directory = URL(fileURLWithPath: CommandLine.arguments[1]).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Assets/Localization")
+        }
+        let otherLanguages = AppLanguage.allCases.filter { ![.system, .chinese, .english].contains($0) }
+        let allCopies = [zh, en] + otherLanguages.map { OnboardingCopy(language: .other($0)) }
+        // Interpolated strings reach their template; a string with no translation stays English.
+        for code in otherLanguages {
+            let unlock = Translations.text("Unlock the iPad", language: code)
+            check(unlock != "Unlock the iPad" && unlock.contains("iPad") && !unlock.contains("{0}"))
+            check(Translations.text("No such string", language: code) == "No such string")
+            // Only a template can produce these, so they prove the placeholder matching works.
+            for english in ["Step 3 of 8", "Connecting to iPhone…"] {
+                let translated = Translations.text(english, language: code)
+                check(translated != english && !translated.contains("{"), #line)
+            }
+        }
         check(zh.status(flow, at: 70).1 == "USB 已连接，正在设置无线连接…")
         check(zh.settingUpStatus(code: "wifi_waiting") == "USB 已连接，正在设置无线连接…")
         flow.receive(code: "ready", final: false, ipados: nil, at: 71)
@@ -81,6 +110,37 @@ struct OnboardingTests {
         early.receive(code: "trust_needed", final: false, ipados: nil, at: 0)
         check(!early.advancesBySetup); early.advance(); check(early.step == .access)
 
+        // Developer Mode: exact threshold, repeated status, every exit, and a fresh retry.
+        var hint = OnboardingFlow(); hint.step = .devmode
+        hint.receive(code: "developer_mode_needed", final: false, ipados: nil, at: 10)
+        check(!hint.showsDeveloperModeHint(at: 24.999))
+        check(hint.showsDeveloperModeHint(at: 25))
+        hint.receive(code: "developer_mode_needed", final: false, ipados: nil, at: 20)
+        check(hint.showsDeveloperModeHint(at: 25))
+        for stage in OnboardingStep.allCases where stage != .devmode {
+            var away = hint; away.step = stage
+            check(!away.showsDeveloperModeHint(at: 100))
+        }
+        for code in ["developer_mode_auto", "ipad_restarting", "developer_mode_confirm", "unlock_needed", "preparing_image", "setup_timeout"] {
+            var changed = hint
+            changed.receive(code: code, final: false, ipados: nil, at: 30)
+            check(!changed.showsDeveloperModeHint(at: 100))
+            changed.receive(code: "developer_mode_needed", final: false, ipados: nil, at: 100)
+            check(!changed.showsDeveloperModeHint(at: 114.9) && changed.showsDeveloperModeHint(at: 115))
+        }
+        var reentered = hint
+        reentered.step = .prepare; reentered.step = .devmode
+        reentered.updateTime(at: 80)
+        check(!reentered.showsDeveloperModeHint(at: 94.9) && reentered.showsDeveloperModeHint(at: 95))
+        var waitingElsewhere = OnboardingFlow(); waitingElsewhere.step = .trust
+        waitingElsewhere.receive(code: "developer_mode_needed", final: false, ipados: nil, at: 0)
+        waitingElsewhere.step = .devmode; waitingElsewhere.updateTime(at: 100)
+        check(!waitingElsewhere.showsDeveloperModeHint(at: 114.9) && waitingElsewhere.showsDeveloperModeHint(at: 115))
+        hint.receive(code: "developer_mode_needed", final: true, ipados: nil, at: 30)
+        check(!hint.showsDeveloperModeHint(at: 100))
+        check(en.developerModeHint == "Don't see Developer Mode? Swipe Settings away and open it again.")
+        check(zh.developerModeHint.contains("从后台划掉再打开"))
+
         // Buttons.
         var b = OnboardingFlow()
         check(!b.showsBack); b.step = .access; check(b.showsBack); b.step = .wifi; check(!b.showsBack)
@@ -88,11 +148,13 @@ struct OnboardingTests {
         check(zh.cableOnly == "先只用数据线" && en.cableOnly == "Use cable only for now")
         check(zh.cableOnlyStatus == "只能插线用，无线还没设好")
 
-        // Language follows the system; anything not Chinese is English.
+        // Language follows the system's first language; one Toss doesn't have is English.
         check(OnboardingLanguage.current(["zh-Hans-CN", "en-US"]) == .chinese)
         check(OnboardingLanguage.current(["zh-Hant-TW"]) == .chinese)
         check(OnboardingLanguage.current(["en-GB", "zh-Hans"]) == .english)
-        check(OnboardingLanguage.current(["ja-JP"]) == .english && OnboardingLanguage.current([]) == .english)
+        check(OnboardingLanguage.current(["ja-JP"]) == .other(.japanese) && OnboardingLanguage.current(["pt-PT"]) == .other(.portuguese))
+        check(OnboardingLanguage.current(["de-DE", "ja-JP"]) == .english && OnboardingLanguage.current([]) == .english)
+        check(AppLanguage.resolve(choice: .system, preferred: ["gl-ES"]) == .galician && AppLanguage.resolve(choice: .french, preferred: ["ko-KR"]) == .french)
         var line = OnboardingFlow(); line.step = .cable
         check(zh.stepLine(line) == "第 3 步，共 8 步" && en.stepLine(line) == "Step 3 of 8")
         line.step = .access; line.setMenuIcon(.hidden); line.step = .cable
@@ -156,9 +218,9 @@ struct OnboardingTests {
         var rel = OnboardingFlow(); rel.step = .access; rel.accessRequestedAt = 0; rel.relaunching = true
         check(!rel.showsStaleAccessHint(at: 100) && zh.status(rel, at: 100).1 == "已允许，正在重新打开 Toss…"
               && en.status(rel, at: 100).1 == "Allowed, reopening Toss…")
-        // No remove-and-re-add instructions anywhere (2026-10-29).
+        // No remove-and-re-add instructions anywhere (Ashley 2026-10-29).
         var anyText = ""
-        for copy in [zh, en] {
+        for copy in allCopies {
             for step in OnboardingStep.allCases { anyText += copy.title(step) + copy.why(step) + copy.howto(step).joined() }
             var a2 = OnboardingFlow(); a2.step = .access; a2.accessRequestedAt = 0
             anyText += (copy.status(a2, at: 100).2 ?? "")
@@ -201,7 +263,7 @@ struct OnboardingTests {
         check(OnboardingCopy.split("一根能传数据的 USB 线\n只能充电的线不行") == ("一根能传数据的 USB 线", "只能充电的线不行"))
         check(OnboardingCopy.split("iPad 解锁，放在手边") == ("iPad 解锁，放在手边", nil))
         func noParens(_ text: String) -> Bool { text.range(of: "[()（）]", options: .regularExpression) == nil }
-        for copy in [zh, en] {
+        for copy in allCopies {
             for step in OnboardingStep.allCases {
                 check(noParens(copy.title(step) + copy.why(step) + copy.howto(step).joined()))
             }
@@ -228,9 +290,10 @@ struct OnboardingTests {
             return w <= width && !text.contains("\n")
         }
         let inner = SettingsStyle.width - 2 * SettingsStyle.margin
+        for copy in allCopies { check(fits(copy.developerModeHint, 12.5, inner)) }
         check(NSFont(name: "HankenGrotesk-Regular", size: 12) != nil) // measured with the real font
         check(NSAttributedString(string: String(repeating: "宽", count: 30), attributes: [.font: SettingsStyle.sans(12.5)]).size().width > 278)
-        for copy in [zh, en] {
+        for copy in allCopies {
             for step in OnboardingStep.allCases { check(fits(copy.why(step), 14, inner)) }
             for row in copy.shortcutRows { check(fits(row.note, 12.5, inner - 120)) }
             check(fits(copy.iPadRow.note, 12.5, inner - 160))
@@ -266,7 +329,7 @@ struct OnboardingTests {
             }
         }
         // The grey line under each title stays one line wide (468 pt column, 14 pt text).
-        for copy in [zh, en] {
+        for copy in allCopies {
             for step in OnboardingStep.allCases where step != .done {
                 let why = copy.why(step)
                 check(!why.isEmpty && !why.contains("\n"))
@@ -305,14 +368,33 @@ struct OnboardingTests {
         check(alone.autoNext == nil && !alone.showsBack && zh.stepLine(alone) == "菜单栏图标")
         check(zh.status(alone, at: 0).1 == "Toss 已经打开，但图标被刘海挡住了" && zh.primary(alone, at: 0) == "完成")
 
-        // Opens by itself on first run or while unpaired, only until it was closed once.
+        // Unpaired launches always show setup, even after an earlier dismissal.
         check(OnboardingPolicy.opensAutomatically(paired: false, firstRun: false, seen: false))
         check(OnboardingPolicy.opensAutomatically(paired: true, firstRun: true, seen: false))
         check(!OnboardingPolicy.opensAutomatically(paired: true, firstRun: false, seen: false))
         // A close on the welcome step (before Start) is not "seen"; any later step is.
         check(!OnboardingPolicy.closeMarksSeen(step: .welcome))
         for step in OnboardingStep.allCases where step != .welcome { check(OnboardingPolicy.closeMarksSeen(step: step)) }
-        check(!OnboardingPolicy.opensAutomatically(paired: false, firstRun: true, seen: true))
+        check(OnboardingPolicy.opensAutomatically(paired: false, firstRun: true, seen: true))
+        for paired in [false,true] { for first in [false,true] { for seen in [false,true] {
+            check(OnboardingPolicy.opensAutomatically(paired: paired, firstRun: first, seen: seen) == (!paired || (first && !seen)))
+        } } }
+        for paired in [false,true] { for visible in [false,true] {
+            check(OnboardingPolicy.opensFromIcon(paired: paired, guideVisible: visible) == (!paired || visible))
+        } }
+
+        // Reopening UI attaches to the latest running setup, then stops at its step.
+        for code in ["developer_mode_needed", "developer_mode_confirm", "trust_needed", "no_usb_ipad"] {
+            var resumed = OnboardingFlow()
+            resumed.accessibility = true
+            resumed.step = .cable
+            resumed.receive(code: code, final: false, ipados: nil, at: 0)
+            for _ in 0..<OnboardingStep.allCases.count {
+                if resumed.autoNext != nil { resumed.advance() }
+            }
+            check(resumed.step == OnboardingFlow.stage(for: code))
+            check(resumed.autoNext == nil && !resumed.needsSetupStart)
+        }
 
         // TossApp wiring: alerts stay off while the onboarding shows; USB-only pairing still turns shortcuts on.
         let app = (try? String(contentsOfFile: CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "", encoding: .utf8)) ?? ""
@@ -323,7 +405,7 @@ struct OnboardingTests {
             check(app.contains("self.onboarding?.tossed()"))
             check(app.contains("if !hasPairing { showOnboarding(); return }"))
             check(app.contains("guard onboarding?.isVisible != true else { return }")) // no auto pairing/permission prompt behind it
-            check(app.contains("if onboarding?.isVisible == true { showOnboarding(); return true }"))
+            // Launch, Dock and status-button routing are exercised by EntryRoutingTests.
             check(app.contains("self.onboarding?.setupCode(\"setup_unavailable\", final: true"))
             check(app.contains("if setupWizard.isRunning, permissionsReady, controller.flow.step"))
             check(app.contains("else if onboarding?.isVisible != true { lastPermissionStep"))
@@ -335,7 +417,7 @@ struct OnboardingTests {
             check(app.contains("UserDefaults.standard.set(true, forKey: OnboardingPolicy.resumeAccessKey)") && app.contains("self?.relaunch()"))
             check(app.contains("onboarding?.showRelaunching()"))
             check(app.contains("if controller.flow.step == .welcome { controller.jump(to: .access) }"))
-            check(app.contains("if !self.terminating, OnboardingPolicy.closeMarksSeen(step: controller?.flow.step ?? .done) {"))
+            check(app.contains("if !self.terminating, dismissedAutomatic || OnboardingPolicy.closeMarksSeen(step: controller?.flow.step ?? .done) {"))
             check(app.contains("terminating = true\n        return .terminateNow"))
             // Closing never cancels the pairing: onClose must not call setupWizard.cancel().
             if let close = app.range(of: "controller.onClose = {"), let end = app.range(of: "onboarding = controller", range: close.upperBound..<app.endIndex) {
@@ -362,6 +444,44 @@ struct OnboardingTests {
             c.jump(to: .access); c.setAccessibility(true); check(c.flow.mark(at: 0) == .ok)
             let d = OnboardingController(language: .english); d.jump(to: .access); d.tossed(); check(!d.flow.tossed)
         }
+
+        // The delayed footer is one grey line and does not move any of the four steps.
+        func views(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(views) }
+
+        for language in [OnboardingLanguage.chinese, .english] + AppLanguage.allCases.filter({ ![.system, .chinese, .english].contains($0) }).map({ OnboardingLanguage.other($0) }) {
+            for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+                let controller = OnboardingController(language: language)
+                controller.window.appearance = NSAppearance(named: appearance)
+                var time = 0.0
+                controller.now = { time }
+                controller.jump(to: .devmode)
+                controller.setupCode("developer_mode_needed", final: false, ipados: "18.1")
+                let content = controller.window.contentView!
+                content.layoutSubtreeIfNeeded()
+                let before = controller.window.frame
+                let steps = controller.copy.howto(.devmode).map { OnboardingCopy.split($0).main }
+                check(steps.count == 4)
+                func positions() -> [NSRect] {
+                    views(content).compactMap { $0 as? NSTextField }.filter { steps.contains($0.stringValue) }
+                        .map { $0.convert($0.bounds, to: content) }
+                }
+                let frames = positions()
+                check(frames.count == 4)
+                time = 15; controller.render(); content.layoutSubtreeIfNeeded()
+                check(before == controller.window.frame && frames == positions())
+                let hints = views(content).compactMap { $0 as? NSTextField }.filter { $0.stringValue == controller.copy.developerModeHint }
+                check(hints.count == 1)
+                if let hint = hints.first {
+                    check(hint.textColor == SettingsStyle.muted)
+                    check(hint.bounds.height == 20)
+                    check(hint.attributedStringValue.size().width <= hint.bounds.width)
+                }
+                controller.setupCode("ipad_restarting", final: false, ipados: nil)
+                check(!views(content).compactMap { $0 as? NSTextField }.contains { $0.stringValue == controller.copy.developerModeHint })
+                controller.windowWillClose(Notification(name: NSWindow.willCloseNotification))
+            }
+        }
+
 
         // Every L("English", "中文") pair in the app has both languages (Settings → Language).
         if !dir.isEmpty, let files = try? FileManager.default.contentsOfDirectory(atPath: dir) {
@@ -393,7 +513,7 @@ struct OnboardingTests {
 
         // The uninstaller keeps Accessibility so a reinstall passes step 2 at once.
         if !dir.isEmpty {
-            for name in ["Uninstall.command"] {
+            for name in ["Uninstall.command", "卸载.command"] {
                 let script = (try? String(contentsOfFile: dir + "/../" + name, encoding: .utf8)) ?? ""
                 check(!script.isEmpty && !script.contains("tccutil") && script.contains("--unregister-login-item"))
             }

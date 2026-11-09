@@ -121,18 +121,96 @@ def record_failure(error, client, diagnostics, state, attempt):
                    {"event": "devmode_enable_failed", "devmode_attempt": attempt, **diagnostics})
 
 
-async def reveal(client):
+class RevealFailures:
+    """Per setup run; independent of enable's diagnostics and bounded on disk."""
+    def __init__(self):
+        self.last_error = None
+        self.answered = False
+
+    def record_answer(self, state):
+        if not self.answered and state is not None:
+            from link_timeline import append_log
+            append_log(Path(state).parent / "link-timeline.jsonl", {"event": "devmode_reveal_ok"})
+        self.answered = True
+
+    def record(self, error, client, state):
+        message = safe_error(error, client)
+        if message == self.last_error:
+            return
+        self.last_error = message
+        if state is not None:
+            from link_timeline import append_log
+            append_log(Path(state).parent / "link-timeline.jsonl",
+                       {"event": "devmode_reveal_failed", "devmode_reveal_error": message})
+
+
+async def reveal(client, *, state=None, failures=None) -> bool:
     from pymobiledevice3.services.amfi import AmfiService
 
+    failures = failures if failures is not None else RevealFailures()
     try:
         async with asyncio.timeout(REQUEST_TIMEOUT):
             await AmfiService(client).reveal_developer_mode_option_in_ui()
-    except Exception:
-        pass  # Preserve the enable error; a reveal failure must not overwrite it.
+        failures.last_error = None
+        return True
+    except Exception as error:
+        failures.record(error, client, state)
+        return False
+
+
+class RevealRepeater:
+    """One bounded request in flight; tick never waits on AMFI or a reconnect.
+
+    Own a separate client so the 1.5 s status loop can close its client safely.
+    The owner must close this repeater before finishing or leaving setup.
+    """
+    def __init__(self, state):
+        self.state = state
+        self.failures = RevealFailures()
+        self.next_at = 0.0
+        self.task = None
+
+    async def first(self, client):
+        """Awaited before the guide says to look; the repeats start 3 s after it."""
+        answered = await self._reveal(client)
+        self.next_at = time.monotonic() + 3.0
+        return answered
+
+    async def _reveal(self, client):
+        answered = await reveal(client, state=self.state, failures=self.failures)
+        if answered:
+            self.failures.record_answer(self.state)
+        return answered
+
+    def tick(self, reconnect):
+        now = time.monotonic()
+        if now < self.next_at or (self.task is not None and not self.task.done()):
+            return
+        self.next_at = now + 3.0
+        self.task = asyncio.create_task(self._request(reconnect))
+
+    async def _request(self, reconnect):
+        client = None
+        try:
+            async with asyncio.timeout(REQUEST_TIMEOUT):
+                client = await reconnect()
+                async with client:
+                    await self._reveal(client)
+        except Exception as error:
+            self.failures.record(error, client, self.state)
+
+    async def close(self):
+        if self.task is not None:
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+            self.task = None
 
 
 async def enable(client, *, progress, diagnostics, state=None, reconnect=None,
-                 model=None, ipados=None, deadline=None) -> str:
+                 model=None, ipados=None, deadline=None, revealer=None) -> str:
     """Return rebooting/manual/locked; at most three enable attempts in total."""
     from pymobiledevice3.exceptions import DeviceHasPasscodeSetError
     from pymobiledevice3.services.amfi import AmfiService
@@ -158,7 +236,13 @@ async def enable(client, *, progress, diagnostics, state=None, reconnect=None,
             except Exception as error:
                 record_failure(error, current, diagnostics, state, attempt + 1)
                 if isinstance(error, DeviceHasPasscodeSetError) or attempt == ENABLE_ATTEMPTS - 1:
-                    await reveal(current)
+                    if revealer is None:
+                        await reveal(current, state=state)
+                    else:
+                        # Settings reads the row when it opens, so the guide must not say to
+                        # look before iPadOS has answered. auto owns the asynchronous repeats
+                        # after this; next_step awaits one reveal before its manual instruction.
+                        await revealer.first(current)
                     return "manual"
                 if not await wait_for_unlock(current, deadline, progress,
                                              {"model": model, "ipados": ipados, **diagnostics},

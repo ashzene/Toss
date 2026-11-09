@@ -7,6 +7,7 @@ enum CaptureContractError: Error { case invalid }
 struct CaptureReceipt {
     let capturedAt: Double
     let expiresAt: Double
+    let byteCount: Int
 
     static func validate(json: Data, exitCode: Int32, requestID: String, triggeredAt: Double,
                          now: Double, file: URL) throws -> CaptureReceipt {
@@ -28,7 +29,8 @@ struct CaptureReceipt {
               [triggeredAt, now, started, completed, captureStarted, captured].allSatisfy({ $0.isFinite }),
               started >= triggeredAt - 0.05, started <= captureStarted,
               captureStarted <= captured, captured <= completed, completed <= now + 0.05,
-              captured - captureStarted <= 8, now - captured >= -0.05, now - captured <= 5,
+              // A flowing transfer may take 30 s; a completed result must still be fresh.
+              captured - captureStarted <= 30, now - captured >= -0.05, now - captured <= 5,
               now - triggeredAt < 45 else { throw CaptureContractError.invalid }
         let descriptor = open(file.path, O_RDONLY | O_NOFOLLOW)
         guard descriptor >= 0 else { throw CaptureContractError.invalid }
@@ -43,7 +45,7 @@ struct CaptureReceipt {
               SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() == hash else {
             throw CaptureContractError.invalid
         }
-        return CaptureReceipt(capturedAt: captured, expiresAt: captured + 10)
+        return CaptureReceipt(capturedAt: captured, expiresAt: captured + 10, byteCount: bytes)
     }
 
     // Same rule as Backend/capture_once.py screen_dimensions_ok: any iPad screen.

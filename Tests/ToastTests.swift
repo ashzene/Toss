@@ -36,14 +36,14 @@ enum ToastTests {
         }
         let failure = ToastContent.failure(reason: "  The draft\nchanged.\tTry again.  ", code: "append_failed", cue: true)!
         check(failure.title == "Didn't attach", "failure is independent of the target")
-        check(failure.reason.isEmpty, "failure toast has no reason line (2026-10-24)")
+        check(failure.reason.isEmpty, "failure toast has no reason line (Ashley 2026-10-24)")
         check(ToastContent.shortReason("  The draft\nchanged.\tTry again.  ") == "The draft changed. Try again.", "reason is trimmed to one line")
         check(ToastContent.failure(reason: "", code: "append_failed", cue: true, language: .chinese)?.title == "没贴进去", "Chinese failure copy")
         check(ToastContent.failure(reason: "", code: "capture_result_failed", cue: true, backend: "black_frame_rejected")?.title
               == "iPad screenshot is black", "black frame: reports content without claiming screen/lock state")
         check(ToastContent.failure(reason: "", code: "capture_result_failed", cue: true, backend: "black_frame_rejected",
                                    language: .chinese)?.title == "iPad 截图是黑的", "Chinese black-frame copy")
-        // One title per actual cause (2026-10-28).
+        // One title per actual cause (Ashley 2026-10-28).
         for (backend, english, chinese) in [("timeout", "iPad connection too slow", "iPad 连接太慢"),
                                             ("slow_threshold", "iPad connection too slow", "iPad 连接太慢"),
                                             ("first_byte_timeout", "iPad connection too slow", "iPad 连接太慢"),
@@ -100,17 +100,18 @@ enum ToastTests {
             }
             return true
         }
-        check(order("Sources/TossApp.swift", ["self.successSound { self.cueQueue.async", "self.captureAnimation.confirmed("],
+        check(order("Sources/TossApp.swift", ["SuccessSound.forFileSize(tx.receipt?.byteCount)",
+                    "self.playResultCue(", "self.captureAnimation.confirmed("],
                     from: "self.transaction?.appendConfirmed = true"),
               "success: the sound starts (off the main thread) before the toast and jelly are set up")
-        check(order("Sources/TossApp.swift", ["failureSound { cueQueue.async", "captureAnimation.failCurrent("],
+        check(order("Sources/TossApp.swift", ["if cue { playResultCue(failureSound) }", "captureAnimation.failCurrent("],
                     from: "let text = code == \"append_unconfirmed\""),
               "failure: the sound plays before the toast")
         check(order("Sources/CaptureAnimation.swift", ["showToast(success: true", "startLanding("],
                     from: "func confirmed(requestID"),
               "success: the toast is shown before the jelly window is created")
 
-        // 2026-10-28 (paste where it was pressed): an app switch during the capture brings the original
+        // Ashley 2026-10-28 ("就在原来的地方贴"): an app switch during the capture brings the original
         // chat back before the first composer focus, which would otherwise fail into the manual fallback.
         do {
             let text = (try? String(contentsOfFile: "Sources/TossApp.swift", encoding: .utf8)) ?? ""
@@ -198,7 +199,7 @@ enum ToastTests {
         check(ToastContent.failure(reason: "App changed", code: "append_unconfirmed", cue: true,
                                    language: .chinese)?.title == "看看草稿里有没有", "uncertain receipt never claims paste failed")
 
-        // Toss's own cues are present, 48 kHz 24-bit stereo AIFF, and the
+        // Toss's own cues (Ashley's picks) are present, 48 kHz 24-bit stereo AIFF, and the
         // app and build no longer reference the Codex sound.
         func aiffFormat(_ path: String) -> (channels: Int, bits: Int, rate: Double)? {
             guard let data = FileManager.default.contents(atPath: path), data.count > 12,
@@ -211,15 +212,37 @@ enum ToastTests {
             for byte in b[10..<18] { mantissa = mantissa << 8 | UInt64(byte) }
             return (channels, bits, Double(mantissa) * pow(2, Double(exponent - 16383 - 63)))
         }
-        for cue in ["Toss-Success", "Toss-Failure"] {
+        let soundCases: [(Int?, SuccessSound)] = [
+            (nil, .small), (Int.min, .small), (-1, .small), (0, .small),
+            (1, .small), (999_999, .small), (1_000_000, .small), (1_999_999, .small),
+            (2_000_000, .medium), (2_000_001, .medium), (4_999_999, .medium),
+            (5_000_000, .large), (5_000_001, .large), (7_999_999, .large),
+            (8_000_000, .extraLarge), (8_000_001, .extraLarge), (Int.max, .extraLarge),
+            // Actual received sizes from Ashley's six-image iPad test. The old
+            // 5/50/1000 MB boundaries collapsed these into just two sounds.
+            (1_260_037, .small), (9_565_667, .extraLarge), (8_812_214, .extraLarge),
+            (7_500_974, .large), (4_924_611, .medium), (3_485_136, .medium)
+        ]
+        for (bytes, expected) in soundCases {
+            check(SuccessSound.forFileSize(bytes) == expected, "file-size sound boundary: \(String(describing: bytes))")
+        }
+        check(Set(SuccessSound.allCases.map(\.rawValue)).count == 4, "four distinct sound resources")
+        let build = (try? String(contentsOfFile: "scripts/build-release.py", encoding: .utf8)) ?? ""
+        for cue in SuccessSound.allCases.map(\.rawValue) + ["Toss-Failure"] {
             let format = aiffFormat("Assets/Sounds/\(cue).aiff")
             check(format.map { $0.channels == 2 && $0.bits == 24 && $0.rate == 48000 } == true,
                   "\(cue).aiff is bundled as 48 kHz 24-bit stereo AIFF")
+            check(NSSound(contentsOfFile: "Assets/Sounds/\(cue).aiff", byReference: false) != nil,
+                  "AppKit can preload \(cue) without playback")
+            check(build.contains("\"\(cue).aiff\""), "release packaging requires \(cue)")
         }
         let app = (try? String(contentsOfFile: "Sources/TossApp.swift", encoding: .utf8)) ?? ""
-        let build = (try? String(contentsOfFile: "scripts/build-release.py", encoding: .utf8)) ?? ""
-        check(app.contains("sound(\"Toss-Success\")") && app.contains("sound(\"Toss-Failure\")"),
-              "the app loads both of Toss's own cues by name")
+        check(order("Sources/TossApp.swift", ["for tier in SuccessSound.allCases", "sound(tier.rawValue)",
+                    "sound(\"Toss-Failure\")"], from: "func prepareInterface()"),
+              "the app preloads all size tiers and its failure cue before captures")
+        check(order("Sources/TossApp.swift", ["Array(successSounds.values)", "cueQueue.async",
+                    "for sound in sounds { sound.stop() }", "cue.play()"], from: "private func playResultCue"),
+              "all prior result cues stop on the audio queue before the next one plays")
         check(!app.contains("Codex-Appshot") && !build.contains("Codex-Appshot"),
               "no Codex sound in the app or the bundle")
 

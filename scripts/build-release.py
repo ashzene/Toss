@@ -18,8 +18,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
-VERSION, BUILD = "1.0.0", "39"
+VERSION, BUILD = "1.0.8", "92"
 DEFAULT_IDENTITY = "Toss Local Signing"
 
 project = Path(__file__).resolve().parent.parent
@@ -44,7 +45,7 @@ if not (runtime / "bin/python3").exists():
 out = args.output.resolve()
 out.mkdir(parents=True, exist_ok=True)
 # Keep build outputs out of Spotlight and Launchpad, so app search only finds the installed Toss
-# (2026-10-29: searching showed a pile of build copies).
+# (Ashley 2026-10-29: 「我现在在 app 搜索 toss 出来一堆」).
 (out / ".metadata_never_index").touch()
 app = out / "Toss.app"
 if app.exists():
@@ -112,14 +113,17 @@ for pyc in root.joinpath("lib").rglob("*.pyc"):
 subprocess.run([str(runtime_bin / "python3"), "-I", "-c", recompile, str(resources / "Runtime/python")],
                check=True, env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"})
 shutil.copyfile(project / "User Guide.txt", resources / "User Guide.txt")
-# Toss's own upload cues (2026-10-24). Both are required: the shipped app
-# carries no Codex sound and has no fallback.
-for cue in ("Toss-Success.aiff", "Toss-Failure.aiff"):
+# Toss's own cues: four approved file-size tiers and the existing failure sound.
+# Require every asset so packaging cannot silently lose one of the larger tiers.
+for cue in ("Toss-Success.aiff", "Toss-Success-Medium.aiff", "Toss-Success-Large.aiff",
+            "Toss-Success-XLarge.aiff", "Toss-Failure.aiff"):
     if not (project / "Assets/Sounds" / cue).exists():
         sys.exit(f"missing Assets/Sounds/{cue}")
     shutil.copyfile(project / "Assets/Sounds" / cue, resources / cue)
 # Settings window type: Source Serif 4 + Hanken Grotesk (SIL OFL, licences alongside).
 shutil.copytree(project / "Assets/Fonts", resources / "Fonts")
+# The languages besides English and Chinese.
+shutil.copytree(project / "Assets/Localization", resources / "Localization")
 # Nothing from the build Mac may ship: refuse a bundle whose text files carry this Mac's home path
 # (2026-10-29: runtime launchers did, until they were dropped above).
 home = str(Path.home()).encode()
@@ -137,20 +141,8 @@ subprocess.run(["/System/Library/Frameworks/CoreServices.framework/Frameworks/La
                 "-u", str(app)], check=False, stderr=subprocess.DEVNULL)
 
 if args.dmg:
-    # The app installs itself into Applications on first open; no script needed.
-    dmg = out / f"Toss {VERSION}.dmg"
-    with tempfile.TemporaryDirectory() as staging:
-        staging = Path(staging)
-        subprocess.run(["/usr/bin/ditto", str(app), str(staging / app.name)], check=True)
-        (staging / "Applications").symlink_to("/Applications")
-        for name in ("User Guide.txt",):
-            shutil.copy2(project / name, staging / name)
-        if dmg.exists():
-            dmg.unlink()
-        subprocess.run(["/usr/bin/hdiutil", "create", "-quiet", "-volname", f"Toss {VERSION}",
-                        "-srcfolder", str(staging), "-format", "UDZO", "-fs", "HFS+", str(dmg)], check=True)
-    digest = subprocess.run(["/usr/bin/shasum", "-a", "256", str(dmg)], capture_output=True, text=True, check=True)
-    print("Disk image: " + str(dmg) + "\n" + digest.stdout.strip())
+    subprocess.run([sys.executable, str(project / "scripts/package-installer.py"),
+                    "--payload", str(app), "--output", str(out), "--identity", args.identity], check=True)
 
 if args.zip:
     # --sequesterRsrc keeps extended attributes in __MACOSX/ instead of beside the files: without it

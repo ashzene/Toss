@@ -3,8 +3,8 @@ import ImageIO
 import QuartzCore
 import ScreenCaptureKit
 
-// This is visual feedback only. It never reads target UI, changes focus,
-// touches the clipboard, or decides whether an attachment succeeded.
+// Visual feedback and an explicit transfer-cancel callback. It never reads target
+// UI, changes focus, touches the clipboard, or decides whether an attachment succeeded.
 struct CaptureAnimationState {
     enum Phase: Equatable { case capturing, captured, confirmed, failed }
     private(set) var requestID: UInt64?
@@ -47,7 +47,7 @@ struct CaptureAnimationState {
 
 // Pure geometry only: the landing spot must come from a separately confirmed
 // native attachment. Never infer a slot, fixed coordinate, or substitute screen.
-// (2026-10-24: the picture "lands" in the composer instead of flying
+// (2026-10-24, Ashley: the picture "lands" in the composer instead of flying
 // across the screen after the chip is already visible.)
 struct CaptureLandingPlan: Equatable {
     let screenFrame: CGRect
@@ -75,8 +75,8 @@ enum CaptureCardTiming {
 // - lean (11:25, "horizontal"): thrown in from the side; the top leans into a parallelogram.
 // - drop (11:39, "vertical"): falls straight down; squash and stretch only.
 // - both (11:47, "combined"): drop plus a quicker lean, out of step with the bounce.
-// - extra (14:56, default): like both, but the up/down is much bigger and slower (the
-//   up/down was not bouncy enough); the lean stays secondary.
+// - extra (14:56, default): like both, but the up/down is much bigger and slower (Ashley:
+//   "上下不够duang"); the lean stays secondary.
 // - patch (flag): like extra, but squashes below and stretches narrower than the chip. It needs
 //   an opaque patch of the sampled composer colour over the real chip; without one it is extra.
 // Covered styles (all but patch) never uncover the real chip: they squash and stretch around
@@ -101,7 +101,7 @@ enum CaptureJelly {
     // A damped spring from impact: already at `start`, moving at `velocity` (per second).
     struct Spring { let start: Double; let velocity: Double; let frequency: Double }
     enum Body { case leanSquash, covered, upright, free }
-    // upright (2026-10-25 video: the bulge covered the neighbouring attachment):
+    // upright (2026-10-25, Ashley's video: the bulge covered the neighbouring attachment):
     // pinned at the tile's bottom-LEFT, the copy only grows right and up. New tiles are
     // appended at the right end of the row in Codex and Claude, so nothing is on that side;
     // the sideways growth is capped below the gap between tiles (Codex 11 pt, Claude ~8 pt on
@@ -239,14 +239,14 @@ enum CaptureTileLook: Equatable {
     static func forTarget(claude: Bool, darkAppearance: Bool) -> CaptureTileLook {
         claude && darkAppearance ? .card(red: 25, green: 25, blue: 25, cornerRadius: 15) : .cover
     }
-    // Claude paints its card a few pt outside the AX button's frame (2026-10-25 Live
+    // Claude paints its card a few pt outside the AX button's frame (Ashley's 2026-10-25 Live
     // Photos: the real picture's right and bottom edges showed beside the copy), so the copy
     // covers this much more on every side there. Conservative until measured in pixels; extra
     // cover lands on Claude's own dark card area and does not show.
     static let claudeOutset: CGFloat = 6
     // With the pointer resting on the landing spot, Claude's card is hovered from the moment it
     // appears: it grows toward the top and right and shows its ✕ at the top-right corner
-    // (2026-10-25 Live Photos: the hand cursor was on the new tile every time, and the
+    // (Ashley's 2026-10-25 Live Photos: the hand cursor was on the new tile every time, and the
     // real card showed above and right of the copy). Codex tiles do not grow on hover.
     // Fallback while the hover shield is unproven: extra cover when hovered (defaults
     // jellyClaudeHoverExtra, pt; 0 = off until measured). The top extra never reaches the row
@@ -435,8 +435,8 @@ final class CaptureAnimation {
     private var landingEndsAt: Double?
     private var landingStartedAt: Double?
 
-    // A queued keypress starts while the previous picture is still bouncing (2026-10-28:
-    // it must stay smooth, the queue must not look stuck). That landing plays on to its end on its own
+    // A queued keypress starts while the previous picture is still bouncing (Ashley 2026-10-28:
+    // "流畅一点", the queue must not look stuck). That landing plays on to its end on its own
     // panel; the new keypress's begin()/dismiss() no longer own or cut it. Core Animation
     // drives the bounce, so the panel only has to be removed when it is over.
     func detachLanding() {
@@ -484,7 +484,7 @@ final class CaptureAnimation {
         DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { teardown.finish() }
     }
     // Created at the keypress and ordered in at alpha 0 (invisible, click-through), so that
-    // showing the jelly or the toast at confirmation costs no window creation (test
+    // showing the jelly or the toast at confirmation costs no window creation (Ashley's
     // video, 15:40: the real tile showed for 100-170 ms before the copy).
     private var spareFlight: CaptureFeedbackPanel?
     private var spareToast: CaptureFeedbackPanel?
@@ -758,7 +758,7 @@ final class CaptureAnimation {
 
     // User input during the landing removes only that overlay; the toast stays.
     // An interruption fades the landing copy out (the real tile is right underneath) instead of
-    // cutting it mid-bounce (2026-10-25: a cut-off jelly looked wrong).
+    // cutting it mid-bounce (2026-10-25, Ashley: "果冻很奇怪").
     func fadeFlight() {
         guard let panel = flightPanel, lastArrivalStatus == "landing" || lastArrivalStatus == "sampling" else {
             cancelFlight(); return
@@ -807,35 +807,45 @@ final class CaptureAnimation {
     }
 
     private var transferNoticeShowing = false
+    private var transferNoticeRequestID: String?
 
     // Reuse the result-toast panel and drawing; updates change text without an entrance animation.
-    func showTransferNotice(_ title: String) {
+    func showTransferNotice(_ title: String, requestID: String? = nil, onCancel: (() -> Void)? = nil) {
         if let until = toastFadeAt, until > ProcessInfo.processInfo.systemUptime { return }
-        if transferNoticeShowing, let feedback, panel != nil {
-            feedback.showProgress(title: title); return
+        if transferNoticeShowing, transferNoticeRequestID == requestID, let feedback, let panel {
+            feedback.showProgress(title: title, onCancel: onCancel)
+            panel.ignoresMouseEvents = onCancel == nil
+            return
         }
         guard let screen = toastScreen ?? NSScreen.main else { return }
         removeDetachedToast()
         dismissal?.cancel(); dismissal = nil
+        feedback?.clear()
         panel?.orderOut(nil)
         let frame = CaptureCardLayout.panelFrame(in: screen.visibleFrame)
         let panel = takePanel(&spareToast, frame: frame, allSpaces: true)
         let view = CaptureFeedbackView(frame: NSRect(origin: .zero, size: frame.size), scale: screen.backingScaleFactor)
         panel.contentView = view
         self.panel = panel; feedback = view; transferNoticeShowing = true
-        view.showProgress(title: title)
+        transferNoticeRequestID = requestID
+        view.showProgress(title: title, onCancel: onCancel)
+        panel.ignoresMouseEvents = onCancel == nil
         panel.alphaValue = 1
         panel.orderFrontRegardless()
     }
 
     func hideTransferNotice() {
         guard transferNoticeShowing else { return }
+        feedback?.clear()
         panel?.orderOut(nil); panel = nil; feedback = nil
         transferNoticeShowing = false
+        transferNoticeRequestID = nil
     }
 
     private func showToast(success: Bool, title: String) -> Bool {
         transferNoticeShowing = false
+        transferNoticeRequestID = nil
+        feedback?.clear()
         panel?.orderOut(nil)
         removeDetachedToast() // two toasts never stack in the corner
         guard let screen = toastScreen ?? NSScreen.main else { return false }
@@ -1187,15 +1197,21 @@ private final class CaptureFeedbackPanel: NSPanel {
 
 // The result toast in the Toss style (SettingsStyle palette, Hanken Grotesk):
 // a drawn check or cross and one line of text, 280 x 56.
-private final class CaptureFeedbackView: NSView {
+final class CaptureFeedbackView: NSView {
     private let card = CALayer()
     private let mark = CAShapeLayer()
     private let title = CATextLayer()
     private var markIsSuccess = true
     private var markIsProgress = false
+    private let cancelButton = CaptureCancelButton(frame: .zero)
+    private var onCancel: (() -> Void)?
 
     override var acceptsFirstResponder: Bool { false }
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !cancelButton.isHidden, cancelButton.isEnabled,
+              cancelButton.frame.contains(convert(point, from: superview)) else { return nil }
+        return cancelButton
+    }
 
     private static let ease = CAMediaTimingFunction(controlPoints: 0.2, 0.8, 0.2, 1)
 
@@ -1226,6 +1242,20 @@ private final class CaptureFeedbackView: NSView {
         mark.lineCap = .round
         mark.lineJoin = .round
         card.addSublayer(mark)
+        cancelButton.frame = NSRect(x: m - 6, y: m + CaptureCardLayout.height - 16, width: 22, height: 22)
+        cancelButton.isBordered = false
+        cancelButton.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 9, weight: .semibold))
+        cancelButton.imagePosition = .imageOnly
+        cancelButton.setAccessibilityLabel(L("Cancel Capture", "取消截图"))
+        cancelButton.toolTip = L("Cancel Capture", "取消截图")
+        cancelButton.wantsLayer = true
+        cancelButton.layer?.cornerRadius = 11
+        cancelButton.layer?.borderWidth = 1
+        cancelButton.target = self
+        cancelButton.action = #selector(cancelPressed)
+        cancelButton.isHidden = true
+        addSubview(cancelButton)
         refreshColors()
         setAccessibilityElement(false)
     }
@@ -1243,6 +1273,9 @@ private final class CaptureFeedbackView: NSView {
                 card.backgroundColor = SettingsStyle.background.cgColor
                 card.borderColor = SettingsStyle.line.cgColor
                 title.foregroundColor = SettingsStyle.ink.cgColor
+                cancelButton.contentTintColor = SettingsStyle.muted
+                cancelButton.layer?.backgroundColor = SettingsStyle.background.cgColor
+                cancelButton.layer?.borderColor = SettingsStyle.line.cgColor
                 let colors = CaptureCardMarkColors.colors(progress: markIsProgress, success: markIsSuccess)
                 mark.strokeColor = colors.stroke.cgColor
                 mark.fillColor = colors.fill?.cgColor
@@ -1250,7 +1283,10 @@ private final class CaptureFeedbackView: NSView {
         }
     }
 
-    func showProgress(title text: String) {
+    func showProgress(title text: String, onCancel: (() -> Void)? = nil) {
+        self.onCancel = onCancel
+        cancelButton.isHidden = onCancel == nil
+        cancelButton.isEnabled = onCancel != nil
         markIsSuccess = true
         markIsProgress = true
         refreshColors()
@@ -1266,6 +1302,7 @@ private final class CaptureFeedbackView: NSView {
 
     // Slides up 8 pt and fades in; the check (or cross) draws itself in.
     func show(success: Bool, title text: String, reduceMotion: Bool) {
+        clearCancelAction()
         markIsSuccess = success
         markIsProgress = false
         refreshColors()
@@ -1330,7 +1367,20 @@ private final class CaptureFeedbackView: NSView {
     }
 
     func clear() {
+        clearCancelAction()
         withoutActions { for item in [card, mark, title] { item.removeAllAnimations() } }
+    }
+
+    private func clearCancelAction() {
+        onCancel = nil
+        cancelButton.isHidden = true
+        cancelButton.isEnabled = false
+    }
+
+    @objc private func cancelPressed() {
+        guard let action = onCancel else { return }
+        clearCancelAction()
+        action()
     }
 
     func disableMotion() {
@@ -1344,6 +1394,13 @@ private final class CaptureFeedbackView: NSView {
         body()
         CATransaction.commit()
     }
+}
+
+// The first click cancels without activating Toss or taking the chat's keyboard focus.
+private final class CaptureCancelButton: NSButton {
+    override var acceptsFirstResponder: Bool { false }
+    override var needsPanelToBecomeKey: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
 // Patch style only. Captures the thin strips beside the confirmed chip (never Toss's own
@@ -1395,7 +1452,7 @@ func renderToastView(success: Bool, title: String) -> NSView {
 #endif
 
 // The "on its way" dot is neutral grey: colour in Toss is only the green/red result mark
-// (design rule, 2026-11-03). The result check/cross is stroked only, never filled.
+// (Ashley's rule, 2026-11-03). The result check/cross is stroked only, never filled.
 enum CaptureCardMarkColors {
     static func colors(progress: Bool, success: Bool) -> (stroke: NSColor, fill: NSColor?) {
         if progress { return (SettingsStyle.muted, SettingsStyle.muted) }

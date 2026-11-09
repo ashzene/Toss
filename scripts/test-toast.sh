@@ -8,5 +8,5 @@ trap 'rm -rf "$temporary_dir"' EXIT
 xcrun swiftc -swift-version 5 -target arm64-apple-macosx14.0 \
   -framework AppKit -framework ApplicationServices -framework QuartzCore -framework CoreText \
   Sources/Language.swift Sources/StrictTarget.swift Sources/ClaudeTarget.swift Sources/ChatTarget.swift Sources/TargetActivator.swift \
-  Sources/SettingsStyle.swift Sources/Toast.swift Tests/ToastTests.swift -o "$temporary_dir/toast-tests"
+  Sources/SettingsStyle.swift Sources/Toast.swift Sources/SuccessSound.swift Tests/ToastTests.swift -o "$temporary_dir/toast-tests"
 "$temporary_dir/toast-tests"

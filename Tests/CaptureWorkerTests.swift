@@ -317,11 +317,22 @@ struct CaptureWorkerTests {
             let domain = "local.toss.limits-tests.\(UUID().uuidString)"
             let defaults = UserDefaults(suiteName: domain)!
             defer { defaults.removeVolatileDomain(forName: UserDefaults.registrationDomain) }
-            try expect(CaptureWorker.progressLimits(defaults) == ["first_byte": 800, "stall": 1200, "press_cap": 8000],
+            try expect(CaptureWorker.progressLimits(defaults) == ["first_byte": 800, "stall": 2500, "press_cap": 30000],
                        "default progress limits")
-            defaults.register(defaults: ["firstByteLimitMs": 50.0, "pressCapMs": 9000.0])
+            try expect(CaptureWorker.attemptLimits(["stall": 2500, "press_cap": 8000], role: .usbPrimary) == ["stall": 1200, "press_cap": 8000],
+                       "USB keeps the short stall limit")
+            try expect(CaptureWorker.attemptLimits(["stall": 2500], role: .wifiPrimary) == ["stall": 2500],
+                       "Wi-Fi keeps the longer stall limit")
+            var drop = USBDropNotice()
+            try expect(!drop.shouldShow(externalConnected: false, usbBack: false, at: 1), "really unplugged: no notice")
+            try expect(!drop.shouldShow(externalConnected: nil, usbBack: false, at: 1), "unknown power: no notice")
+            try expect(!drop.shouldShow(externalConnected: true, usbBack: true, at: 1), "USB came back: no notice")
+            try expect(drop.shouldShow(externalConnected: true, usbBack: false, at: 1), "still powered: notice")
+            try expect(!drop.shouldShow(externalConnected: true, usbBack: false, at: 500), "quiet for ten minutes")
+            try expect(drop.shouldShow(externalConnected: true, usbBack: false, at: 601), "notice again after ten minutes")
+            defaults.register(defaults: ["firstByteLimitMs": 50.0, "pressCapMs": 31000.0])
             let clamped = CaptureWorker.progressLimits(defaults)
-            try expect(clamped["first_byte"] == 200 && clamped["press_cap"] == 8000 && clamped["stall"] == 1200,
+            try expect(clamped["first_byte"] == 200 && clamped["press_cap"] == 30000 && clamped["stall"] == 2500,
                        "limits are clamped to what the backend accepts")
             try expect(CaptureWorker.reconnectingFailures == ["timeout", "first_byte_timeout", "stall_timeout", "too_slow", "disconnected", "slow_threshold"],
                        "progress failures keep the reconnecting worker like a timeout")
@@ -451,6 +462,32 @@ struct CaptureWorkerTests {
             try expect(requests.count == 3 && requests[0]["worker_pid"] as? Int == requests[2]["worker_pid"] as? Int,
                        "USB cleanup queue spawned a competing session")
             print("PASS next press waits for draining USB, then reuses USB without a second upload")
+        }
+        // The cable arrives while a press waits on a stuck Wi-Fi attempt: it moves to USB at once, exactly once.
+        do {
+            let (folder, config) = try context("usb-arrives", "usb-arrives")
+            let worker = CaptureWorker(wifiHedgingEnabled: false); defer { worker.stop() }
+            try worker.prepare(configuration: config)
+            try await waitUntil(within: 1.5) { worker.connectionStatus.state == .ready }
+            let box = Box()
+            try request(worker, config, folder, box)
+            try await waitUntil(within: 1.0) {
+                audit(folder).contains { $0["event"] as? String == "request" && $0["transport"] as? String == "wifi" }
+            }
+            let plugged = ProcessInfo.processInfo.systemUptime
+            try Data().write(to: folder.appendingPathComponent("usb-present"))
+            let result = try await response(box, within: 2.0)
+            try expect(result.exit == 0 && result.json["transport"] as? String == "authenticated_usb", "press did not move to the new cable")
+            try expect(ProcessInfo.processInfo.systemUptime - plugged < 1.5, "press waited after the cable arrived")
+            let id = result.json["request_id"] as! String
+            try expect(try String(contentsOf: folder.appendingPathComponent(id + ".png"), encoding: .utf8) == "usb", "wrong route published")
+            try await Task.sleep(nanoseconds: 400_000_000)
+            try expect(box.responses.count == 1, "moved press completed twice")
+            let routes = (result.json["route_attempts"] as? [[String: Any]])?.compactMap { $0["transport"] as? String }
+            try expect(routes == ["usb"], "the moved press must record its USB attempt")
+            try expect(try FileManager.default.contentsOfDirectory(atPath: folder.path).filter { $0.hasPrefix(".capture-attempt-") }.isEmpty,
+                       "abandoned attempt file was retained")
+            print("PASS usb-arrives: a waiting Wi-Fi press moved to the new cable, exactly once")
         }
         for mode in ["usb-progress-late", "usb-stall-late", "usb-tooslow-late", "usb-failure", "usb-unplug", "usb-wrong-attempt"] {
             let (folder, config) = try context(mode, mode)
@@ -688,23 +725,27 @@ struct CaptureWorkerTests {
             try mode.write(to: folder.appendingPathComponent("mode"), atomically: true, encoding: .utf8)
             return (folder, .init(python: python, script: fixture, stateDirectory: folder.path, outputDirectory: folder.path))
         }
-        for mode in ["flow-12mb", "flow-no-bytes", "flow-stalled", "flow-too-long"] {
-            let (folder, config) = try context(mode, mode)
-            let worker = CaptureWorker(wifiHedgingEnabled: false); defer { worker.stop() }
+        for (mode, direct) in [("flow-12mb", false), ("flow-slow-wifi", false), ("flow-slow-wifi", true),
+                               ("flow-no-bytes", false), ("flow-stalled", false), ("flow-too-long", false)] {
+            let (folder, config) = try context(mode + (direct ? "-direct" : ""), mode)
+            let worker = CaptureWorker(wifiHedgingEnabled: false, wifiOnly: direct); defer { worker.stop() }
             var progress: [Double] = []
             worker.onCaptureProgress = { _, got, total in if total > 0 { progress.append(got / total) } }
             let box = Box(), at = ProcessInfo.processInfo.systemUptime
             try request(worker, config, folder, box, timeout: 40)
-            let result = try await response(box, within: 8.5)
+            let result = try await response(box, within: mode == "flow-too-long" ? 31 : 12)
             let elapsed = ProcessInfo.processInfo.systemUptime - at
-            try expect(result.exit == (mode == "flow-12mb" ? 0 : 1), "\(mode): incorrect outcome \(result.json)")
+            try expect(result.exit == (["flow-12mb", "flow-slow-wifi"].contains(mode) ? 0 : 1), "\(mode): incorrect outcome \(result.json)")
             if mode == "flow-12mb" {
                 try expect(elapsed > 5.5 && elapsed < 8 && progress.count > 10 && progress.last! > 0.9,
                            "flowing transfer or its progress was cut off")
-            } else if mode == "flow-too-long" { try expect(elapsed >= 7.9 && elapsed < 8.5, "hard cap moved") }
+            } else if mode == "flow-slow-wifi" {
+                try expect(elapsed >= 10 && elapsed < 12 && progress.count > 20 && progress.last! > 0.9,
+                           "iPad transfer must finish beyond the old 8-second cutoff, direct=\(direct)")
+            } else if mode == "flow-too-long" { try expect(elapsed >= 29.9 && elapsed < 31, "30-second hard cap moved") }
             else if mode == "flow-stalled" {
-                try expect(result.json["reason"] as? String == "stall_timeout" && elapsed >= 1.7 && elapsed < 3,
-                           "received bytes then a 1.2-second stall must fail before the normal 4.5-second budget")
+                try expect(result.json["reason"] as? String == "stall_timeout" && elapsed >= 2.5 && elapsed < 4.4,
+                           "received bytes then a 2.5-second stall must fail before the normal 4.5-second budget")
             } else { try expect(elapsed >= 4.4 && elapsed < 5, "silent transfer must not extend") }
             try expect(box.responses.count == 1, "duplicate completion")
             print("PASS \(mode): \(String(format: "%.2f", elapsed)) seconds, \(progress.count) progress updates")

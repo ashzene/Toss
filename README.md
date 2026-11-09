@@ -29,6 +29,10 @@ Toss brings the right chat window forward first, then captures and attaches. Wor
 
 Since 1.0.4, you can also add an iPad screenshot to ChatGPT’s Dot. Open Dot and press both Option keys together; the screenshot stays in the draft until you send it.
 
+## See where the screenshot went
+
+Since 1.0.8, the Toss menu shows the last screenshot’s destination, file size, elapsed time and actual USB or Wi-Fi route, for example **Claude · 3.2 MB · 1.4 s · Wi-Fi**. It shows **Success** after confirming the attachment in the draft. Otherwise it shows **Not successful** with a short explanation; if confirmation is missing, check the draft before trying again. A clipboard-only result says **Clipboard**.
+
 ## Get started
 
 1. Download the latest [release](https://github.com/ashzene/Toss/releases/latest), open the disk image, and double-click **Toss Installer**. In its window, drag Toss into Applications; Toss installs and opens its setup guide automatically.

@@ -136,7 +136,7 @@ final class SetupWizard {
         }
     }
 
-    // Shown after about 30 s of waiting for Trust, in place of the usual line (2026-10-30).
+    // Shown after about 30 s of waiting for Trust, in place of the usual line (Ashley 2026-10-30).
     static var trustHint: String { L("No prompt? Unplug the cable, plug it back in.", "没看到提示？拔下数据线再插上。") }
     static let trustHintAfter = 30.0
 
@@ -165,7 +165,7 @@ final class SetupWizard {
         case "pairing_wireless":
             return L("Setting up wireless pairing…", "正在建立无线配对…")
         case "preparing_image":
-            return L("Preparing the iPad… about a minute.", "正在准备 iPad…约 1 分钟。")
+            return L("Preparing the iPad… a few minutes.", "正在准备 iPad…可能要几分钟。")
         case "wifi_waiting":
             return L("Looking for the iPad on your Wi-Fi…", "正在 Wi-Fi 上找 iPad…")
         case "pairing_failed":

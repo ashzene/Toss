@@ -72,7 +72,7 @@ out = sys.argv[1]
 # Success (v2, 2026-10-24: v1 at A5->E6 was too sharp and too close to Codex's tick + thump).
 # Round mid-register tones, 9 ms attack (no click), almost no upper harmonics.
 variant = sys.argv[2] if len(sys.argv) > 2 else "E"
-if variant == "E":   # two round notes up a fourth, G4 -> C5: "all set"
+if variant == "E":   # two round notes up a fourth, G4 -> C5: "放好了"
     L, R = mix([pluck(392.0, 0.000, 0.42, 7, 14, tilt=2.4, pan=0.45, cutoff=2400, attack_s=0.009),
                 pluck(523.25, 0.085, 0.50, 5, 12, tilt=2.4, pan=0.55, cutoff=2400, attack_s=0.009)], 0.62)
 else:                # "F": one soft tone lifting from A4 towards D5: a single "whoop" up

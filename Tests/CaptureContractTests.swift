@@ -43,6 +43,7 @@ struct CaptureContractTests {
         }
         let receipt = try validate()
         expect(receipt.capturedAt == 199.0 && receipt.expiresAt == 209.0)
+        expect(receipt.byteCount == bytes.count)
         let landscape = try validate(changed(["width": 2388, "height": 1668]))
         expect(landscape.capturedAt == 199.0)
         expect(try validate(changed(["transport": "authenticated_usb"])).capturedAt == 199.0)
@@ -74,9 +75,15 @@ struct CaptureContractTests {
         expectThrows { try validate(changed(["capture_completed_monotonic": 198.4])) }
         expectThrows { try validate(changed(["request_completed_monotonic": 198.9])) }
         expectThrows { try validate(changed(["request_completed_monotonic": 201.0])) }
+        // Slow transfer duration and stale completed images are separate checks.
+        let slow = changed(["capture_started_monotonic": 198.3,
+                            "capture_completed_monotonic": 208.3,
+                            "request_completed_monotonic": 208.4])
+        expect(try validate(slow, now: 208.5).capturedAt == 208.3)
+        expectThrows { try validate(slow, now: 213.31) }
         expectThrows { try validate(changed(["capture_started_monotonic": 198.3,
-                                           "capture_completed_monotonic": 207.0,
-                                           "request_completed_monotonic": 207.1]), now: 207.2) }
+                                           "capture_completed_monotonic": 228.4,
+                                           "request_completed_monotonic": 228.5]), now: 228.6) }
         expectThrows { try validate(triggered: 150.0) }
         expectThrows { try validate(now: .infinity) }
         expectThrows { try validate(triggered: .nan) }

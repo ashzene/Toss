@@ -44,6 +44,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private var diagnosticRequestStartedAt: Double?
     // The keypress in progress, written to capture-history.jsonl when it ends.
     private var captureRecord: CaptureRecord?
+    private var lastCaptureResult: TossCaptureResult?
     private lazy var captureHistory = CaptureHistory(url: base.appendingPathComponent("capture-history.jsonl"))
     private let setupWizard = SetupWizard()
     private var setupStatus: NSTextField?
@@ -106,6 +107,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var enabled = false
     private let captureWorker = CaptureWorker(wifiHedgingEnabled: false)
+    private var usbDropNotice = USBDropNotice()
+    private var usbDropCheckRunning = false
     private var capturePipeline = CapturePipeline()
     private var chordDetector = CaptureChordDetector()
     private var pipelineCaptures: [UInt64: EarlyCapture] = [:]
@@ -120,7 +123,9 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private let newDraftInteraction = AppendInteractionWatch()
     private var backendTimings: [String: Double] = [:]
     private var connectionReused: Bool?
-    private var successSound: NSSound?
+    private var successSounds: [SuccessSound: NSSound] = [:]
+    private var lastSuccessSound: SuccessSound?
+    private var lastSuccessSoundBytes: Int?
     // Cues start here, not on the main thread: starting one costs 11-30 ms, which must
     // not delay the jelly that covers the new attachment.
     private let cueQueue = DispatchQueue(label: "Toss.cues", qos: .userInteractive)
@@ -170,7 +175,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private var lastPastePostedAt: Double?
     // Whether the last confirmed toss's tile has stopped growing (see startQueuedPress).
     private var landingSettle = AttachmentSighting.LandingSettleGate()
-    // Queued presses (2026-10-28: paste where it was pressed), keyed by press time: the chat the
+    // Queued presses (Ashley 2026-10-28: 「就在原来的地方贴」), keyed by press time: the chat the
     // press was made in, when it is provably the running toss's chat (same app, and no click,
     // scroll or typing since that chat was checked). Taken from memory; no AX read on the key event.
     private var queuedBindings: [Double: any ChatLease] = [:]
@@ -230,7 +235,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         return path.hasPrefix("/Volumes/") || path.contains("/AppTranslocation/")
     }
 
-    // Replaces the old install script: copy to Applications and remove the download
+    // Replaces 安装.command: copy to Applications and remove the download
     // quarantine (else macOS blocks the bundled runtime). Asks once; macOS shows
     // its own password window only when Applications needs an administrator.
     // Returns true when this instance is about to quit (relaunch or declined).
@@ -280,7 +285,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil)
             return true
         }
-        relaunch(at: destination)
+        relaunch(at: destination, showSetup: true)
         return true
     }
 
@@ -314,11 +319,11 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         return process.terminationStatus == 0
     }
 
-    private func relaunch(at path: String = Bundle.main.bundlePath) {
+    private func relaunch(at path: String = Bundle.main.bundlePath, showSetup: Bool = false) {
         guard !uninstalling else { return }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-c", "sleep 1.5; /usr/bin/open \"$0\"", path]
+        process.arguments = ["-c", "sleep 1.5; /usr/bin/open \"$0\"" + (showSetup ? " --args --show-setup" : ""), path]
         try? process.run()
         stop(reason: L("Reopening…", "正在重新打开…"))
         NSApp.terminate(nil)
@@ -435,11 +440,13 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         interfacePrepared = true
         startKeepAliveCheck()
         // Load once without playing. Never put audio I/O in the capture path.
-        // Toss's own cues (Assets/Sounds); there is no Codex fallback.
+        // Toss's own cues (Assets/Sounds, Ashley's picks); there is no Codex fallback.
         func sound(_ name: String) -> NSSound? {
             Bundle.main.url(forResource: name, withExtension: "aiff").flatMap { NSSound(contentsOf: $0, byReference: false) }
         }
-        successSound = sound("Toss-Success")
+        for tier in SuccessSound.allCases {
+            successSounds[tier] = sound(tier.rawValue)
+        }
         failureSound = sound("Toss-Failure")
         NSApp.setActivationPolicy(startup.shouldShowInitialSettings ? .regular : .accessory)
         // First launch: start near the right edge so a crowded bar doesn't push the icon under the
@@ -466,11 +473,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         _ = add(menu, L("Copy Diagnostics", "复制诊断信息"), #selector(copyDiagnostics))
         menu.addItem(.separator())
         _ = add(menu, L("Quit", "退出"), #selector(quit))
-        menuStatus = TossStatusController(item: item, menu: menu,
-            recheck: { [weak self] in self?.recheckMenuConnection() },
-            settings: { [weak self] in self?.showSettings() },
-            diagnostics: { [weak self] in self?.showDiagnostics() },
-            exportLogs: { [weak self] in self?.exportLogs() })
+        menuStatus = makeStatusController(item: item, menu: menu)
         for worker in [captureWorker] {
             worker.onConnectionChange = { [weak self] _ in
                 guard let self else { return }
@@ -480,6 +483,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
                 self.refreshMenuStatus()
                 self.recordConnectionEvent(status)
             }
+            worker.onUSBLost = { [weak self] in self?.checkUSBDrop() }
             worker.onCaptureSlow = { [weak self] requestID in
                 guard let self else { return }
                 self.slowPipelineIDs.insert(requestID)
@@ -622,7 +626,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             // Keep the column as tall as its text, so the title re-centres when the note hides.
             labels.setHuggingPriority(.defaultHigh, for: .vertical)
             let view = hstack([labels, spacer()] + trailing, spacing: 10)
-            // Roomier rows (2026-10-30).
+            // Roomier rows (Ashley 2026-10-30: 「太紧凑了」).
             let pad = SettingsStyle.settingsRowPad ?? SettingsStyle.rowPad
             view.edgeInsets = NSEdgeInsets(top: pad, left: 0, bottom: pad, right: 0)
             view.heightAnchor.constraint(greaterThanOrEqualToConstant: 28 + 2 * pad).isActive = true
@@ -700,7 +704,6 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             more.addItem(entry)
             return entry
         }
-        _ = moreItem(L("Set Up iPad…", "设置 iPad…"), #selector(openOnboarding))
         checkMenuItem = moreItem(L("Check iPad", "检查 iPad"), #selector(runSetup))
         _ = moreItem(L("Cancel Capture", "取消截图"), #selector(cancelCurrent))
         _ = moreItem(L("Refresh Access", "刷新权限"), #selector(refreshPermissions))
@@ -709,7 +712,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         more.addItem(.separator())
         forgetMenuItem = moreItem(L("Forget iPad…", "忘记这台 iPad…"), #selector(forgetDevice))
         settingsMore = more
-        let footer = hstack([SettingsPill(L("User guide", "使用说明"), target: self, action: #selector(showInstructions)),
+        let footer = hstack([SettingsPill(L("Setup guide", "设置引导"), target: self, action: #selector(openOnboarding)),
                              SettingsPill(L("Diagnostics", "诊断信息"), target: self, action: #selector(showDiagnostics)),
                              SettingsPill(L("More…", "更多…"), target: self, action: #selector(showSettingsMore(_:))), spacer(),
                              SettingsPill(L("Quit Toss", "退出 Toss"), kind: .quiet, target: self, action: #selector(quit))], spacing: 8)
@@ -724,13 +727,13 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         window.center()
     }
 
-    // Settings → Language: Follow System (default) / Simplified Chinese / English. Each choice is named in its own
+    // Settings → Language: Follow System (default) and every AppLanguage. Each choice is named in its own
     // language so it can be found whatever the current one is.
     private func languageMenu() -> NSPopUpButton {
         let popup = NSPopUpButton(frame: .zero, pullsDown: false)
         popup.font = SettingsStyle.sans(13)
-        popup.addItems(withTitles: [L("Follow System", "跟随系统"), "简体中文", "English"])
-        popup.selectItem(at: [AppLanguage.system, .chinese, .english].firstIndex(of: AppLanguage.choice) ?? 0)
+        popup.addItems(withTitles: AppLanguage.allCases.map { $0 == .system ? L("Follow System", "跟随系统") : $0.nativeName })
+        popup.selectItem(at: AppLanguage.allCases.firstIndex(of: AppLanguage.choice) ?? 0)
         popup.target = self
         popup.action = #selector(languageChosen(_:))
         popup.setAccessibilityLabel(L("Language", "语言"))
@@ -741,10 +744,11 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     // seconds) and comes back to Settings; shortcuts resume as before.
     @objc private func languageChosen(_ sender: NSPopUpButton) {
         guard !uninstalling else { return }
-        let choice = [AppLanguage.system, .chinese, .english][max(0, min(2, sender.indexOfSelectedItem))]
-        let wasChinese = AppLanguage.isChinese
+        let languages = AppLanguage.allCases
+        let choice = languages[max(0, min(languages.count - 1, sender.indexOfSelectedItem))]
+        let before = AppLanguage.current
         AppLanguage.choice = choice
-        guard AppLanguage.isChinese != wasChinese else { return }
+        guard AppLanguage.current != before else { return }
         UserDefaults.standard.set(true, forKey: Self.reopenSettingsKey)
         UserDefaults.standard.synchronize()
         relaunch()
@@ -820,7 +824,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         case (true, .connecting):
             networkState?.show(L("Connecting…", "正在连接…"), dot: SettingsStyle.accent)
             networkDetail?.stringValue = ""
-            networkButton?.isHidden = true
+            networkButton?.title = L("Retry", "重试")
+            networkButton?.isHidden = false
         case (true, .disconnected), (true, .failed):
             networkState?.show(L("Not connected", "没连上"), dot: SettingsStyle.accent)
             networkDetail?.stringValue = connection.errorMessage ?? L("Unlock iPad, use the same Wi-Fi.", "解锁 iPad，连同一个 Wi-Fi。")
@@ -894,7 +899,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
                 !setupWizard.isRunning && enableTask == nil,
             lastMessage: lastStatus, retryError: lastConnectionFailure,
             uploadTarget: targetKind == .claude ? .claude : .codex,
-            summary: summary.text, summaryTone: summary.tone))
+            summary: summary.text, summaryTone: summary.tone,
+            lastCaptureResult: lastCaptureResult, captureInProgress: captureRecord != nil))
         refreshSettingsUI()
     }
 
@@ -912,6 +918,15 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         refreshMenuStatus()
     }
 
+    private func makeStatusController(item: NSStatusItem, menu: NSMenu) -> TossStatusController {
+        TossStatusController(item: item, menu: menu,
+            recheck: { [weak self] in self?.recheckMenuConnection() },
+            settings: { [weak self] in self?.showSettings() },
+            diagnostics: { [weak self] in self?.showDiagnostics() },
+            exportLogs: { [weak self] in self?.exportLogs() },
+            openSetupIfNeeded: { [weak self] in self?.openSetupIfNeeded() ?? false })
+    }
+
     @objc private func showMenuStatus() {
         refreshMenuStatus()
         menuStatus?.showPanel()
@@ -919,6 +934,9 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showSettings() {
         guard !uninstalling else { return }
+        #if TOSS_RENDER
+        if let opened = RenderState.onOpenInterface { opened("settings"); return }
+        #endif
         prepareInterface()
         refreshPermissions()
         refreshStartupUI()
@@ -929,8 +947,15 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         afterSettingsShown()
     }
 
+    // Manual app entry is always recoverable after an incomplete/dismissed setup.
+    @discardableResult private func openSetupIfNeeded() -> Bool {
+        guard OnboardingPolicy.opensFromIcon(paired: hasPairing, guideVisible: onboarding?.isVisible == true) else { return false }
+        showOnboarding()
+        return true
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if onboarding?.isVisible == true { showOnboarding(); return true }
+        if openSetupIfNeeded() { return true }
         showSettings()
         return true
     }
@@ -939,18 +964,83 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidBecomeActive(_ notification: Notification) { refreshPermissions() }
 
+    private var usbSetupObserver: USBSetupObserver?
+    private var usbSetupPolicy = USBSetupPolicy(dismissals: USBSetupDismissals(preferences: UserDefaults.standard))
+    private var usbSetupRetry: Timer?
+
+    private func startUSBSetupObserver() {
+        #if !TOSS_RENDER
+        guard usbSetupObserver == nil, !uninstalling else { return }
+        let observer = USBSetupObserver { [weak self] devices in
+            guard let self, !self.uninstalling, !self.terminating else { return }
+            self.usbSetupPolicy.update(devices)
+            self.offerUSBSetup()
+        }
+        usbSetupObserver = observer
+        observer.start()
+        #endif
+    }
+
+    private func stopUSBSetupObserver() {
+        usbSetupRetry?.invalidate(); usbSetupRetry = nil
+        usbSetupObserver?.stop(); usbSetupObserver = nil
+    }
+
+    private func pairedUSBSetupHashes() -> [String: String] {
+        var hashes: [String: String] = [:]
+        if let config = try? runtimeConfiguration(),
+           let data = try? Data(contentsOf: URL(fileURLWithPath: config.state_dir + "/target.json")),
+           let pin = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let hash = pin["device_hash"] as? String { hashes["iPad"] = hash }
+        return hashes
+    }
+
+    private func offerUSBSetup() {
+        guard !uninstalling, !terminating else { return }
+        let paired = hasPairing
+        let hashes = pairedUSBSetupHashes()
+        let blocked = core.isBusy || hasActiveWork || transaction != nil || enableTask != nil ||
+            captureWorker.isBusy || sleeping || runtimeQuarantined || onboarding != nil
+        let candidates = usbSetupPolicy.pending(paired: hashes, iPadOnly: true, hasPairing: paired)
+        if usbSetupPolicy.take(paired: hashes, iPadOnly: true, hasPairing: paired, blocked: blocked) != nil {
+            openOnboarding()
+            usbSetupPolicy.automaticPresented(candidates, visible: onboarding?.isVisible == true)
+        }
+        // Only an outstanding insertion needs this timer; an idle listener has no polling.
+        let pending = !usbSetupPolicy.pending(paired: hashes, iPadOnly: true, hasPairing: paired).isEmpty
+        if pending && usbSetupRetry == nil {
+            usbSetupRetry = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.offerUSBSetup() }
+            }
+        } else if !pending { usbSetupRetry?.invalidate(); usbSetupRetry = nil }
+    }
+
     func showInitialInterface() {
         guard !initialInterfaceShown else { return }
         initialInterfaceShown = true
         if installIfNeeded() { return }
         retireOtherInstances()
+        startUSBSetupObserver()
+        presentInitialInterface(afterInstall: CommandLine.arguments.contains("--show-setup"))
+    }
+
+    private func presentInitialInterface(afterInstall: Bool) {
+        if afterInstall {
+            showOnboarding()
+            if hasPairing && permissionsReady {
+                onboarding?.setTransport(currentConnection.state == .ready ? currentConnection.transportLabel : nil)
+                onboarding?.jump(to: .done)
+            }
+            restoreIfPossible()
+            return
+        }
         if UserDefaults.standard.bool(forKey: Self.reopenSettingsKey) {
             UserDefaults.standard.removeObject(forKey: Self.reopenSettingsKey)
             if onboarding == nil && hasPairing { showSettings(); restoreIfPossible(); return }
         }
         if OnboardingPolicy.opensAutomatically(paired: hasPairing, firstRun: startup.shouldShowInitialSettings,
                                                seen: UserDefaults.standard.bool(forKey: OnboardingPolicy.seenKey)) { showOnboarding() }
-        else if startup.shouldShowInitialSettings || !hasPairing { showSettings(); checkMenuIconSoon() }
+        else if startup.shouldShowInitialSettings { showSettings(); checkMenuIconSoon() }
         else { restoreIfPossible(); checkMenuIconSoon() }
     }
 
@@ -1259,8 +1349,10 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private func runtimeConfiguration() throws -> TossConfiguration {
         guard let python = Bundle.main.resourceURL?.appendingPathComponent("Runtime/python/bin/python3").path,
               fm.isExecutableFile(atPath: python) else { throw TossError.backendUnavailable }
+        let root = base.appendingPathComponent("DeviceState", isDirectory: true)
+        let state = IPadPairingState.existingDirectory(in: root) ?? root
         return TossConfiguration(python: python,
-                                 state_dir: base.appendingPathComponent("DeviceState", isDirectory: true).path)
+                                 state_dir: state.path)
     }
 
     // A browser download marks every file; macOS then blocks the bundled Python
@@ -1402,7 +1494,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Onboarding (step-by-step first setup)
 
-    @objc private func openOnboarding() { showOnboarding() }
+    @objc private func openOnboarding() { usbSetupPolicy.markPresented(); showOnboarding() }
 
     // System Settings → Menu Bar (macOS 26: the Control Center settings extension).
     private func openMenuBarSettings() {
@@ -1499,7 +1591,12 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
 
     private func showOnboarding() {
         guard !uninstalling else { return }
+        #if TOSS_RENDER
+        if let opened = RenderState.onOpenInterface { opened("setup"); return }
+        #endif
         prepareInterface()
+        menuStatus?.closePanel()
+        settingsWindow?.orderOut(nil)
         NSApp.setActivationPolicy(.regular)
         let controller = onboarding ?? makeOnboarding()
         controller.setAccessibility(permissionsReady)
@@ -1537,6 +1634,11 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         }
         controller.menuIconProbe = { [weak self] in self?.menuStatus?.iconVisibility() ?? .visible }
         controller.onOpenMenuBarSettings = { [weak self] in self?.openMenuBarSettings() }
+        controller.setupRunningProbe = { [weak self] in self?.setupWizard.isRunning == true }
+        controller.onCancelSetup = { [weak self] in
+            guard let self, self.setupWizard.isRunning else { return }
+            self.runSetup()
+        }
         controller.onReopen = { [weak self] in
             guard self?.uninstalling == false else { return }
             UserDefaults.standard.set(true, forKey: OnboardingPolicy.resumeAccessKey)
@@ -1544,11 +1646,14 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             self?.relaunch()
         }
         controller.onFinish = {}
-        // Closing it any way (done, cable only, or early) never cancels a running pairing and never
-        // reopens it at the next launch; "Set Up iPad…" under More opens it again.
+        // Closing never cancels pairing. Until a device is paired, launch/Dock/status
+        // entry offers this guide again even if an earlier step was dismissed.
         controller.onClose = { [weak self, weak controller] in
             guard let self else { return }
-            if !self.terminating, OnboardingPolicy.closeMarksSeen(step: controller?.flow.step ?? .done) {
+            let dismissedAutomatic = self.usbSetupPolicy.closed(
+                terminating: self.terminating || self.uninstalling,
+                completed: controller?.flow.step == .done, paired: self.pairedUSBSetupHashes())
+            if !self.terminating, dismissedAutomatic || OnboardingPolicy.closeMarksSeen(step: controller?.flow.step ?? .done) {
                 UserDefaults.standard.set(true, forKey: OnboardingPolicy.seenKey)
             }
             self.onboarding = nil
@@ -1574,9 +1679,11 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             refreshStartupUI()
         }
         captureWorker.stop()
+        let forgottenHash = pairedUSBSetupHashes()["iPad"]
         for name in ["strict-remote-pairing.plist", "target.json"] {
             try? fm.removeItem(atPath: config.state_dir + "/" + name)
         }
+        if !hasPairing, let forgottenHash { usbSetupPolicy.forget(forgottenHash) }
         lastSetupCode = "forgotten"
         UserDefaults.standard.removeObject(forKey: OnboardingPolicy.wirelessKey)
         setupAutoStarted = false
@@ -1616,7 +1723,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         if !queued, ActivationPolicy.isReady(TargetActivator.observe(kind)) {
             do {
                 setStatus(L("Checking the current window and chat…", "正在检查当前窗口和聊天…"), code: "locating_target")
-                // Speed: ask the iPad now, so the screenshot RPC runs
+                // Speed (提速副本): ask the iPad now, so the screenshot RPC runs
                 // while locateLease() reads the chat, instead of after it. The
                 // result is still used only once the lease exists and passes
                 // every check below; on any failure it is discarded.
@@ -1634,7 +1741,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         guard core.activeRequestID == request.id else { return }
         let task = Task { @MainActor [weak self] in
             do {
-                // Clicks, typing or scrolling never abandon the keypress (2026-10-28):
+                // Clicks, typing or scrolling never abandon the keypress (Ashley 2026-10-28):
                 // the paste still goes to the chat the shortcut was pressed for.
                 let outcome = try await TargetActivator.bringForward(kind, shouldContinue: { [weak self] in self != nil })
                 guard let self, self.isCurrentActivation(request.id) else { return }
@@ -1747,7 +1854,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         earlyCapture = nil
         earlyTargetFailure = nil
         abandonedCaptureID = early.uuid
-        // Speed: an unanswered request no longer stops the worker.
+        // Speed (提速副本): an unanswered request no longer stops the worker.
         // Stopping it threw away the authenticated iPad connection, so the next
         // keypress paid a multi-second reconnect. The late receipt is ignored
         // and its file deleted by the completion in startEarlyCapture().
@@ -1989,7 +2096,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
                 self.earlyFocusTask = nil
                 // If the user switched apps or clicked elsewhere while the screenshot was on its way,
                 // bring the original chat back first; focusLease alone fails when another app is in
-                // front and would drop to the manual-paste fallback (paste in the original place).
+                // front and would drop to the manual-paste fallback (Ashley: paste in the original place).
                 try await self.refocusIfUserMoved(tx, chatTarget)
                 // focus() checks focus cheaply; the full lease check runs right before Cmd+V.
                 try await self.retryingSettlingTree(tx) { try await chatTarget.focusLease(tx.lease) }
@@ -2168,12 +2275,15 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
                 }
                 self.firstTileRaw = nil
                 self.prePaste = nil
-                // Result order (2026-10-24, felt slow): the sound first, at once; then the
+                // Result order (Ashley 2026-10-24 "好慢"): the sound first, at once; then the
                 // toast; then the jelly, whose window setup (~20 ms) must not delay the sound.
                 // Only an acknowledged native attachment earns this cue. Audio
-                // failure must not change success or retry the paste. Restart a
-                // still-playing cue if two successful requests arrive rapidly.
-                if let cue = self.successSound { self.cueQueue.async { cue.stop(); cue.play() } }
+                // failure must not change success or retry the paste. Use this
+                // transaction's verified file size, even when later captures are ready.
+                let soundTier = SuccessSound.forFileSize(tx.receipt?.byteCount)
+                self.lastSuccessSound = soundTier
+                self.lastSuccessSoundBytes = tx.receipt?.byteCount
+                self.playResultCue(self.successSounds[soundTier] ?? self.successSounds[.small])
                 self.onboarding?.tossed()
                 // The ✓ toast shows only when "Show notifications" is on.
                 let result = ToastContent.success(target: tx.kind)
@@ -2288,11 +2398,11 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             L("Keys or draft changed. Cancelled; release the keys before trying again.", "按键或草稿变了，已取消。松开按键再试。"), code: "input_interrupted")
     }
 
-    // The user clicked, typed or scrolled since the last focus (2026-10-28: never give
+    // The user clicked, typed or scrolled since the last focus (Ashley 2026-10-28: never give
     // up, paste in the original place): bring the leased window back and put the keyboard in
     // the leased composer again. The lease check right before Cmd+V still refuses another chat.
     private func refocusIfUserMoved(_ tx: Transaction, _ chatTarget: ChatTarget) async throws {
-        // The user may click the other app again while Toss brings the chat back (2026-10-28 13:29): try a
+        // She may click the other app again while Toss brings the chat back (2026-10-28 13:29): try a
         // few times, then give up to the manual-paste path; Cmd+V still needs the verified composer.
         for attempt in 1...QueuedDestinationPolicy.refocusAttempts {
             guard newDraftInteraction.intervened || NSWorkspace.shared.frontmostApplication?.processIdentifier != tx.lease.pid
@@ -2580,7 +2690,11 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         let progress = pipelineProgress[uuid]
         let title = TransferNotice.text(received: progress?.received ?? 0,
             expected: progress?.expected ?? 0, queued: capturePipeline.waitingCount)
-        captureAnimation.showTransferNotice(title)
+        captureAnimation.showTransferNotice(title, requestID: uuid) { [weak self] in
+            guard let self, self.slowPipelineIDs.contains(uuid),
+                  self.deliveryCaptureID == uuid || self.pipelineCaptures.values.contains(where: { $0.uuid == uuid }) else { return }
+            self.cancelCurrent()
+        }
         if !core.isBusy { setStatus(title.replacingOccurrences(of: "\n", with: " · "), code: "capture_slow") }
     }
 
@@ -2657,6 +2771,49 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
 
     // Authenticate the wireless connection ahead of the next keypress so it is
     // not paid for after the press. Connection only: never a screenshot.
+    // USB data dropped: wait out a brief re-attach, then ask the device over Wi-Fi whether it still has power.
+    private func checkUSBDrop() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, !self.uninstalling, !self.setupWizard.isRunning,
+                  !self.captureWorker.usbConnected, !self.usbDropCheckRunning,
+                  let config = try? self.configuration(),
+                  let script = Bundle.main.resourceURL?.appendingPathComponent("Backend/usb_power_check.py").path else { return }
+            self.usbDropCheckRunning = true
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: config.python)
+            process.arguments = ["-B", script, "--state-dir", config.state_dir]
+            process.environment = CaptureWorkerProcess.backendEnvironment
+            let output = Pipe()
+            process.standardOutput = output
+            process.standardError = FileHandle.nullDevice
+            // The helper bounds itself and exits on its own watchdog; this is the outer limit.
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                var powered: Bool?
+                if (try? process.run()) != nil {
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 20) { if process.isRunning { process.terminate() } }
+                    let data = output.fileHandleForReading.readDataToEndOfFile()
+                    process.waitUntilExit()
+                    let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                    powered = object?["external_connected"] as? Bool
+                }
+                let reading = powered
+                DispatchQueue.main.async {
+                    self?.usbDropCheckRunning = false
+                    self?.finishUSBDropCheck(powered: reading)
+                }
+            }
+        }
+    }
+
+    private func finishUSBDropCheck(powered: Bool?) {
+        guard !uninstalling, usbDropNotice.shouldShow(externalConnected: powered,
+            usbBack: captureWorker.usbConnected, at: ProcessInfo.processInfo.systemUptime) else { return }
+        let name = "iPad"
+        let title = L("\(name) USB dropped\nReplug; resume charging if paused", "\(name) 的 USB 断了\n重插一下；暂停充电的话先恢复")
+        captureAnimation.showTransferNotice(title)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.updateTransferNotice() }
+    }
+
     private func rewarmWorker(after delay: TimeInterval) {
         guard enabled, !sleeping else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
@@ -2820,7 +2977,10 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             "failure_category": failureCategory, "backend_reason": backendReason, "busy_repeats_total": busyRepeatsTotal,
             "accessibility_preparation": target.accessibilityPreparationSummary,
             "backend_timings_ms": backendTimings, "connection_reused": connectionReused as Any? ?? NSNull(),
-            "success_sound_loaded": successSound != nil,
+            "success_sound_loaded": successSounds.count == SuccessSound.allCases.count,
+            "success_sound_tiers_loaded": SuccessSound.allCases.filter { successSounds[$0] != nil }.map(\.rawValue),
+            "last_success_sound_selected": lastSuccessSound.map { String(describing: $0) } as Any? ?? NSNull(),
+            "last_success_sound_bytes": lastSuccessSoundBytes as Any? ?? NSNull(),
             "failure_sound_loaded": failureSound != nil,
             "arrival_animation": captureAnimation.lastArrivalStatus, "jelly_early": earlyLandingNote, "append_interaction": appendInteractionNote, "jelly_growth": growthNote, "jelly_confirm_offset_pt": captureAnimation.confirmedOffset.map { Double($0) } as Any? ?? NSNull(), "jelly_patch": captureAnimation.patchStatus,
             "attachment_geometry": target.latestAttachmentGeometryStatus,
@@ -2871,7 +3031,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         return formatter
     }()
     private func recordDiagnosticEvent() {
-        // Speed: ms since the hotkey, so last-run.json shows where
+        // Speed (提速副本): ms since the hotkey, so last-run.json shows where
         // each keypress spends its time (locate, capture, focus, paste, confirm).
         var sinceHotkey: Any = NSNull()
         if let started = diagnosticRequestStartedAt {
@@ -2898,6 +3058,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         guard !uninstalling else { return }
         guard var record = captureRecord else { return }
         captureRecord = nil
+        lastCaptureResult = record.menuResult(outcome: outcome)
         record.timings = backendTimings
         record.connectionReused = connectionReused
         if targetKind == .claude, ["composerUnavailable", "composersAmbiguous"].contains(failureCategory) {
@@ -2913,7 +3074,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         // Metadata only: no titles, draft text, IDs, URLs, image data, or key material.
         // Keep last-run diagnostics available after a user-triggered failure, without
         // requiring clipboard changes or another target inspection by the reader.
-        // Speed: write the file once a keypress has finished (or
+        // Speed (提速副本): write the file once a keypress has finished (or
         // between keypresses), not on every step of it on the main thread.
         guard !hasActiveWork, transaction == nil else { return }
         guard fm.fileExists(atPath: base.path), let data = diagnosticsData() else { return }
@@ -2933,7 +3094,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         guard !uninstalling else { return }
         stop(reason: L("Quit", "退出")); NSApp.terminate(nil)
     }
-    func applicationWillTerminate(_ notification: Notification) { stop(reason: L("Quit", "退出")) }
+    func applicationWillTerminate(_ notification: Notification) { stopUSBSetupObserver(); stop(reason: L("Quit", "退出")) }
     // Quitting is not dismissing: windows closed by a quit must not mark the onboarding as seen.
     private var terminating = false
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -2980,7 +3141,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         setStatus(text, code: code)
         // Only a failed keypress gets cues; quiet interruptions stay silent. The sound
         // first, then the ✕ toast (if enabled); any other failure shows nothing.
-        if cue, let sound = failureSound { cueQueue.async { sound.stop(); sound.play() } }
+        if cue { playResultCue(failureSound) }
         if let result = ToastContent.failure(reason: text, code: code, cue: cue, backend: backendReason) {
             captureAnimation.failCurrent(title: result.title, toastHold: toastPreferences.enabled ? result.holdDuration : nil)
         } else {
@@ -2990,6 +3151,16 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         // connection that is already authenticated instead of a cold start.
         rewarmWorker(after: 0.5)
     }
+    private func playResultCue(_ cue: NSSound?) {
+        guard let cue else { return }
+        let sounds = Array(successSounds.values) + [failureSound].compactMap { $0 }
+        cueQueue.async {
+            // Stop the other sizes too: rapid results must never stack different cues.
+            for sound in sounds { sound.stop() }
+            cue.play()
+        }
+    }
+
     // Re-evaluates the iPad keepalive every 2 s on the main thread (cheap: one defaults read
     // and one input-idle query); the waker sends on its own queue.
     private func startKeepAliveCheck() {
@@ -3052,7 +3223,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         uninstalling = true
         terminating = true
         // Freeze the active language before clearing the saved preference.
-        AppLanguage.override = AppLanguage.isChinese
+        AppLanguage.forced = AppLanguage.current
         let remover = UninstallDataRemover(home: fm.homeDirectoryForCurrentUser)
         let controller = UninstallController(app: Bundle.main.bundleURL, actions: .init(
             stopCapture: { [self] in
@@ -3090,6 +3261,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     // Stop event sources without the normal capture cleanup's path-based file
     // removals. The allowlist remover owns ALL file deletion during uninstall.
     private func quiesceForUninstall() {
+        stopUSBSetupObserver()
         enabled = false
         captureWorker.beginUninstall()
         setupWizard.cancel()
@@ -3132,7 +3304,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     // latter preserves its original fail-before-deletion script contract.
     static func clearOnboardingPreferences(in defaults: UninstallPreferenceClearing = UserDefaults.standard) {
         for key in [OnboardingPolicy.seenKey, OnboardingPolicy.wirelessKey, OnboardingPolicy.resumeAccessKey,
-                    OnboardingPolicy.autoRelaunchKey, AppLanguage.key, reopenSettingsKey] {
+                    OnboardingPolicy.autoRelaunchKey, USBSetupDismissals.key, AppLanguage.key, reopenSettingsKey] {
             defaults.removeObject(forKey: key)
         }
         _ = defaults.synchronize()
@@ -3159,9 +3331,12 @@ enum RenderState {
     static var connection: TossConnectionStatus?
     static var pairing: Bool?
     static var onUninstallConfirmed: (() -> Void)?
+    static var onOpenInterface: ((String) -> Void)?
 }
 
 extension TossDelegate {
+    func renderInitialEntry(afterInstall: Bool = false) { presentInitialInterface(afterInstall: afterInstall) }
+    func renderStatusEntry(item: NSStatusItem) -> TossStatusController { makeStatusController(item: item, menu: NSMenu()) }
     func renderSettingsWindow(enabled: Bool, enabling: Bool = false, setupCode: String = "not_run", setupText: String? = nil,
                               permissionHintText: String? = nil) -> NSWindow {
         toggleItem = NSMenuItem(); statusItem = NSMenuItem()

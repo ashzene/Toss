@@ -25,7 +25,7 @@ import uuid
 
 import capture_once as once
 import link_timeline
-from capture_timing import SuccessTimingStore, TransferBudget
+from capture_timing import MAX_TRANSFER_BUDGET, SuccessTimingStore, TransferBudget
 
 MAX_LINE_BYTES = 64 * 1024
 MAX_REQUEST_IDS = 4096
@@ -39,8 +39,9 @@ WARM_CHECK_SECONDS = 1.0   # was 3.0: reconnect sooner after a drop (2026-10-24)
 WARM_BACKOFF_SECONDS = (2.0, 5.0, 10.0, 20.0, 30.0, 60.0)
 MOUNT_TIMEOUT = 120.0
 DEVELOPER_SERVICE = "com.apple.instruments.dtservicehub"
-SCREENSHOT_TIMEOUT = 8.0
-MAX_TRANSFER_BUDGET = 8.0
+SCREENSHOT_TIMEOUT = MAX_TRANSFER_BUDGET
+# A large Wi-Fi frame can still be arriving at 8 s. The shared cap is 30 s;
+# no-byte and stalled transfers retain their shorter, progress-based deadlines.
 USB_FIRST_BYTE_LIMIT = 2.5
 # Fail fast on a flaky Wi-Fi link (2026-10-24: 3 keypresses waited 5.5 s each during a link
 # drop). The first screenshot attempt gets FIRST_ATTEMPT_TIMEOUT (the slowest successful one
@@ -68,7 +69,9 @@ MIN_RETRY_SECONDS = 1.5
 # as advisory progress only: a one-second radio outage can recover before the cap.
 REQUEST_BUDGET = 4.5           # press cap ("timeout")
 FIRST_BYTE_LIMIT = 0.8         # Wi-Fi advisory; USB uses USB_FIRST_BYTE_LIMIT
-STALL_LIMIT = 1.2              # Wi-Fi hedge hint; neither is proof of disconnection
+# Wi-Fi retransmits were seen taking up to 2.1 s to recover (2026-11-05), so 1.2 s gave up too early.
+STALL_LIMIT = 2.5              # Wi-Fi hedge hint; neither is proof of disconnection
+USB_STALL_LIMIT = 1.2          # A cable has no retransmit wait: after this, fall back to Wi-Fi
 WATCH_INTERVAL = 0.025
 PROGRESS_INTERVAL = 0.25
 RPC_CANCEL_SECONDS = 0.05  # Never let a cancellation-resistant RPC block session teardown.
@@ -473,6 +476,9 @@ class CaptureService:
                                       "state": state, "reason": safe})
         self.last_connection_event = event
 
+    def _default_stall(self):
+        return USB_STALL_LIMIT if self.transport == "usb" else STALL_LIMIT
+
     def _check_output_directory(self):
         once.check_private_directory(self.output_dir, "output_parent_not_private")
         if self._directory_identity(self.output_dir.lstat()) != self.directory_identity:
@@ -526,7 +532,7 @@ class CaptureService:
                 given = value["limits_ms"]
                 if not isinstance(given, dict) or set(given) != {"first_byte", "stall", "press_cap"}:
                     raise once.CaptureFailure("invalid_arguments")
-                for key, (low, high) in {"first_byte": (200, 5000), "stall": (200, 5000), "press_cap": (800, 8000)}.items():
+                for key, (low, high) in {"first_byte": (200, 5000), "stall": (200, 5000), "press_cap": (800, MAX_TRANSFER_BUDGET * 1000)}.items():
                     ms = given[key]
                     if type(ms) not in (float, int) or not math.isfinite(ms) or not low <= ms <= high:
                         raise once.CaptureFailure("invalid_timeout")
@@ -537,19 +543,19 @@ class CaptureService:
                 if not isinstance(identity, str) or str(uuid.UUID(identity)) != identity:
                     raise once.CaptureFailure("invalid_arguments")
                 end = value["deadline_monotonic"]
-                if type(end) not in (float, int) or not math.isfinite(end) or end > started + 8:
+                if type(end) not in (float, int) or not math.isfinite(end) or end > started + MAX_TRANSFER_BUDGET:
                     raise once.CaptureFailure("invalid_timeout")
                 attempt = {"attempt_id": identity, "deadline_monotonic": float(end)}
             if "screenshot_deadline_monotonic" in value:
                 end = value["screenshot_deadline_monotonic"]
                 if ("attempt_id" not in value or type(end) not in (float, int)
-                        or not math.isfinite(end) or end <= 0 or end > started + 8):
+                        or not math.isfinite(end) or end <= 0 or end > started + MAX_TRANSFER_BUDGET):
                     raise once.CaptureFailure("invalid_timeout")
                 attempt["screenshot_deadline_monotonic"] = float(end)
             if "press_started_monotonic" in value:
                 origin = value["press_started_monotonic"]
                 if (type(origin) not in (float, int) or not math.isfinite(origin)
-                        or not started - 8 <= origin <= started + 0.05):
+                        or not started - MAX_TRANSFER_BUDGET <= origin <= started + 0.05):
                     raise once.CaptureFailure("invalid_timeout")
                 attempt["press_started_monotonic"] = float(origin)
             timeout = value["timeout"]
@@ -759,7 +765,7 @@ class CaptureService:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
                 handle.flush()
-                # Speed: no fsync. This is a private cache file the
+                # Speed (提速副本): no fsync. This is a private cache file the
                 # native app reads back from the page cache within milliseconds,
                 # and it re-checks size and SHA-256 before use; forcing it to
                 # disk only added latency (most for 8-11 MiB wide-colour frames).
@@ -872,7 +878,7 @@ class CaptureService:
             hard = min(MAX_TRANSFER_BUDGET, cap, request["timeout"] - 1,
                        request.get("deadline_monotonic", origin + MAX_TRANSFER_BUDGET) - origin)
             budget = TransferBudget(origin, normal=min(REQUEST_BUDGET, hard), hard=hard,
-                                    stall=limits.get("stall", STALL_LIMIT))
+                                    stall=limits.get("stall", self._default_stall()))
             request_end = budget.deadline
             if preconnect is not None:
                 async with asyncio.timeout(max(0.0, request_end - time.monotonic())):
@@ -919,7 +925,7 @@ class CaptureService:
                                     self.provider.progress_fail_fast = self.transport == "usb"
                                     self.provider.limits = (max(USB_FIRST_BYTE_LIMIT, limits.get("first_byte", FIRST_BYTE_LIMIT))
                                                             if self.transport == "usb" else limits.get("first_byte", FIRST_BYTE_LIMIT),
-                                                            limits.get("stall", STALL_LIMIT), budget_end)
+                                                            limits.get("stall", self._default_stall()), budget_end)
                                     async def progressed(progress):
                                         budget.observe(time.monotonic(), progress["received_bytes"], progress["idle_ms"])
                                         if not deadline.expired():

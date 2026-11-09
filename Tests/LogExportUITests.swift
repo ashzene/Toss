@@ -58,6 +58,48 @@ struct LogExportUITests {
                     try render(panel.view, name: name)
                     print("\(name): \(Int(panel.view.bounds.width)) × \(Int(panel.view.bounds.height))")
                 }
+                // Keep a completed receipt readable after the app returns to idle,
+                // disconnects, or starts the next shortcut; no stale success on a new job.
+                let receiptPanel = TossStatusPanel()
+                receiptPanel.loadViewIfNeeded()
+                receiptPanel.view.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+                for outcome in [TossCaptureResult.Outcome.confirmed, .unconfirmed, .manualPaste, .failed, .cancelled] {
+                    let receipt = TossCaptureResult(target: "claude", outcome: outcome,
+                        byteCount: 3_200_000, elapsedMilliseconds: 1400, transport: "wifi")
+                    var presentation = TossStatusPresentation(connection: .init(state: .ready, reason: "ready", transport: "usb"),
+                        phase: .idle, paired: true, enabled: true, summary: L("Ready", "已就绪"), lastCaptureResult: receipt)
+                    receiptPanel.update(presentation)
+                    receiptPanel.view.frame.size = receiptPanel.preferredContentSize
+                    receiptPanel.view.layoutSubtreeIfNeeded()
+                    let fields = descendants(receiptPanel.view).compactMap { $0 as? NSTextField }
+                    let summary = fields.first { $0.accessibilityIdentifier() == "Toss.lastCapture.summary" }!
+                    let detail = fields.first { $0.accessibilityIdentifier() == "Toss.lastCapture.detail" }
+                    check(summary.stringValue == receipt.summary && !summary.isHiddenOrHasHiddenAncestor, "last receipt visible at idle")
+                    check(summary.stringValue.hasSuffix("Wi-Fi"), "live USB connection cannot rewrite screenshot route")
+                    check((detail?.stringValue ?? "") == receipt.detail &&
+                          (detail?.isHiddenOrHasHiddenAncestor ?? true) == receipt.detail.isEmpty, "only unsuccessful outcomes have an explanation")
+                    check(fields.contains { $0.stringValue == receipt.status }, "distinct receipt outcome")
+                    for field in [summary, detail].compactMap({ $0 }) where !field.isHiddenOrHasHiddenAncestor {
+                        let frame = field.superview!.convert(field.alignmentRect(forFrame: field.frame), to: receiptPanel.view)
+                        check(frame.minX >= 19.5 && frame.maxX <= receiptPanel.view.bounds.maxX - 19.5, "receipt inside horizontal margins: \(frame), panel \(receiptPanel.view.bounds), text \(field.stringValue)")
+                        check(frame.minY >= 0 && frame.maxY <= receiptPanel.view.bounds.maxY, "receipt inside vertical bounds")
+                        check(field.frame.height >= field.fittingSize.height - 0.5, "wrapped receipt text is not clipped")
+                    }
+                    try render(receiptPanel.view, name: "receipt-\(chinese ? "zh" : "en")-\(dark ? "dark" : "light")-\(outcome)")
+                    presentation.connection = .init(state: .disconnected, reason: "network_unavailable")
+                    presentation.phase = .failed
+                    receiptPanel.update(presentation)
+                    check(summary.stringValue == receipt.summary, "disconnect does not erase last receipt")
+                    presentation.captureInProgress = true
+                    presentation.phase = .preparing
+                    receiptPanel.update(presentation)
+                    check(summary.isHiddenOrHasHiddenAncestor, "new shortcut never borrows previous metadata")
+                    check(fields.contains { $0.stringValue == L("Current screenshot", "当前截图") }, "current and last screenshot are distinct")
+                    presentation.captureInProgress = false
+                    presentation.phase = .idle
+                    receiptPanel.update(presentation)
+                    check(!summary.isHiddenOrHasHiddenAncestor && summary.stringValue == receipt.summary, "receipt returns after unrelated idle status")
+                }
                 for success in [true, false] {
                     let view = LogExportNotice.makeView(success: success)
                     view.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)

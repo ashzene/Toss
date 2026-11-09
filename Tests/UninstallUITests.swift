@@ -82,7 +82,7 @@ struct UninstallUITests {
         let defaults = RenderDefaults()
         TossDelegate.clearOnboardingPreferences(in: defaults)
         check(defaults.removed == [OnboardingPolicy.seenKey, OnboardingPolicy.wirelessKey, OnboardingPolicy.resumeAccessKey,
-                                  OnboardingPolicy.autoRelaunchKey, AppLanguage.key, TossDelegate.reopenSettingsKey] &&
+                                  OnboardingPolicy.autoRelaunchKey, USBSetupDismissals.key, AppLanguage.key, TossDelegate.reopenSettingsKey] &&
               defaults.synchronized, "CLI and UI share complete owned onboarding/language cleanup")
         let fm = FileManager.default
         for url in try fm.contentsOfDirectory(at: URL(fileURLWithPath: "Assets/Fonts"), includingPropertiesForKeys: nil)

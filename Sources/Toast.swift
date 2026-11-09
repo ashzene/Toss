@@ -22,12 +22,12 @@ enum ToastCopy {
     static func strings(_ language: Language = language) -> Strings {
         switch language {
         case .english:
-            return Strings(codex: "Tossed successfully", claude: "Tossed successfully",
-                           failure: "Didn't attach", manualPaste: "Copied — paste it yourself",
-                           blackScreen: "iPad screenshot is black",
-                           slow: "iPad connection too slow", notConnected: "iPad not connected",
-                           pairing: "Pair your iPad again", unconfirmed: "Check your draft",
-                           notifications: "Show notifications")
+            return Strings(codex: Translations.text("Tossed successfully"), claude: Translations.text("Tossed successfully"),
+                           failure: Translations.text("Didn't attach"), manualPaste: Translations.text("Copied — paste it yourself"),
+                           blackScreen: Translations.text("iPad screenshot is black"),
+                           slow: Translations.text("iPad connection too slow"), notConnected: Translations.text("iPad not connected"),
+                           pairing: Translations.text("Pair your iPad again"), unconfirmed: Translations.text("Check your draft"),
+                           notifications: Translations.text("Show notifications"))
         case .chinese:
             return Strings(codex: "已成功 Toss", claude: "已成功 Toss",
                            failure: "没贴进去", manualPaste: "已复制，可以手动粘贴",
@@ -63,7 +63,7 @@ struct ToastContent: Equatable {
                     reason: showsFailureReason ? shortReason(reason) : "")
     }
 
-    // 2026-10-28: one short title per actual cause instead of a single
+    // Ashley 2026-10-28 ("换成对应报错"): one short title per actual cause instead of a single
     // "Didn't attach". Only the screenshot step has a backend reason; paste-side failures keep the
     // plain title, except a paste that was sent but not confirmed, which may well be in the draft.
     static let slowReasons: Set<String> = ["timeout", "first_byte_timeout", "stall_timeout", "too_slow", "slow_threshold"]
@@ -85,7 +85,7 @@ struct ToastContent: Equatable {
         return copy.failure
     }
 
-    // 2026-10-24: the failure toast shows only "Didn't attach"; the reason stays
+    // Ashley 2026-10-24: the failure toast shows only "Didn't attach"; the reason stays
     // in Diagnostics. Flip this to bring the grey second line back.
     static let showsFailureReason = false
 
@@ -110,11 +110,11 @@ final class ToastPreferences {
 enum TransferNotice {
     static func text(received: Double, expected: Double, queued: Int,
                      language: ToastCopy.Language = ToastCopy.language) -> String {
-        var value = language == .chinese ? "图片正在传过来…" : "Image on its way…"
+        var value = language == .chinese ? "图片正在传过来…" : Translations.text("Image on its way…")
         if received.isFinite, expected.isFinite, expected > 0, received >= 0 {
             value += " \(Int(min(100, max(0, received / expected * 100))))%"
         }
-        if queued > 0 { value += language == .chinese ? "\n还有 \(queued) 张" : "\n\(queued) more" }
+        if queued > 0 { value += language == .chinese ? "\n还有 \(queued) 张" : Translations.text("\n\(queued) more") }
         return value
     }
 }

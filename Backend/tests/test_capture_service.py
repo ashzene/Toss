@@ -197,7 +197,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"], result)
         self.assertGreater(result["timings_ms"]["screenshot"], 90)
     async def test_invalid_shared_deadline_is_rejected(self):
-        for value in (True, float("nan"), -1, time.monotonic() + 10):
+        for value in (True, float("nan"), -1, time.monotonic() + 31):
             result = await self.accept(self.request(attempt_id=str(uuid.uuid4()),
                 deadline_monotonic=time.monotonic() + 4, screenshot_deadline_monotonic=value))
             self.assertEqual(result["reason"], "invalid_timeout")
@@ -212,7 +212,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(time.monotonic() - at, 0.4)
 
     async def test_invalid_press_origin_is_rejected(self):
-        for origin in (True, float("nan"), time.monotonic() + 1, time.monotonic() - 10):
+        for origin in (True, float("nan"), time.monotonic() + 1, time.monotonic() - 31):
             result = await self.accept(self.request(press_started_monotonic=origin))
             self.assertEqual(result["reason"], "invalid_timeout")
         self.assertEqual(self.captures, 0)
@@ -777,9 +777,9 @@ class CaptureSessionTests(unittest.IsolatedAsyncioTestCase):
     async def emit(self, receipt):
         self.receipts.append(receipt)
 
-    async def capture_request(self, wait=True, limits_ms=None):
+    async def capture_request(self, wait=True, limits_ms=None, timeout=8):
         identity = str(uuid.uuid4())
-        value = {"action": "capture", "request_id": identity, "timeout": 8,
+        value = {"action": "capture", "request_id": identity, "timeout": timeout,
                  "output_file": str(self.output / (identity + ".png"))}
         if limits_ms is not None:
             value["limits_ms"] = limits_ms
@@ -949,7 +949,7 @@ class CaptureSessionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_keypress_during_a_hanging_reconnect_fails_at_5_s_and_reconnect_continues(self):
         # 2026-10-24 16:25: a keypress waited 45 s for a failing reconnect, silently.
-        # 16:33: past 5 s it has failed. The reconnect keeps going for the next press.
+        # Ashley 16:33: past 5 s it has failed. The reconnect keeps going for the next press.
         gate = asyncio.Event()
         owner = self
         class Slow(service.CaptureSession):
@@ -1127,7 +1127,7 @@ class CaptureSessionTests(unittest.IsolatedAsyncioTestCase):
         link = self.fake_link()
         async def stalls(_dvt):
             link.packets.append((time.monotonic(), 1400))
-            await asyncio.sleep(1.35)
+            await asyncio.sleep(service.STALL_LIMIT + 0.15)
             link.packets.append((time.monotonic(), 1400))
             return self.frames[0]
         self.rpc_hook = stalls
@@ -1137,7 +1137,7 @@ class CaptureSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["ok"], result)
         self.assertEqual(result["reason"], "stall_timeout")
         self.assertGreaterEqual(elapsed, service.STALL_LIMIT)
-        self.assertLess(elapsed, 1.8)
+        self.assertLess(elapsed, service.STALL_LIMIT + 0.6)
         self.assertEqual(self.rpcs, 1)
         self.assertIn("wifi_exit", self.events)
 
@@ -1259,6 +1259,24 @@ class CaptureSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(time.monotonic() - at, 5.4)
         self.assertLess(time.monotonic() - at, 8)
         self.assertEqual(self.rpcs, 1)
+
+    async def test_flowing_wifi_finishes_after_old_eight_second_cap(self):
+        link = self.fake_link()
+        async def flowing(_dvt):
+            # Burst arrivals separated by half-second pauses continue beyond 8 s.
+            for _ in range(18):
+                link.packets.append((time.monotonic(), 440000))
+                await asyncio.sleep(0.5)
+            return self.frames[0]
+        self.rpc_hook = flowing
+        at = time.monotonic()
+        result = await self.capture_request(timeout=40,
+            limits_ms={"first_byte": 800, "stall": 2500, "press_cap": 30000})
+        self.assertTrue(result["ok"], result)
+        self.assertGreaterEqual(time.monotonic() - at, 9)
+        self.assertLess(time.monotonic() - at, 12)
+        self.assertEqual(self.rpcs, 1)
+        self.assertGreater(self.worker.success_timings.load()["wifi"][-1]["seconds"], 8)
 
     async def test_usb_silence_waits_full_two_and_a_half_seconds(self):
         self.fake_link()

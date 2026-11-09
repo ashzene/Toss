@@ -150,6 +150,8 @@ struct TossStatusPresentation {
     // The same one-line status the Settings window shows.
     var summary = ""
     var summaryTone: NSColor?
+    var lastCaptureResult: TossCaptureResult?
+    var captureInProgress = false
 }
 
 // Paints the popover (arrow included) in the website colour instead of the
@@ -212,6 +214,10 @@ final class TossStatusPanel: NSViewController {
     private let summary = SettingsStatus(size: 13.5, emphasizesLead: true)
     private let note = SettingsDetail(wrappingLabelWithString: "")
     private let job = SettingsStatus(size: 13)
+    private let captureCaption = NSTextField(labelWithString: "")
+    private let receiptDetails = NSStackView()
+    private let receiptSummary = SettingsDetail(wrappingLabelWithString: "")
+    private let receiptNote = SettingsDetail(wrappingLabelWithString: "")
     private let activity = SettingsActivityBar()
     private let recheck = SettingsPill(L("Check connection", "检查连接"), target: nil, action: nil)
     private let settings = SettingsPill(L("Settings", "设置"), target: nil, action: nil)
@@ -266,10 +272,9 @@ final class TossStatusPanel: NSViewController {
         note.setContentCompressionResistancePriority(.required, for: .vertical)
         place(note, gap: 16)
 
-        let caption = NSTextField(labelWithString: L("Last screenshot", "上一张截图"))
-        caption.font = SettingsStyle.sans(13.5)
-        caption.textColor = SettingsStyle.ink
-        let row = NSStackView(views: [caption, spacer(), job, activity])
+        captureCaption.font = SettingsStyle.sans(13.5)
+        captureCaption.textColor = SettingsStyle.ink
+        let row = NSStackView(views: [captureCaption, spacer(), job, activity])
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 8
@@ -277,6 +282,20 @@ final class TossStatusPanel: NSViewController {
         row.widthAnchor.constraint(equalToConstant: inner).isActive = true
         place(hairline(), gap: 0)
         place(row, gap: 0)
+        receiptDetails.orientation = .vertical
+        receiptDetails.alignment = .leading
+        receiptDetails.spacing = 5
+        receiptDetails.widthAnchor.constraint(equalToConstant: inner).isActive = true
+        for field in [receiptSummary, receiptNote] {
+            field.font = SettingsStyle.sans(12.5)
+            field.textColor = field === receiptSummary ? SettingsStyle.ink : SettingsStyle.muted
+            field.preferredMaxLayoutWidth = inner
+            field.widthAnchor.constraint(equalToConstant: inner).isActive = true
+            field.setContentCompressionResistancePriority(.required, for: .vertical)
+            receiptDetails.addArrangedSubview(field)
+        }
+        receiptDetails.isHidden = true
+        place(receiptDetails, gap: 14)
         place(hairline(), gap: 14)
 
         recheck.target = self
@@ -300,23 +319,37 @@ final class TossStatusPanel: NSViewController {
         summary.show(value.summary.isEmpty ? nil : value.summary + route, dot: value.summaryTone)
         var detail = connection.state == .connecting ? value.retryError : connection.errorMessage
         if !value.paired { detail = L("Pair your iPad in Settings to start.", "先在设置里配对 iPad。") }
-        switch value.phase {
-        case .idle:
-            job.show(value.enabled ? L("Waiting for a shortcut", "等你按快捷键") : L("Off", "已关闭"))
-        case .preparing:
-            job.show(L("Preparing…", "准备中…"))
-        case .uploading:
-            job.show(L("Uploading", "正在上传"))
-        case .slow:
-            job.show(L("Taking longer…", "比平时慢…"))
-            if detail == nil { detail = L("Still waiting for your iPad. Your shortcut was received.", "还在等 iPad。快捷键已经收到了。") }
-        case .completed:
-            job.show(L("Added to chat", "已放进聊天"), dot: SettingsStyle.ok)
-        case .failed:
-            job.show(L("Not completed", "没完成"), dot: SettingsStyle.accent)
-            if detail == nil, !value.lastMessage.isEmpty { detail = value.lastMessage }
-        case .cancelled:
-            job.show(L("Cancelled", "已取消"))
+        let inProgress = value.captureInProgress || value.phase == .preparing || value.phase.animates
+        captureCaption.stringValue = inProgress ? L("Current screenshot", "当前截图") : L("Last screenshot", "上一张截图")
+        let receipt = inProgress ? nil : value.lastCaptureResult
+        receiptDetails.isHidden = receipt == nil
+        receiptSummary.stringValue = receipt?.summary ?? ""
+        receiptNote.stringValue = receipt?.detail ?? ""
+        receiptSummary.setAccessibilityIdentifier("Toss.lastCapture.summary")
+        receiptNote.setAccessibilityIdentifier("Toss.lastCapture.detail")
+        if let receipt {
+            let tone: NSColor? = receipt.outcome == .confirmed ? SettingsStyle.ok :
+                receipt.outcome == .cancelled ? nil : SettingsStyle.accent
+            job.show(receipt.status, dot: tone)
+        } else {
+            switch value.phase {
+            case .idle:
+                job.show(value.enabled ? L("Waiting for a shortcut", "等你按快捷键") : L("Off", "已关闭"))
+            case .preparing:
+                job.show(L("Preparing…", "准备中…"))
+            case .uploading:
+                job.show(L("Uploading", "正在上传"))
+            case .slow:
+                job.show(L("Taking longer…", "比平时慢…"))
+                if detail == nil { detail = L("Still waiting for your iPad. Your shortcut was received.", "还在等 iPad。快捷键已经收到了。") }
+            case .completed:
+                job.show(L("Added to chat", "已放进聊天"), dot: SettingsStyle.ok)
+            case .failed:
+                job.show(L("Not completed", "没完成"), dot: SettingsStyle.accent)
+                if detail == nil, !value.lastMessage.isEmpty { detail = value.lastMessage }
+            case .cancelled:
+                job.show(L("Cancelled", "已取消"))
+            }
         }
         note.stringValue = detail ?? ""
         stack.setCustomSpacing(detail == nil ? 16 : 8, after: summary)
@@ -345,6 +378,7 @@ private final class TossStatusWindow: NSPanel {
 final class TossStatusController: NSObject, NSPopoverDelegate {
     private let item: NSStatusItem
     private let legacyMenu: NSMenu
+    private let openSetupIfNeeded: () -> Bool
     private let icon = TossMenuIcon(frame: NSRect(x: 0, y: 0, width: 22, height: 22))
     private let panel = TossStatusPanel()
     private let popover = NSPopover()
@@ -356,9 +390,11 @@ final class TossStatusController: NSObject, NSPopoverDelegate {
     private var isShown: Bool { popover.isShown || fallbackWindow?.isVisible == true }
 
     init(item: NSStatusItem, menu: NSMenu, recheck: @escaping () -> Void,
-         settings: @escaping () -> Void, diagnostics: @escaping () -> Void, exportLogs: @escaping () -> Void) {
+         settings: @escaping () -> Void, diagnostics: @escaping () -> Void, exportLogs: @escaping () -> Void,
+         openSetupIfNeeded: @escaping () -> Bool = { false }) {
         self.item = item
         self.legacyMenu = menu
+        self.openSetupIfNeeded = openSetupIfNeeded
         super.init()
         item.length = NSStatusItem.squareLength
         item.autosaveName = "TossStatus"
@@ -431,6 +467,7 @@ final class TossStatusController: NSObject, NSPopoverDelegate {
         }
     }
     func showPanel() {
+        if openSetupIfNeeded() { closePanel(); return }
         guard !isShown, let button = item.button, let anchorWindow = button.window else { return }
         refreshPanel()
         let anchor = anchorWindow.convertToScreen(button.convert(button.bounds, to: nil))
@@ -510,6 +547,8 @@ final class TossStatusController: NSObject, NSPopoverDelegate {
         if let event = NSApp.currentEvent, event.type == .rightMouseUp {
             closePanel()
             NSMenu.popUpContextMenu(legacyMenu, with: event, for: button)
+        } else if openSetupIfNeeded() {
+            closePanel()
         } else if isShown {
             closePanel()
         } else {

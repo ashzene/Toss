@@ -55,7 +55,7 @@ struct TossConnectionStatus: Equatable {
         case "disconnected":
             return L("iPad disconnected. Reconnecting…", "iPad 断开了，正在重连…")
         case "cancelled": return L("Check cancelled.", "检查已取消。")
-        default: return L("Put both on the same Wi-Fi, then check again.", "两台设备连同一个 Wi-Fi，再检查一次。")
+        default: return L("Use the same Wi-Fi or connect via USB, then check again.", "两台设备连同一个 Wi-Fi，或用 USB 连接，再检查一次。")
         }
     }
 }
@@ -74,5 +74,62 @@ enum TossTransferPhase: Equatable {
         case "cancelled", "input_interrupted", "hotkey_rejected": return .cancelled
         default: return code.contains("failed") || code.contains("unconfirmed") ? .failed : .idle
         }
+    }
+}
+
+// A finished shortcut's receipt, independent of the connection's current state.
+// No chat content or window identifiers: the app, result and transfer metadata only.
+struct TossCaptureResult: Equatable {
+    enum Outcome { case confirmed, unconfirmed, manualPaste, cancelled, failed }
+    let target: String
+    let outcome: Outcome
+    let byteCount: Int?
+    let elapsedMilliseconds: Int?
+    let transport: String?
+
+    var targetName: String {
+        switch target {
+        case "claude": return "Claude"
+        case "chatgpt": return "Codex"
+        default: return L("Target app", "目标应用")
+        }
+    }
+
+    var summary: String {
+        var parts = [outcome == .manualPaste ? L("Clipboard", "剪贴板") : targetName]
+        if let bytes = byteCount, bytes > 0 {
+            let size = Double(bytes) / 1_000_000
+            parts.append(size < 0.1 ? "<0.1 MB" : Self.decimal(size) + " MB")
+        }
+        if let ms = elapsedMilliseconds, ms >= 0 {
+            let seconds = Self.decimal(Double(ms) / 1_000)
+            parts.append(L("\(seconds) s", "\(seconds) 秒"))
+        }
+        // Only the route reported for this screenshot, never the live connection.
+        if transport == "usb" { parts.append("USB") }
+        else if transport == "wifi" { parts.append("Wi-Fi") }
+        return parts.joined(separator: " · ")
+    }
+
+    var status: String {
+        switch outcome {
+        case .confirmed: return L("Success", "成功")
+        case .unconfirmed, .manualPaste, .cancelled, .failed:
+            return L("Not successful", "不成功")
+        }
+    }
+
+    var detail: String {
+        switch outcome {
+        case .confirmed: return ""
+        case .unconfirmed: return L("Paste requested. Check the draft before trying again.", "已请求粘贴，请先检查草稿再重试。")
+        case .manualPaste: return L("Not delivered to \(targetName). Paste it yourself.", "未投递到 \(targetName)，请手动粘贴。")
+        case .cancelled: return L("Cancelled", "已取消")
+        case .failed: return L("No paste was requested.", "尚未请求粘贴。")
+        }
+    }
+
+    private static func decimal(_ value: Double) -> String {
+        String(format: "%.1f", locale: Locale(identifier: "en_US_POSIX"), value)
     }
 }

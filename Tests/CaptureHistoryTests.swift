@@ -114,6 +114,49 @@ struct CaptureHistoryTests {
         check(repeats?.count == 2 && repeats?.first?["phase"] as? String == "capturing"
               && repeats?.last?["ms"] as? Int == 1200)
 
+        // Menu receipts come from this shortcut, including its winning route and
+        // whole hotkey-to-result duration, not just backend transfer time.
+        var delivered = CaptureRecord(startedAt: Date(), target: "claude")
+        delivered.takeImage(from: ["bytes": 3_200_000, "transport": "authenticated_wifi",
+            "route_attempts": [["transport": "usb", "reason": "first_byte_timeout", "elapsed_ms": 800.0]]])
+        delivered.reach("paste_posted", ms: 1200)
+        delivered.reach("append_confirmed", ms: 1400)
+        let success = delivered.menuResult(outcome: "append_confirmed")
+        check(success.outcome == .confirmed && success.transport == "wifi")
+        check(success.elapsedMilliseconds == 1400 && success.byteCount == 3_200_000)
+        AppLanguage.override = true
+        check(success.summary == "Claude · 3.2 MB · 1.4 秒 · Wi-Fi")
+        check(success.status == "成功" && success.detail.isEmpty)
+        AppLanguage.override = false
+        check(success.summary == "Claude · 3.2 MB · 1.4 s · Wi-Fi")
+        check(success.status == "Success")
+        for outcome in ["append_unconfirmed", "cancelled", "stopped", "input_interrupted", "unfinished", "append_failed"] {
+            let result = delivered.menuResult(outcome: outcome)
+            check(result.outcome == .unconfirmed && result.status == "Not successful")
+            check(result.detail.contains("Check the draft"))
+        }
+        var recovered = CaptureRecord(startedAt: Date(), target: "chatgpt")
+        recovered.takeImage(from: ["bytes": 2_000_000, "transport": "authenticated_usb"])
+        recovered.reach("copied_for_manual_paste", ms: 2300)
+        let manual = recovered.menuResult(outcome: "copied_for_manual_paste")
+        check(manual.outcome == .manualPaste)
+        check(manual.summary == "Clipboard · 2.0 MB · 2.3 s · USB")
+        check(manual.detail == "Not delivered to Codex. Paste it yourself.")
+        var failed = CaptureRecord(startedAt: Date(), target: "claude")
+        failed.reach("capture_setup_failed", ms: 210)
+        let failure = failed.menuResult(outcome: "capture_setup_failed")
+        check(failure.outcome == .failed && failure.summary == "Claude · 0.2 s")
+        check(failure.byteCount == nil && failure.transport == nil)
+        check(failed.menuResult(outcome: "cancelled").outcome == .cancelled)
+        check(failed.menuResult(outcome: "append_unconfirmed").outcome == .unconfirmed)
+        let noReceipt = CaptureRecord(startedAt: Date(), target: "chatgpt").menuResult(outcome: "unfinished")
+        check(noReceipt.summary == "Codex" && noReceipt.elapsedMilliseconds == nil)
+        check(invalidRoute.menuResult(outcome: "capture_result_failed").transport == nil)
+        var tiny = CaptureRecord(startedAt: Date(), target: "claude")
+        tiny.takeImage(from: ["bytes": 16_000])
+        check(tiny.menuResult(outcome: "append_confirmed").summary == "Claude · <0.1 MB")
+        AppLanguage.override = nil
+
         check(CaptureHistory.trimmed(Data("a\nb\nc\n".utf8), keep: 2) == Data("b\nc\n".utf8))
         check(CaptureHistory.trimmed(Data("a\nb\npartial".utf8), keep: 2) == Data("b\npartial\n".utf8))
         check(CaptureHistory.trimmed(Data(), keep: 2).isEmpty)

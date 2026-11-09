@@ -39,6 +39,21 @@ struct CaptureRecord {
         }
     }
 
+    // A posted paste can still arrive after cancellation or a failed readback.
+    // Only append_confirmed is evidence that the attachment reached the draft.
+    func menuResult(outcome code: String) -> TossCaptureResult {
+        let outcome: TossCaptureResult.Outcome
+        if code == "append_confirmed" { outcome = .confirmed }
+        else if code == "append_unconfirmed" || stages.contains(where: { $0.stage == "paste_posted" }) {
+            outcome = .unconfirmed
+        } else if code == "copied_for_manual_paste" { outcome = .manualPaste }
+        else if ["cancelled", "stopped", "input_interrupted", "hotkey_rejected"].contains(code) {
+            outcome = .cancelled
+        } else { outcome = .failed }
+        return TossCaptureResult(target: target, outcome: outcome, byteCount: image["bytes"],
+                                 elapsedMilliseconds: stages.last?.ms, transport: transport)
+    }
+
     static let imageKeys = ["bytes", "width", "height", "bit_depth"]
 
     // Receipt fields as plain bounded integers; anything else is left out.

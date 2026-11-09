@@ -13,8 +13,8 @@ enum SettingsStyle {
     static func dynamic(_ light: NSColor, _ dark: NSColor) -> NSColor {
         NSColor(name: nil) { $0.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light }
     }
-    // Toss paper, the light surface of every Toss window, popover and toast (2026-10-29:
-    // F0EEE6, the warm card tone instead of white).
+    // Toss paper, the light surface of every Toss window, popover and toast (Ashley 2026-10-29:
+    // 「白色界面全部换成之前那个黄黄的」, F0EEE6, the card tone of her reference (10-29)).
     static let paper = rgb(0xF0EEE6)
     // Raised light: keycaps and switch knobs on paper, and the ink of dark mode. The 10-23 off-white,
     // also the app icon's glyph (Assets/Toss.icon/icon.json); never pure white.
@@ -29,7 +29,7 @@ enum SettingsStyle {
     static let knobOff = dynamic(raised, rgb(0x8A8882))
     static let ok = dynamic(rgb(0x2E9E5B), rgb(0x3CC273))
     static let accent = dynamic(rgb(0xD9622B), rgb(0xF07A43))
-    // Failure mark in the toast (2026-10-24: the ✕ is red). Muted brick red, lighter in dark mode.
+    // Failure mark in the toast (Ashley 2026-10-24: the ✕ is red). Muted brick red, lighter in dark mode.
     static let danger = dynamic(rgb(0xC8372D), rgb(0xEF6A5E))
     static let width: CGFloat = 540
     static let margin: CGFloat = 36
@@ -59,35 +59,35 @@ enum SettingsStyle {
         return chinese(NSFont(name: name, size: size) ?? .systemFont(ofSize: size, weight: weight), chineseSans, weight)
     }
 
-    // One spacing scale for every window (2026-10-30: less crowded, buttons not squeezed).
-    // A = original, B = roomier, C = airy.
+    // One spacing scale for every window (Ashley 2026-10-30: 「感觉还是有点拥挤」, 「把按钮硬压下去了」).
+    // A = before her note, B = roomier, C = airy; she picks one from 间距对比.
     enum Density: Int { case a, b, c }
-    nonisolated(unsafe) static var density: Density = .a // 2026-10-30: option a
+    nonisolated(unsafe) static var density: Density = .a // Ashley 2026-10-30: 「a吧」
     private static func pick(_ a: CGFloat, _ b: CGFloat, _ c: CGFloat) -> CGFloat { [a, b, c][density.rawValue] }
     static var noteGap: CGFloat { pick(4, 6, 9) }          // ink line → its grey note
     static var rowPad: CGFloat { pick(14, 17, 20) }        // above and below each list row
     static var statusRoom: CGFloat { pick(18, 26, 34) }    // list → status block, and status → divider
     static var footerGap: CGFloat { pick(16, 22, 28) }     // divider → buttons, the same in every state
     static var footerBottom: CGFloat { pick(28, 32, 36) }  // buttons → window edge
-    // Settings window width and row padding, separate from the guide (2026-10-30: wider, so rows are shorter).
-    nonisolated(unsafe) static var settingsWidth: CGFloat = 620
+    // Settings window width and row padding, separate from the guide (Ashley 2026-10-30: 「这个太长了，能不能宽一点」).
+    nonisolated(unsafe) static var settingsWidth: CGFloat = 620 // 「620试试看」
     nonisolated(unsafe) static var settingsRowPad: CGFloat?   // nil = the shared rowPad
     // Space above the title and between groups; trimmed from 44 / 28 when notes went back under titles.
     nonisolated(unsafe) static var settingsTop: CGFloat = 44
     nonisolated(unsafe) static var settingsSectionGap: CGFloat = 28
-    nonisolated(unsafe) static var settingsInlineNotes = false // notes back under the title, on their own line
-    static let settingsBottom: CGFloat = 36 // Settings: pill row → window edge, same as the side margin
+    nonisolated(unsafe) static var settingsInlineNotes = false // notes back under the title (「新开一行像以前那样放下面」)
+    static let settingsBottom: CGFloat = 36 // Settings: pill row → window edge, same as the side margin (「最底下也感觉很拥挤」)
     static let settingsFooterGap: CGFloat = 30 // Settings: last divider → pill row
     static var guideHeight: CGFloat { pick(540, 590, 640) } // guide window, tall enough for its tallest state
 
     // The family Chinese characters fall back to inside the Latin fonts above; nil keeps the
-    // system's choice (PingFang SC).
-    // Chinese body text in Hiragino Sans GB, on every Mac (2026-10-30, option B).
+    // system's choice (PingFang SC). Ashley 2026-10-30: 「中文有没有好看一点的字体」.
+    // Chinese body text in Hiragino Sans GB (冬青黑体), on every Mac (Ashley 2026-10-30, option B).
     nonisolated(unsafe) static var chineseSans: String? = "Hiragino Sans GB"
-    // Body text size step on top of each size above; 0 = as designed.
+    // Body text size step on top of each size above (Ashley 2026-10-30: 「看起来好小啊」); 0 = as designed.
     nonisolated(unsafe) static var textBoost: CGFloat = 0
-    // Chinese headings in Songti SC Bold, next to Source Serif "Toss" (2026-10-30).
-    // Songti ships with every Mac, so nothing is bundled.
+    // Chinese headings in Songti SC Bold, next to Source Serif "Toss" (Ashley 2026-10-30: 「就这个就这个
+    // 太美丽了」). Songti ships with every Mac, so nothing is bundled.
     nonisolated(unsafe) static var chineseSerif: String? = "STSongti-SC-Bold"
     private static func chinese(_ font: NSFont, _ family: String?, _ weight: NSFont.Weight) -> NSFont {
         guard let family else { return font }
@@ -279,7 +279,7 @@ final class SettingsDetail: NSTextField {
     override var stringValue: String {
         didSet {
             isHidden = stringValue.isEmpty
-            // Wrapped notes get a little line spacing (2026-10-30).
+            // Wrapped notes get a little line spacing (Ashley 2026-10-30: 「太紧凑了」).
             guard !styling, let font, let textColor else { return }
             styling = true
             let paragraph = NSMutableParagraphStyle(); paragraph.lineSpacing = 3

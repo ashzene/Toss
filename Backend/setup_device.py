@@ -28,6 +28,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -38,6 +39,8 @@ USBMUX = "/var/run/usbmuxd"
 TRUST_TIMEOUT = 90
 POLL_SECONDS = 1.5
 AUTO_LIMIT_SECONDS = 30 * 60
+RESTART_MIN_ABSENCE_SECONDS = 15
+DEVELOPER_CONFIRM_SECONDS = 90
 WIFI_ATTEMPTS = 6
 DEVELOPER_SERVICE = "com.apple.instruments.dtservicehub"
 
@@ -200,20 +203,22 @@ async def wifi_prepare_with_retries(state: Path, model=None, ipados=None) -> str
 
 
 async def try_enable_developer_mode(client, *, diagnostics=None, state=None,
-                                    model=None, ipados=None, deadline=None) -> str:
+                                    model=None, ipados=None, deadline=None, revealer=None) -> str:
     """Keep the legacy string outcome; optional fields record sanitized failures."""
     from developer_mode import enable
     return await enable(client, progress=emit,
                         diagnostics=diagnostics if diagnostics is not None else {}, state=state,
                         reconnect=(lambda: lockdown_for(client.udid, state / "cache")) if state is not None else None,
-                        model=model, ipados=ipados, deadline=deadline)
+                        model=model, ipados=ipados, deadline=deadline, revealer=revealer)
 
 
 async def try_accept_developer_mode(client) -> bool:
     """Answer the post-restart "Turn On Developer Mode?" prompt when iPadOS allows it."""
     from pymobiledevice3.services.amfi import AmfiService
     try:
-        await AmfiService(client).enable_developer_mode_post_restart()
+        from developer_mode import REQUEST_TIMEOUT
+        async with asyncio.timeout(REQUEST_TIMEOUT):
+            await AmfiService(client).enable_developer_mode_post_restart()
         return True
     except Exception:
         return False
@@ -247,82 +252,112 @@ async def auto(state: Path) -> str:
     deadline = time.monotonic() + AUTO_LIMIT_SECONDS
     devmode = {}                       # last sanitized enable failure, kept in the final result
     developer_mode_requested = False   # we asked the user (or iPadOS) to switch it on
-    seen_restart = False                # the iPad went away after that request
+    seen_restart = False
+    usb_absent_since = None
+    confirm_until = None
     accept_tries = 0
+    manual_needed = False
     model = version = None
-    while time.monotonic() < deadline:
-        ipads = await usb_ipads(cache)
-        if not ipads:
-            if developer_mode_requested:
-                seen_restart = True
-                emit(False, "ipad_restarting", final=False, model=model, ipados=version)
-            else:
-                emit(False, "no_usb_ipad", final=False)
-            await asyncio.sleep(POLL_SECONDS)
-            continue
-        if len(ipads) > 1:
-            emit(False, "multiple_usb_ipads", final=False)
-            await asyncio.sleep(POLL_SECONDS)
-            continue
-        serial, model, version, paired = ipads[0]
-        if model is None:
-            emit(False, "ipad_restarting" if seen_restart else "unlock_needed", final=False)
-            await asyncio.sleep(POLL_SECONDS)
-            continue
-        from remote_pairing_transport import supported_ipados
-        if not supported_ipados(version):
-            return emit_final(False, "unsupported_ipados", model=model, ipados=version)
-
-        if not paired:
-            # Shows "Trust This Computer?" on the iPad; the user taps Trust and
-            # enters the passcode. Nothing else on the device is changed here.
-            emit(False, "trust_needed", final=False, model=model, ipados=version)
-            from pymobiledevice3.lockdown import create_using_usbmux
-            try:
-                client = await create_using_usbmux(serial=serial, connection_type="USB", autopair=True,
-                                                   pair_timeout=TRUST_TIMEOUT, pairing_records_cache_folder=cache,
-                                                   usbmux_address=USBMUX)
-                await client.close()
-            except BaseException as error:
-                if not isinstance(error, Exception):
-                    raise
+    from developer_mode import RevealRepeater
+    revealer = RevealRepeater(state)
+    try:
+        while time.monotonic() < deadline:
+            ipads = await usb_ipads(cache)
+            if not ipads:
+                if developer_mode_requested:
+                    if usb_absent_since is None:
+                        usb_absent_since = time.monotonic()
+                    emit(False, "ipad_restarting", final=False, model=model, ipados=version)
+                else:
+                    emit(False, "no_usb_ipad", final=False)
                 await asyncio.sleep(POLL_SECONDS)
-            continue
-
-        try:
-            client = await lockdown_for(serial, cache)
-        except Exception:
-            emit(False, "unlock_needed", final=False, model=model, ipados=version)
-            await asyncio.sleep(POLL_SECONDS)
-            continue
-        async with client:
-            if not client.paired:
                 continue
-            udid = client.udid
+            if len(ipads) > 1:
+                emit(False, "multiple_usb_ipads", final=False)
+                await asyncio.sleep(POLL_SECONDS)
+                continue
+            if usb_absent_since is not None:
+                now = time.monotonic()
+                # An automatic enable already requested a reboot. Only the manual
+                # path needs to distinguish a quick cable replug from a restart.
+                seen_restart = (not manual_needed or
+                                now - usb_absent_since >= RESTART_MIN_ABSENCE_SECONDS)
+                confirm_until = now + DEVELOPER_CONFIRM_SECONDS if seen_restart else None
+                accept_tries = 0
+                usb_absent_since = None
+            serial, model, version, paired = ipads[0]
+            if model is None:
+                emit(False, "ipad_restarting" if seen_restart else "unlock_needed", final=False)
+                await asyncio.sleep(POLL_SECONDS)
+                continue
+            from remote_pairing_transport import supported_ipados
+            if not supported_ipados(version):
+                return emit_final(False, "unsupported_ipados", model=model, ipados=version)
+
+            if not paired:
+                # Shows "Trust This Computer?" on the iPad; the user taps Trust and
+                # enters the passcode. Nothing else on the device is changed here.
+                emit(False, "trust_needed", final=False, model=model, ipados=version)
+                from pymobiledevice3.lockdown import create_using_usbmux
+                try:
+                    client = await create_using_usbmux(serial=serial, connection_type="USB", autopair=True,
+                                                       pair_timeout=TRUST_TIMEOUT, pairing_records_cache_folder=cache,
+                                                       usbmux_address=USBMUX)
+                    await client.close()
+                except BaseException as error:
+                    if not isinstance(error, Exception):
+                        raise
+                    await asyncio.sleep(POLL_SECONDS)
+                continue
+
             try:
-                developer_mode = await client.get_developer_mode_status()
+                client = await lockdown_for(serial, cache)
             except Exception:
-                developer_mode = False
-            if not developer_mode:
-                if seen_restart and accept_tries < 5:
-                    # After the restart iPadOS asks "Turn On Developer Mode?".
-                    accept_tries += 1
-                    if await try_accept_developer_mode(client):
-                        continue
-                    emit(False, "developer_mode_confirm", final=False, model=model, ipados=version)
-                elif not developer_mode_requested:
-                    outcome = await try_enable_developer_mode(client, diagnostics=devmode, state=state,
-                                                              model=model, ipados=version, deadline=deadline)
-                    if outcome == "locked":
-                        return emit_final(False, "setup_timeout", model=model, ipados=version, **devmode)
-                    developer_mode_requested = True
-                    emit(False, "developer_mode_auto" if outcome == "rebooting" else "developer_mode_needed",
-                         final=False, model=model, ipados=version, **devmode)
+                emit(False, "unlock_needed", final=False, model=model, ipados=version)
                 await asyncio.sleep(POLL_SECONDS)
                 continue
-        code = await finish_pairing(state, serial, cache, udid, model, version)
-        return emit_final(code == "ready", code, model=model, ipados=version, **devmode)
-    return emit_final(False, "setup_timeout", model=model, ipados=version, **devmode)
+            async with client:
+                if not client.paired:
+                    continue
+                udid = client.udid
+                try:
+                    developer_mode = await client.get_developer_mode_status()
+                except Exception:
+                    developer_mode = False
+                if not developer_mode:
+                    if seen_restart:
+                        # After the restart iPadOS asks "Turn On Developer Mode?".
+                        if accept_tries < 5 and time.monotonic() < confirm_until:
+                            accept_tries += 1
+                            if await try_accept_developer_mode(client):
+                                continue
+                        if time.monotonic() < confirm_until:
+                            emit(False, "developer_mode_confirm", final=False, model=model, ipados=version)
+                        else:
+                            seen_restart = False
+                            accept_tries = 0
+                            manual_needed = True
+                    elif not developer_mode_requested:
+                        outcome = await try_enable_developer_mode(client, diagnostics=devmode, state=state,
+                                                                  model=model, ipados=version, deadline=deadline, revealer=revealer)
+                        if outcome == "locked":
+                            return emit_final(False, "setup_timeout", model=model, ipados=version, **devmode)
+                        developer_mode_requested = True
+                        manual_needed = outcome == "manual"
+                        emit(False, "developer_mode_auto" if outcome == "rebooting" else "developer_mode_needed",
+                             final=False, model=model, ipados=version, **devmode)
+                    if manual_needed:
+                        revealer.tick(lambda: lockdown_for(serial, cache))
+                        if not seen_restart:
+                            emit(False, "developer_mode_needed", final=False, model=model, ipados=version, **devmode)
+                    await asyncio.sleep(POLL_SECONDS)
+                    continue
+            await revealer.close()
+            code = await finish_pairing(state, serial, cache, udid, model, version)
+            return emit_final(code == "ready", code, model=model, ipados=version, **devmode)
+        return emit_final(False, "setup_timeout", model=model, ipados=version, **devmode)
+    finally:
+        await revealer.close()
 
 
 def emit_final(ok: bool, code: str, **fields) -> str:
@@ -377,8 +412,27 @@ async def next_step(state: Path):
     return emit_final(code == "ready", code, model=model, ipados=version)
 
 
+def exit_with_parent(poll_seconds=1.0):
+    """End this process when Toss goes away, even inside a long pairing step.
+
+    Same effect as the SIGTERM Toss sends when it stops setup itself; this covers a crash or a
+    quit that never sent it. Nobody is left to read the result, so there is nothing to report.
+    """
+    parent = os.getppid()
+    if parent <= 1:  # Toss was already gone while Python was starting.
+        os._exit(0)
+
+    def watch():
+        while os.getppid() == parent:
+            time.sleep(poll_seconds)
+        os._exit(0)
+
+    threading.Thread(target=watch, daemon=True).start()
+
+
 def main(argv=None):
     os.umask(0o077)
+    exit_with_parent()
     parser = once.QuietParser(description=__doc__)
     parser.add_argument("action", choices=["auto", "next", "prepare"])
     parser.add_argument("--state-dir", type=Path, required=True)

@@ -58,7 +58,6 @@ struct UninstallTests {
         }
         let build = try String(contentsOf: source.appendingPathComponent("scripts/build-release.py"), encoding: .utf8)
         check(!build.contains("Uninstall.command"), "DMG build no longer stages a command uninstaller")
-        check(build.contains(#"VERSION, BUILD = "1.0.0", "#), "Version stays 1.0.0 (build numbers only go up)")
     }
 
     static func write(_ url: URL, _ text: String = "keep") throws {
@@ -169,7 +168,7 @@ struct UninstallTests {
             check(notice == (chinese ? "请把 Toss 拖进废纸篓" : "Drag Toss to the Trash"), "Language survives preference clearing")
         }
         AppLanguage.override = nil
-        check(!UninstallPolicy.resetPermissions, "Default keeps Accessibility, as Uninstall.command does")
+        check(!UninstallPolicy.resetPermissions, "Default keeps Accessibility, as Uninstall.command does (Ashley 2026-10-29)")
         check(UninstallPolicy.domain == "io.github.ashzene.toss" &&
               UninstallPolicy.permissionServices == ["Accessibility", "PostEvent", "ListenEvent"],
               "Exact permission services and bundle ID required by the task")

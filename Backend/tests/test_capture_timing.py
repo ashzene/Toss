@@ -68,6 +68,12 @@ class StoreTests(unittest.TestCase):
                                             "wifi": [{"seconds": 1.358, "timestamp": 1235}]})
         self.assertFalse(list(self.base.glob(".screenshot-success-times-*")))
 
+    def test_slow_success_is_retained_without_relaxing_the_history_limit(self):
+        self.assertTrue(self.store.record("wifi", 10, 1234))
+        self.assertEqual(self.store.load()["wifi"], [{"seconds": 10, "timestamp": 1234}])
+        self.assertFalse(self.store.record("wifi", 30.01, 1235))
+        self.assertEqual(len(self.store.load()["wifi"]), 1)
+
     def test_retains_two_hundred_per_lane_independent_of_capture_history(self):
         self.write({"schema_version": 1, "usb": rows(200, 0.2), "wifi": rows(200, 0.3)})
         (self.base / "capture-history.jsonl").write_text("")

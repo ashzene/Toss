@@ -7,6 +7,57 @@ import ApplicationServices
 struct StrictTargetPolicyTests {
     static var assertions = 0
     static func main() throws {
+        // ChatGPT's Dot page: its composer is only labelled "Message" and its row is not a thread row.
+        do {
+            typealias Row = SidebarIdentityNode<Int>
+            let threadClasses: Set<String> = ["sidebar-item", SidebarIdentityPolicy.threadClass]
+            func fixture() -> [Row] {
+                [Row(key: 100, parent: nil, role: "AXWindow"),
+                 Row(key: 101, parent: 0, role: "AXWebArea"),
+                 Row(key: 102, parent: 1, role: "AXTextArea"),
+                 Row(key: 103, parent: 1, role: "AXButton", labels: ["Home"], current: "page"),
+                 Row(key: 104, parent: 1, role: "AXList"),
+                 Row(key: 105, parent: 4, role: "AXButton", labels: ["Your Dot"], current: "page"),
+                 Row(key: 106, parent: 4, role: "AXButton", labels: ["A chat"], classes: threadClasses)]
+            }
+            func check(_ nodes: [Row], dot: Bool = true, title: String? = "Your Dot") -> SidebarIdentityAnalysis<Int> {
+                SidebarIdentityPolicy.analyze(nodes: nodes, webArea: 1, composer: 2, documentRoutes: [], dotComposer: dot, documentTitle: title)
+            }
+            let dot = check(fixture())
+            expect(dot.failure == nil && dot.listKinds.contains(.dot) && dot.currentCount == 1)
+            if case let .sidebar(proof)? = dot.identity {
+                expect(proof.button == 105 && proof.list == 104 && proof.kind == .dot && proof.buttonLabel.isEmpty)
+            } else { preconditionFailure("The Dot's page must be a retained sidebar proof") }
+            // The unread count in the row's label must not read as a different chat.
+            var nodes = fixture(); nodes[5].labels = ["Your Dot, 1 unread"]
+            expect(check(nodes).identity == dot.identity)
+            // A renamed Dot still matches its own document.
+            nodes = fixture(); nodes[5].labels = ["Pal, 2 unread"]
+            expect(check(nodes, title: "Pal").identity == dot.identity)
+            // Any other current row is not the Dot, and neither is a page without a title.
+            nodes = fixture(); nodes[5].labels = ["Unrelated page"]
+            expect(check(nodes).identity == nil && check(nodes).failure == .currentThreadUnavailable)
+            expect(check(fixture(), title: nil).identity == nil && check(fixture(), title: "").identity == nil)
+            // An ordinary composer never takes the Dot's row as its chat.
+            expect(check(fixture(), dot: false).identity == nil)
+            expect(check(fixture(), dot: false).failure == .currentThreadUnavailable)
+            // A "Message" field on an ordinary chat is not the Dot.
+            nodes = fixture(); nodes[5].current = nil; nodes[6].current = "page"
+            expect(check(nodes).identity == nil && check(nodes).failure == .currentThreadUnavailable)
+            // The nav rail's current Home alone proves nothing.
+            nodes = fixture(); nodes[5].current = nil
+            expect(check(nodes).identity == nil)
+            // A hidden row and two current rows both refuse.
+            nodes = fixture(); nodes[5].hidden = true
+            expect(check(nodes).identity == nil)
+            nodes = fixture(); nodes[6].classes = []; nodes[6].labels = ["Your Dot copy"]; nodes[6].current = "page"
+            expect(check(nodes).failure == .currentThreadsAmbiguous)
+            expect(ComposerLabelPolicy.accepts("消息") && ComposerLabelPolicy.dot("Message") && !ComposerLabelPolicy.existing("消息"))
+            expect(ComposerLabelPolicy.dot("訊息"))
+            // Languages whose attachment labels cannot be confirmed stay out, so nothing is pasted unconfirmed.
+            for label in ["メッセージ", "Nachricht", "Mensaje", "메시지"] { expect(!ComposerLabelPolicy.accepts(label)) }
+            expect(!ComposerLabelPolicy.dot("Ask ChatGPT") && !ComposerLabelPolicy.accepts("Reply"))
+        }
         let id = "01a13e1f-fd91-7240-8fc6-a930d29e3676"
         expect(StrictTarget.conversationRoute("app://./local/\(id)") == "/local/\(id)")
         expect(StrictTarget.conversationRoute("codex://threads/\(id)") == "/local/\(id)")
