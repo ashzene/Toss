@@ -46,6 +46,9 @@ enum HotkeyRejection: Equatable {
 
 enum HotkeyAction: Equatable {
     case capture(HotkeyRequest)
+    // Same logical press/target, fresh screenshot generation. The old image is discarded.
+    case retarget(HotkeyRequest)
+    case retargetQueued(pressedAt: Double)
     // This is an abstract, once-only authorization, not proof of an attachment.
     case pasteIntent(HotkeyRequest, imageToken: String)
     case rejected(requestID: UInt64, HotkeyRejection)
@@ -78,8 +81,12 @@ struct HotkeyCore {
     private var armed = false
     private var cycleDirty = false
     private var cycleFired = false
+    private var cycleFiredAt: Double = 0
+    // Two paired devices: a fast second press may lift only one hand before pressing again.
+    var partialReleaseWindow: Double = 0
     private var cycleOwnsRequest = false
     private var originalChordReleased = false
+    private var pasteNotBefore: Double = 0
 
     init(captureTimeout: Double = 15, imageLifetime: Double = 10, firstID: UInt64 = 1, idStride: UInt64 = 1) {
         precondition(captureTimeout > 0 && captureTimeout.isFinite)
@@ -102,6 +109,31 @@ struct HotkeyCore {
         case .capturing(let r), .appending(let r, _): return r.id
         case .ready(let r): return r.request.id
         }
+    }
+
+    var activeRequest: HotkeyRequest? {
+        switch phase {
+        case .idle: return nil
+        case .capturing(let request), .appending(let request, _): return request
+        case .ready(let ready): return ready.request
+        }
+    }
+
+    func recognizesNewChord(_ snapshot: HotkeyKeys) -> Bool {
+        armed && !cycleFired && !cycleDirty && !snapshot.contaminated && snapshot.leftOption && snapshot.rightOption
+    }
+
+    mutating func holdPaste(until time: Double) { pasteNotBefore = time }
+
+    mutating func recapture(at now: Double) -> HotkeyRequest? {
+        guard let old = activeRequest else { return nil }
+        if case .appending = phase { return nil }
+        let request = HotkeyRequest(id: old.id, startedAt: old.startedAt, deadlineAt: now + captureTimeout)
+        phase = .capturing(request)
+        pasteNotBefore = 0
+        originalChordReleased = false
+        cycleOwnsRequest = true
+        return request
     }
 
     // Call for relevant key-down, key-up and modifier changes. Return values
@@ -133,6 +165,9 @@ struct HotkeyCore {
         }
         guard armed else { return actions }
         cycleDirty = cycleDirty || keys.contaminated
+        if cycleFired, !cycleDirty, keys.leftOption != keys.rightOption, now < cycleFiredAt + partialReleaseWindow {
+            cycleFired = false
+        }
         if cycleDirty {
             if cycleOwnsRequest {
                 actions += cancel(reason: .chordInterrupted)
@@ -142,6 +177,7 @@ struct HotkeyCore {
         }
         if keys.leftOption && keys.rightOption && !cycleFired {
             cycleFired = true // Busy chords are consumed, never queued.
+            cycleFiredAt = now
             guard allowNewCapture, !isBusy, busyElsewhere == nil else {
                 if allowNewCapture, let running = runningRequest ?? busyElsewhere {
                     actions.append(.busyRepeat(requestID: running.id, phase: running.phase))
@@ -152,6 +188,7 @@ struct HotkeyCore {
                                         deadlineAt: now + captureTimeout)
             nextID += idStride
             originalChordReleased = false
+            pasteNotBefore = 0
             cycleOwnsRequest = true
             phase = .capturing(request)
             actions.append(.capture(request))
@@ -211,6 +248,7 @@ struct HotkeyCore {
         originalChordReleased = true
         cycleOwnsRequest = false
         phase = .capturing(request)
+        pasteNotBefore = 0
         return [.capture(request)]
     }
 
@@ -223,6 +261,7 @@ struct HotkeyCore {
         cycleFired = false
         cycleOwnsRequest = false
         originalChordReleased = false
+        pasteNotBefore = 0
         return actions
     }
 
@@ -244,7 +283,7 @@ struct HotkeyCore {
     }
 
     private mutating func issuePasteIfReady(at now: Double) -> [HotkeyAction] {
-        guard keys.allReleased, originalChordReleased,
+        guard now >= pasteNotBefore, keys.allReleased, originalChordReleased,
               case .ready(let ready) = phase, now < ready.expiresAt else { return [] }
         phase = .appending(ready.request, expiresAt: ready.expiresAt) // Advance before exposing the effect.
         return [.pasteIntent(ready.request, imageToken: ready.imageToken)]
@@ -348,26 +387,26 @@ enum ParallelCaptureFallbackPolicy {
 
 enum HotkeyChord: Equatable { case options, shifts }
 
-// Where a queued press pastes (2026-10-28: in the chat where it was pressed, never a wrong one). Pure rules;
+// Where a queued press pastes (Ashley 2026-10-28: 「就在原来的地方贴」「为什么会贴错地方」). Pure rules;
 // the adapter supplies the facts. A bound press pastes only into the chat it was bound to; otherwise
 // (option b) its picture stays on the clipboard with the manual-paste notice. Unbound presses use
 // their app's current chat when their turn comes, as in v21.1.
 enum QueuedDestinationPolicy {
     // Bound to the chat this app's presses already go to in the current burst (the running toss's
-    // chat for the same app, else the burst's earlier chat for it). Input in OTHER apps (2026-10-28
-    // 13:29: clicking another app while pressing) never voids it; only input that went
+    // chat for the same app, else the burst's earlier chat for it). Input in OTHER apps (Ashley
+    // 2026-10-28 13:29: clicking another app while pressing) never voids it; only input that went
     // into that chat app itself may have changed the chat.
     static func binds(sourceAvailable: Bool, watchObserving: Bool, inputInTargetApp: Bool) -> Bool {
         sourceAvailable && watchObserving && !inputInTargetApp
     }
-    // Bringing the chat back after the user clicked away: a few tries, then manual paste (never a fight).
+    // Bringing the chat back after she clicked away: a few tries, then manual paste (never a fight).
     static let refocusAttempts = 3
     static let foregroundRetriesBeforePaste = 2
     enum Outcome: Equatable { case paste, manualPaste }
     static func outcome(bound: Bool, sameDestination: Bool) -> Outcome {
         !bound || sameDestination ? .paste : .manualPaste
     }
-    // Back to the bound chat (back where it was, not a new page). isBound() locates the current
+    // Back to the bound chat (Ashley: 「还是放回原来那里，不要放在新的页面」). isBound() locates the current
     // chat and compares it with the binding. Nothing is clicked while it already matches; the window
     // is raised before any sidebar item is pressed; the item is pressed at most once and the result
     // verified. false: not provably back (gone, deleted, ambiguous) → manual paste, never elsewhere.
@@ -399,7 +438,26 @@ struct DualHotkeyCore {
     private var options: HotkeyCore
     private var shifts: HotkeyCore
 
-    init(captureTimeout: Double = 15, imageLifetime: Double = 10) {
+    static let doublePressWindow: Double = 0.500
+    private let tapSelectionEnabled: Bool
+    var hasSecondaryDevice = false {
+        didSet {
+            let window = hasSecondaryDevice ? Self.doublePressWindow : 0
+            options.partialReleaseWindow = window
+            shifts.partialReleaseWindow = window
+        }
+    }
+    private struct Gesture {
+        let chord: HotkeyChord
+        let at: Double
+        let dual: Bool
+        var doubled = false
+    }
+    private var lastGesture: Gesture?
+    private var gestures: [Double: Gesture] = [:]
+
+    init(captureTimeout: Double = 15, imageLifetime: Double = 10, tapSelectionEnabled: Bool = false) {
+        self.tapSelectionEnabled = tapSelectionEnabled
         options = HotkeyCore(captureTimeout: captureTimeout, imageLifetime: imageLifetime, firstID: 1, idStride: 2)
         shifts = HotkeyCore(captureTimeout: captureTimeout, imageLifetime: imageLifetime, firstID: 2, idStride: 2)
     }
@@ -408,9 +466,22 @@ struct DualHotkeyCore {
 
     var isBusy: Bool { options.isBusy || shifts.isBusy }
     var activeRequestID: UInt64? { options.activeRequestID ?? shifts.activeRequestID }
+    private var activeRequest: HotkeyRequest? { options.activeRequest ?? shifts.activeRequest }
+    func selectsSecondary(pressedAt: Double) -> Bool {
+        guard let gesture = gestures[pressedAt] else { return false }
+        return gesture.dual && gesture.doubled
+    }
+    func selectsSecondary(requestID: UInt64) -> Bool {
+        guard let request = activeRequest, request.id == requestID else { return false }
+        return selectsSecondary(pressedAt: request.startedAt)
+    }
+    func selectionDeadline(pressedAt: Double) -> Double {
+        guard let gesture = gestures[pressedAt], gesture.dual, !gesture.doubled else { return 0 }
+        return gesture.at + Self.doublePressWindow
+    }
 
-    // Chords pressed while a request is running (2026-10-28: the next one may start
-    // before the last has pasted). Each still reports busyRepeat for the menu-bar nudge, and is also kept here in
+    // Chords pressed while a request is running (Ashley, 2026-10-28: "允许在没粘贴完的时候粘贴
+    // 下一个"). Each still reports busyRepeat for the menu-bar nudge, and is also kept here in
     // order; the adapter starts the oldest with startQueued once the slot is free. A press older
     // than queueLifetime is dropped rather than pasted long after the user moved on.
     static let queueLimit = 3
@@ -421,25 +492,65 @@ struct DualHotkeyCore {
 
     mutating func observe(_ snapshot: ModifierSnapshot, at now: Double,
                           allowNewCapture: Bool = true) -> [HotkeyAction] {
+        let chord: HotkeyChord? = options.recognizesNewChord(snapshot.optionChord) ? .options :
+            (shifts.recognizesNewChord(snapshot.shiftChord) ? .shifts : nil)
+        let second = tapSelectionEnabled && allowNewCapture && chord != nil &&
+            lastGesture?.chord == chord && lastGesture?.doubled == false &&
+            now >= lastGesture!.at && now < lastGesture!.at + Self.doublePressWindow
         let fromOptions = options.observe(snapshot.optionChord, at: now,
-                                          allowNewCapture: allowNewCapture, busyElsewhere: shifts.runningRequest)
+                                          allowNewCapture: allowNewCapture && !second, busyElsewhere: shifts.runningRequest)
         let fromShifts = shifts.observe(snapshot.shiftChord, at: now,
-                                        allowNewCapture: allowNewCapture, busyElsewhere: options.runningRequest)
+                                        allowNewCapture: allowNewCapture && !second, busyElsewhere: options.runningRequest)
+        if second, var gesture = lastGesture {
+            gesture.doubled = true
+            lastGesture = gesture
+            gestures[gesture.at] = gesture
+            if gesture.dual {
+                if activeRequest?.startedAt == gesture.at {
+                    let request = gesture.chord == .options ? options.recapture(at: now) : shifts.recapture(at: now)
+                    if let request { return fromOptions + fromShifts + [.retarget(request)] }
+                } else if queue.contains(where: { $0.at == gesture.at }) {
+                    return fromOptions + fromShifts + [.retargetQueued(pressedAt: gesture.at)]
+                }
+            }
+            return fromOptions + fromShifts // Single device: consume the second chord even after completion.
+        }
         for (chord, actions) in [(HotkeyChord.options, fromOptions), (.shifts, fromShifts)] {
             let pressedWhileBusy = actions.contains { if case .busyRepeat = $0 { return true }; return false }
-            if pressedWhileBusy, queue.count < Self.queueLimit { queue.append((chord, now)) }
+            let queued = pressedWhileBusy && queue.count < Self.queueLimit
+            if queued { queue.append((chord, now)) }
+            let captured = actions.contains { if case .capture = $0 { return true }; return false }
+            if tapSelectionEnabled, queued || captured {
+                let gesture = Gesture(chord: chord, at: now, dual: hasSecondaryDevice)
+                lastGesture = gesture
+                gestures[now] = gesture
+                if captured { holdPaste(chord: chord, pressedAt: now) }
+            }
         }
         return fromOptions + fromShifts
+    }
+
+    private mutating func holdPaste(chord: HotkeyChord, pressedAt: Double) {
+        let deadline = selectionDeadline(pressedAt: pressedAt)
+        if chord == .options { options.holdPaste(until: deadline) } else { shifts.holdPaste(until: deadline) }
     }
 
     mutating func startQueued(at now: Double) -> [HotkeyAction] {
         queue.removeAll { now - $0.at > Self.queueLifetime || now < $0.at }
         guard !isBusy, !queue.isEmpty else { return [] }
         let next = queue.removeFirst()
+        let actions: [HotkeyAction]
         switch next.chord {
-        case .options: return options.startQueued(at: now, pressedAt: next.at)
-        case .shifts: return shifts.startQueued(at: now, pressedAt: next.at)
+        case .options: actions = options.startQueued(at: now, pressedAt: next.at)
+        case .shifts: actions = shifts.startQueued(at: now, pressedAt: next.at)
         }
+        holdPaste(chord: next.chord, pressedAt: next.at)
+        return actions
+    }
+
+    mutating func recaptureDelivery(at now: Double) -> HotkeyRequest? {
+        guard let request = activeRequest else { return nil }
+        return Self.chord(of: request.id) == .options ? options.recapture(at: now) : shifts.recapture(at: now)
     }
 
     mutating func beginDelivery(chord: HotkeyChord, pressedAt: Double, at now: Double) -> [HotkeyAction] {
@@ -456,10 +567,12 @@ struct DualHotkeyCore {
     @discardableResult
     mutating func discardUncapturedQueuedPresses(after reason: String,
                                                capturedAt: Double? = nil,
-                                               reportingFailureAt: Double? = nil) -> Int {
+                                               reportingFailureAt: Double? = nil,
+                                               secondaryDevice: Bool? = nil) -> Int {
         guard CaptureQueueFailurePolicy.affectsQueuedPresses(reason) else { return 0 }
         let previous = queue.count
-        queue.removeAll { $0.at != capturedAt && $0.at != reportingFailureAt }
+        let affected = Set(queue.filter { secondaryDevice == nil || selectsSecondary(pressedAt: $0.at) == secondaryDevice }.map { $0.at })
+        queue.removeAll { affected.contains($0.at) && $0.at != capturedAt && $0.at != reportingFailureAt }
         return previous - queue.count
     }
 
@@ -498,7 +611,8 @@ struct DualHotkeyCore {
     // keepQueue: the end of one request (its own cleanup reset) keeps the presses waiting
     // behind it; disabling, lost key monitoring or invalid timing clears them.
     mutating func reset(keepQueue: Bool = false) -> [HotkeyAction] {
-        if !keepQueue { queue.removeAll() }
+        if !keepQueue { queue.removeAll(); gestures.removeAll(); lastGesture = nil }
+        else { gestures = gestures.filter { at, _ in queue.contains { $0.at == at } || lastGesture?.at == at } }
         return options.reset() + shifts.reset()
     }
 }
@@ -584,20 +698,23 @@ struct CapturePipeline {
 
 struct CaptureChordDetector {
     private struct Cycle {
-        var armed = false, dirty = false, fired = false
-        mutating func observe(_ keys: HotkeyKeys, allow: Bool) -> Bool {
+        var armed = false, dirty = false, fired = false, firedAt: Double = 0
+        mutating func observe(_ keys: HotkeyKeys, allow: Bool, at now: Double, partialReleaseWindow: Double) -> Bool {
             if keys.optionsReleased { armed = true; dirty = false; fired = false; return false }
             guard armed else { return false }
             dirty = dirty || keys.contaminated
+            if fired, !dirty, keys.leftOption != keys.rightOption, now < firedAt + partialReleaseWindow { fired = false }
             guard !dirty, !fired, keys.leftOption, keys.rightOption else { return false }
             fired = true
+            firedAt = now
             return allow
         }
     }
     private var options = Cycle(), shifts = Cycle()
-    mutating func observe(_ keys: ModifierSnapshot, allow: Bool) -> HotkeyChord? {
-        let option = options.observe(keys.optionChord, allow: allow)
-        let shift = shifts.observe(keys.shiftChord, allow: allow)
+    mutating func observe(_ keys: ModifierSnapshot, allow: Bool, at now: Double = 0,
+                          partialReleaseWindow: Double = 0) -> HotkeyChord? {
+        let option = options.observe(keys.optionChord, allow: allow, at: now, partialReleaseWindow: partialReleaseWindow)
+        let shift = shifts.observe(keys.shiftChord, allow: allow, at: now, partialReleaseWindow: partialReleaseWindow)
         return option ? .options : shift ? .shifts : nil
     }
 }

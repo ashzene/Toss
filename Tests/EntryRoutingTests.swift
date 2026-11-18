@@ -14,7 +14,7 @@ import AppKit
     @MainActor static func main() {
         let app = NSApplication.shared
         let saved = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
-        defer { UserDefaults.standard.setVolatileDomain(saved, forName: UserDefaults.argumentDomain); RenderState.onOpenInterface = nil }
+        defer { UserDefaults.standard.setVolatileDomain(saved, forName: UserDefaults.argumentDomain); RenderState.onOpenInterface = nil; RenderState.pairedDevices = nil }
         var count = 0
         func check(_ condition: Bool, _ message: String) { precondition(condition,message); count += 1 }
         let prefs = EntryPreferences()
@@ -23,8 +23,23 @@ import AppKit
         RenderState.connection = .init(state: .notChecked, reason: "not_checked")
         var opened: [String] = []
         RenderState.onOpenInterface = { opened.append($0) }
-        for paired in [false,true] { for first in [false,true] { for seen in [false,true] {
-            RenderState.paired = paired; prefs.loginChoiceMade = !first
+        for classes: Set<DeviceClass> in [[], [.iPhone], [.iPad], [.iPhone, .iPad]] {
+            var files: [String: Data] = [:]
+            var pins: [String: [String: String]] = [:]
+            for kind in classes {
+                let pin = ["device_class": kind.rawValue, "model": kind.rawValue + "15,1", "device_hash": "fixture-" + kind.rawValue]
+                pins[kind.rawValue] = pin
+                files["/fixture/devices/" + kind.rawValue + "/target.json"] = try! JSONSerialization.data(withJSONObject: pin)
+                files["/fixture/devices/" + kind.rawValue + "/strict-remote-pairing.plist"] = Data()
+            }
+            files["/fixture/target.json"] = try! JSONSerialization.data(withJSONObject: ["schema_version": 2, "devices": pins])
+            var devices = PairedDevicesState()
+            devices.restore(root: "/fixture", read: { files[$0] }, exists: { files[$0] != nil })
+            check(devices.classes == classes, "Fixture restores the actual dual-device index")
+            RenderState.pairedDevices = devices
+            let paired = !classes.isEmpty
+            for first in [false,true] { for seen in [false,true] {
+            prefs.loginChoiceMade = !first
             UserDefaults.standard.setVolatileDomain([OnboardingPolicy.seenKey:seen,TossDelegate.reopenSettingsKey:false],forName:UserDefaults.argumentDomain)
             opened = []; delegate.renderInitialEntry()
             check(opened == (!paired ? ["setup"] : first ? [seen ? "settings" : "setup"] : []), "Launch chooses setup from actual pairing, including stale seen flag")
@@ -33,7 +48,7 @@ import AppKit
             opened = []; delegate.renderInitialEntry(afterInstall:true)
             check(opened == ["setup"], "Installer explicitly opens its setup window")
         } } }
-        RenderState.paired = false
+        RenderState.pairedDevices = PairedDevicesState()
         let item = NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength)
         defer { NSStatusBar.system.removeStatusItem(item) }
         let status = delegate.renderStatusEntry(item:item)

@@ -216,7 +216,7 @@ enum DualHotkeyCoreTests {
         check(!core.isBusy, "failure frees slot")
 
         // Presses made while a request runs are queued in order and start, one at a time,
-        // only when the adapter asks (2026-10-28: allow the next toss before the last
+        // only when the adapter asks (Ashley 2026-10-28: allow the next toss before the last
         // one has pasted). A queued request needs no new physical press to paste.
         var q = DualHotkeyCore(captureTimeout: 45)
         _ = q.observe(up, at: 0); _ = q.observe(leftShift, at: 0.01)
@@ -481,7 +481,7 @@ enum DualHotkeyCoreTests {
         check(!binds([], target: codexPID, source: false), "no earlier chat in this burst for that app: as a first press")
         check(!binds([], target: codexPID, observing: false), "no watch running: nothing proven")
         check(QueuedDestinationPolicy.refocusAttempts == 3 && QueuedDestinationPolicy.foregroundRetriesBeforePaste == 2,
-              "bringing the chat back after the user clicks away is bounded")
+              "bringing the chat back after she clicks away is bounded")
         check(QueuedDestinationPolicy.outcome(bound: true, sameDestination: true) == .paste, "bound chat still current: paste there")
         check(QueuedDestinationPolicy.outcome(bound: true, sameDestination: false) == .manualPaste,
               "bound chat switched away or gone: never another chat, manual paste")

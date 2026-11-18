@@ -59,6 +59,46 @@ struct TargetLease {
     }
 }
 
+// A missing current-chat marker is not permission to paste. It can, however,
+// be a focus-dependent AX state: focus the one proven composer, then require
+// a fresh, fully identified lease from the same window, editor and draft.
+enum ComposerFocusRecovery {
+    struct Snapshot<Key: Equatable> {
+        let pid: pid_t
+        let window: Key
+        let webArea: Key
+        let composer: Key
+        let documentTitle: String?
+        let draft: DraftSnapshot
+
+        func validate(_ current: Self) throws {
+            guard pid == current.pid, window == current.window, webArea == current.webArea,
+                  composer == current.composer, documentTitle == current.documentTitle else {
+                throw TargetFailure.targetChanged
+            }
+            guard draft.sameDraft(as: current.draft) else { throw TargetFailure.draftChanged }
+        }
+    }
+
+    @MainActor
+    static func recover<Candidate, Lease>(from error: TargetFailure,
+        prepare: () throws -> Candidate, focus: (Candidate) throws -> Void,
+        read: (Candidate) throws -> Lease?,
+        pause: () async throws -> Void = { try await Task.sleep(nanoseconds: 40_000_000) }) async throws -> Lease {
+        guard error == .currentThreadUnavailable else { throw error }
+        try Task.checkCancellation()
+        let candidate = try prepare()
+        try Task.checkCancellation()
+        try focus(candidate)
+        for _ in 0..<6 {
+            try await pause()
+            try Task.checkCancellation()
+            if let lease = try read(candidate) { return lease }
+        }
+        throw TargetFailure.currentThreadUnavailable
+    }
+}
+
 // Equality is AX object equality, never a title, DOM position, route guess or
 // recently used conversation. The wrapper retains the referenced AX element.
 fileprivate struct AXIdentityKey: Equatable {
@@ -100,12 +140,15 @@ struct NewDraftConversationProof<Key: Equatable>: Equatable {
 // Exact editor labels from the installed 26.1013.40934 renderer and locales.
 // These identify a composer only; a new draft also needs positive home evidence.
 enum ComposerLabelPolicy {
-    static let established: Set<String> = [
+    static let chatLabels: Set<String> = ["Ask ChatGPT", "询问 ChatGPT", "問問 ChatGPT", "問 ChatGPT"]
+    static let established = chatLabels.union([
         // "和 Codex 一起工作" is the zh-CN text in the 2026-10-17 ChatGPT update.
         "Work with Codex", "与 Codex 协作", "和 Codex 一起工作", "與 Codex 協作",
-        "Ask ChatGPT", "询问 ChatGPT", "問問 ChatGPT", "問 ChatGPT",
         "Work with ChatGPT", "使用 ChatGPT Work", "與 ChatGPT 協作", "與 ChatGPT 一起工作"
-    ]
+    ])
+    static func usesChatLayout(_ labels: [String]) -> Bool {
+        !labels.isEmpty && labels.allSatisfy(chatLabels.contains)
+    }
     static let newLabels: Set<String> = [
         "Do anything", "随心输入", "想做什麼都可以", "輸入任何任務",
         "New chat in this project", "此项目中的新聊天", "此專案中的新對話", "在此項目中開始新對話"
@@ -226,10 +269,17 @@ struct SidebarIdentityAnalysis<Key: Equatable> {
 }
 
 enum SidebarIdentityPolicy {
-    // This complete token occurs only in the installed app's thread-row renderer
-    // _zo, which passes it to ORo with hasNavigationLink:false. It is an actual
-    // DOM class, not an attempt to read an unexposed arbitrary data attribute.
+    // Both complete class tokens have been observed on ChatGPT's thread rows.
+    // The newer renderer switched the selected row's background to secondary.
     static let threadClass = "data-[app-action-sidebar-thread-selected=true]:bg-primary-ghost-hover"
+    private static let threadClasses: Set<String> = [
+        threadClass, "data-[app-action-sidebar-thread-selected=true]:bg-secondary-ghost-hover"
+    ]
+
+    static func hasThreadMarker(_ classes: Set<String>) -> Bool {
+        !threadClasses.isDisjoint(with: classes)
+    }
+
     static let chatsLabels: Set<String> = ["Chats", "聊天", "對話"]
     static let pinnedLabels: Set<String> = ["Pinned", "置顶", "已固定", "已釘選"]
 
@@ -273,7 +323,7 @@ enum SidebarIdentityPolicy {
             // The Dot's row is not a thread row: page-current inside a sidebar list, named like the open
             // document, is its proof (the label may add an unread count after the name, and the Dot can be
             // renamed, so no fixed name). The nav rail's Home button is also current, but not in a list.
-            if dotComposer, !node.hidden, node.current == "page", !node.classes.contains(threadClass),
+            if dotComposer, !node.hidden, node.current == "page", !hasThreadMarker(node.classes),
                let title = documentTitle, !title.isEmpty, node.labels.contains(where: { $0.hasPrefix(title) }),
                let chain = ancestors(index), !chain.contains(composer),
                !chain.contains(where: { nodes[$0].hidden }),
@@ -284,7 +334,7 @@ enum SidebarIdentityPolicy {
                 candidates.append((index, chain[listPosition], .dot))
                 continue
             }
-            guard !node.hidden, node.classes.contains("sidebar-item"), node.classes.contains(threadClass),
+            guard !node.hidden, node.classes.contains("sidebar-item"), hasThreadMarker(node.classes),
                   let chain = ancestors(index), !chain.contains(composer),
                   !chain.contains(where: { nodes[$0].hidden }),
                   chain.first(where: { nodes[$0].role == "AXWebArea" }) == webArea,
@@ -531,6 +581,7 @@ final class StrictTarget {
     // Consumers must use immediately; these are never a target-selection input.
     private(set) var latestConfirmedAttachmentFrame: CGRect?
     private(set) var latestConfirmedAttachmentFrameTimestamp: TimeInterval?
+    private(set) var latestConfirmedChatCard: AXUIElement?
     private(set) var latestAttachmentGeometryStatus = "not-requested"
     // A consumption receipt is weaker than preserved-draft success. The caller
     // may use it to restore its clipboard after a user edit, never to claim success.
@@ -567,6 +618,7 @@ final class StrictTarget {
         let composerIndex: Int
         let filename: String
         let hasComposerAttachmentCard: Bool
+        let usesChatLayout: Bool
     }
 
     // Called only when the user enables this companion. Chromium's
@@ -718,6 +770,86 @@ final class StrictTarget {
                            originatingFrontmostPID: foreground.processIdentifier)
     }
 
+    // Capture entry only. Read-only queue binding and lease revalidation still
+    // use locate()/inspect(), which never change focus or accept a missing chat.
+    func locateForCapture(shouldContinue: (pid_t) -> Bool) async throws -> TargetLease {
+        do { return try locate() }
+        catch let error as TargetFailure {
+            return try await ComposerFocusRecovery.recover(from: error,
+                prepare: { try self.focusRecoveryCandidate(shouldContinue: shouldContinue) },
+                focus: { candidate in
+                    try self.validateRecoveryWindow(candidate, shouldContinue: shouldContinue)
+                    guard AXUIElementSetAttributeValue(candidate.inspection.composer,
+                        "AXFocused" as CFString, kCFBooleanTrue) == .success else {
+                        throw TargetFailure.focusFailed
+                    }
+                },
+                read: { candidate in
+                    try self.validateRecoveryWindow(candidate, shouldContinue: shouldContinue)
+                    let current = try self.focusRecoveryCandidate(shouldContinue: shouldContinue)
+                    try candidate.snapshot.validate(current.snapshot)
+                    try self.validateRecoveryWindow(candidate, shouldContinue: shouldContinue)
+                    let appAX = AXUIElementCreateApplication(candidate.application.processIdentifier)
+                    guard let focused = self.element(appAX, "AXFocusedUIElement"),
+                          CFEqual(focused, current.inspection.composer),
+                          self.bool(current.inspection.composer, "AXFocused") == true,
+                          let conversation = current.inspection.conversation else { return nil }
+                    if let original = candidate.inspection.conversation {
+                        guard original == conversation else { throw TargetFailure.conversationChanged }
+                    } else if case .newDraft = conversation { throw TargetFailure.conversationChanged }
+                    self.diagnosticSummary += "; focusRecovery=confirmed"
+                    return TargetLease(pid: candidate.application.processIdentifier,
+                        initialSnapshot: current.inspection.draft, application: candidate.application,
+                        window: candidate.window, composer: current.inspection.composer,
+                        webArea: current.inspection.webArea, conversation: conversation,
+                        originatingFrontmostPID: candidate.application.processIdentifier)
+                })
+        }
+    }
+
+    private struct FocusRecoveryCandidate {
+        let application: NSRunningApplication
+        let window: AXUIElement
+        let inspection: ComposerInspection
+        let snapshot: ComposerFocusRecovery.Snapshot<AXIdentityKey>
+    }
+
+    private func focusRecoveryCandidate(shouldContinue: (pid_t) -> Bool) throws -> FocusRecoveryCandidate {
+        guard AXIsProcessTrusted() else { throw TargetFailure.denied }
+        let apps = NSRunningApplication.runningApplications(withBundleIdentifier: Self.bundleID)
+            .filter { !$0.isTerminated }
+        guard apps.count == 1, let app = apps.first,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
+              shouldContinue(app.processIdentifier) else { throw TargetFailure.targetChanged }
+        let appAX = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(appAX, 0.08)
+        let windows = try windowCandidates(app: app, appAX: appAX)
+        guard let window = element(appAX, "AXFocusedWindow"),
+              windows.contains(where: { CFEqual($0, window) }) else { throw TargetFailure.windowUnavailable }
+        let inspected = try inspectComposer(window, allowMissingIdentity: true)
+        let snapshot = ComposerFocusRecovery.Snapshot(pid: app.processIdentifier,
+            window: AXIdentityKey(element: window), webArea: AXIdentityKey(element: inspected.webArea),
+            composer: AXIdentityKey(element: inspected.composer),
+            documentTitle: string(inspected.webArea, "AXTitle"), draft: inspected.draft)
+        let candidate = FocusRecoveryCandidate(application: app, window: window,
+            inspection: inspected, snapshot: snapshot)
+        try validateRecoveryWindow(candidate, shouldContinue: shouldContinue)
+        return candidate
+    }
+
+    private func validateRecoveryWindow(_ candidate: FocusRecoveryCandidate,
+                                       shouldContinue: (pid_t) -> Bool) throws {
+        try Task.checkCancellation()
+        let pid = candidate.application.processIdentifier
+        guard AXIsProcessTrusted(), !candidate.application.isTerminated,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+              shouldContinue(pid) else { throw TargetFailure.targetChanged }
+        let appAX = AXUIElementCreateApplication(pid)
+        guard let window = element(appAX, "AXFocusedWindow"), CFEqual(window, candidate.window),
+              bool(window, "AXMinimized") == false, bool(window, "AXHidden") != true,
+              bool(window, "AXModal") != true else { throw TargetFailure.targetChanged }
+    }
+
     // The app is already in front (TargetActivator, as for any press). Bring the lease's own window
     // forward if it still exists; waits up to ~0.5 s for it to become the focused window.
     func raiseWindow(_ lease: TargetLease) async throws {
@@ -773,14 +905,14 @@ final class StrictTarget {
                     chain.contains(where: { CFEqual(nodes[$0].element, proof.list.element) })
             case .sidebar(let proof):
                 let labels = ["AXDescription", "AXTitle"].compactMap { string(node.element, $0) }
-                let classes = value(node.element, "AXDOMClassList") as? [String] ?? []
+                let classes = Set(value(node.element, "AXDOMClassList") as? [String] ?? [])
                 return CFEqual(node.element, proof.button.element) && labels == proof.buttonLabel &&
-                    classes.contains("sidebar-item") && classes.contains(SidebarIdentityPolicy.threadClass) &&
+                    classes.contains("sidebar-item") && SidebarIdentityPolicy.hasThreadMarker(classes) &&
                     chain.contains(where: { CFEqual(nodes[$0].element, proof.list.element) })
             case .route(let expected):
                 guard let raw = urlString(node.element, "AXURL"), Self.conversationRoute(raw) == expected else { return false }
-                let classes = value(node.element, "AXDOMClassList") as? [String] ?? []
-                return node.role == "AXLink" || classes.contains(SidebarIdentityPolicy.threadClass)
+                let classes = Set(value(node.element, "AXDOMClassList") as? [String] ?? [])
+                return node.role == "AXLink" || SidebarIdentityPolicy.hasThreadMarker(classes)
             case .newDraft: return false
             }
         }
@@ -884,6 +1016,7 @@ final class StrictTarget {
     func verifyAppend(_ lease: TargetLease, expectedFilename: String) throws -> AppendReadback {
         latestConfirmedAttachmentFrame = nil
         latestConfirmedAttachmentFrameTimestamp = nil
+        latestConfirmedChatCard = nil
         latestAttachmentGeometryStatus = "pending-confirmation"
         latestPasteConsumptionConfirmed = false
         latestPasteConsumptionFilename = nil
@@ -924,9 +1057,13 @@ final class StrictTarget {
         // tree traversal and no optional geometry failure can turn success into
         // an error, retry, or a different target.
         if result == .confirmed, let geometry,
-           let rect = optionalAttachmentFrame(geometry, lease: lease) {
+           let (rect, card) = optionalAttachmentFrame(geometry, lease: lease) {
             latestConfirmedAttachmentFrame = rect
             latestConfirmedAttachmentFrameTimestamp = ProcessInfo.processInfo.systemUptime
+            if !lease.isNewDraft, geometry.usesChatLayout {
+                latestConfirmedChatCard = card
+                latestAttachmentGeometryStatus += "; layout=chat"
+            }
         }
         return result
     }
@@ -1031,6 +1168,23 @@ final class StrictTarget {
     private func inspect(_ window: AXUIElement, geometryFilename: String? = nil,
                          requireEmptySelection: Bool = true) throws ->
         (AXUIElement, AXUIElement, ConversationIdentity<AXIdentityKey>, DraftSnapshot, AttachmentGeometryProbe?) {
+        let inspected = try inspectComposer(window, geometryFilename: geometryFilename,
+                                            requireEmptySelection: requireEmptySelection)
+        guard let conversation = inspected.conversation else { throw TargetFailure.currentThreadUnavailable }
+        return (inspected.composer, inspected.webArea, conversation, inspected.draft, inspected.geometry)
+    }
+
+    private struct ComposerInspection {
+        let composer: AXUIElement
+        let webArea: AXUIElement
+        let conversation: ConversationIdentity<AXIdentityKey>?
+        let draft: DraftSnapshot
+        let geometry: AttachmentGeometryProbe?
+    }
+
+    private func inspectComposer(_ window: AXUIElement, geometryFilename: String? = nil,
+                                requireEmptySelection: Bool = true,
+                                allowMissingIdentity: Bool = false) throws -> ComposerInspection {
         let previousDeadline = inspectionDeadline
         inspectionDeadline = ProcessInfo.processInfo.systemUptime + 3.0
         defer { inspectionDeadline = previousDeadline }
@@ -1087,12 +1241,20 @@ final class StrictTarget {
             throw TargetFailure.webAreaUnavailable
         }
         let webArea = nodes[webAreaIndex].element
+        if allowMissingIdentity {
+            var ancestor: Int? = index
+            while let current = ancestor {
+                let values = try inspectionAttributes(current, nodes: nodes, names: ["AXHidden"], cache: &attributes)
+                guard values["AXHidden"] as? Bool != true else { throw TargetFailure.composerUnavailable }
+                ancestor = nodes[current].parent
+            }
+        }
         let labelValues = try inspectionAttributes(index, nodes: nodes,
             names: ["AXDescription", "AXTitle", "AXHelp", "AXPlaceholderValue"], cache: &attributes)
         let editorLabels = Array(Set(labelValues.values.compactMap { $0 as? String }
             .filter(ComposerLabelPolicy.accepts))).sorted()
         let (conversation, identityNodes) = try identity(webAreaIndex: webAreaIndex, composerIndex: index,
-                                                         composerLabels: editorLabels, nodes: nodes, cache: &attributes)
+            composerLabels: editorLabels, nodes: nodes, cache: &attributes, allowMissingIdentity: allowMissingIdentity)
         var projected = identityNodes
         var markers: [String: Int] = [:]
         // identity() has read visibility and labels for document buttons and all
@@ -1122,14 +1284,15 @@ final class StrictTarget {
                 webArea: webAreaIndex, composer: index, filename: filename)
             geometry = AttachmentGeometryProbe(nodes: nodes, projected: projected,
                 webAreaIndex: webAreaIndex, composerIndex: index, filename: filename,
-                hasComposerAttachmentCard: hasCard)
+                hasComposerAttachmentCard: hasCard, usesChatLayout: ComposerLabelPolicy.usesChatLayout(editorLabels))
         }
-        return (composer, webArea, conversation, DraftSnapshot(text: text, attachmentMarkers: markers), geometry)
+        return ComposerInspection(composer: composer, webArea: webArea, conversation: conversation,
+            draft: DraftSnapshot(text: text, attachmentMarkers: markers), geometry: geometry)
     }
 
     private func identity(webAreaIndex: Int, composerIndex: Int, composerLabels: [String], nodes: [Node],
-                          cache: inout InspectionAttributeCache) throws ->
-        (ConversationIdentity<AXIdentityKey>, [SidebarIdentityNode<AXIdentityKey>]) {
+                          cache: inout InspectionAttributeCache, allowMissingIdentity: Bool = false) throws ->
+        (ConversationIdentity<AXIdentityKey>?, [SidebarIdentityNode<AXIdentityKey>]) {
         var documentIDs = Set<String>()
         for attribute in ["AXURL", "AXDocument"] {
             if let raw = urlString(nodes[webAreaIndex].element, attribute),
@@ -1172,7 +1335,7 @@ final class StrictTarget {
             if let classes = values["AXDOMClassList"] as? [String] {
                 classesSupported += 1; projected[index].classes = Set(classes)
             } else { classesUnavailable += 1 }
-            if projected[index].classes.contains(SidebarIdentityPolicy.threadClass) {
+            if SidebarIdentityPolicy.hasThreadMarker(projected[index].classes) {
                 let threadValues = try inspectionAttributes(index, nodes: nodes,
                     names: ["AXARIACurrent", "AXURL"], cache: &cache)
                 if let current = threadValues["AXARIACurrent"] as? String {
@@ -1261,13 +1424,20 @@ final class StrictTarget {
         guard let draft = NewDraftIdentityPolicy.analyze(nodes: projected, webArea: webAreaIndex,
             composer: composerIndex, composerLabels: composerLabels, existing: analysis) else {
             diagnosticSummary += "; newDraft=unproven"
+            // Only an ordinary, visible, uniquely identified editor can be
+            // focused for recovery. This nil identity can never form a lease.
+            if allowMissingIdentity, analysis.failure == .currentThreadUnavailable,
+               composerLabels.contains(where: ComposerLabelPolicy.existing),
+               !mainLandmarks.contains(where: {
+                   projected[$0].classes.contains(NewDraftIdentityPolicy.homeClass) && !projected[$0].hidden
+               }) { return (nil, projected) }
             throw analysis.failure ?? TargetFailure.conversationUnavailable
         }
         diagnosticSummary += "; newDraft=confirmed"
         return (draft, projected)
     }
 
-    private func optionalAttachmentFrame(_ probe: AttachmentGeometryProbe, lease: TargetLease) -> CGRect? {
+    private func optionalAttachmentFrame(_ probe: AttachmentGeometryProbe, lease: TargetLease) -> (CGRect, AXUIElement)? {
         // This optional work starts only after a fully preserved append receipt.
         // The native renderer can initially expose an anonymous div, so anchor
         // to its unique exact remove control and inspect only existing ancestors.
@@ -1360,7 +1530,7 @@ final class StrictTarget {
             status("frame-outside-bounds"); return nil
         }
         status("frame-ready")
-        return card
+        return (card, probe.nodes[candidate.index].element)
     }
 
     private func inspectionAttributes(_ index: Int, nodes: [Node], names: [String],

@@ -16,6 +16,14 @@ struct CaptureWorkerTests {
     static var passed = 0
 
     static func main() async throws {
+        // Lock readings: only a well-formed event counts, and it is never read as a connection event.
+        let lockEvent: [String: Any] = ["schema_version": 1, "event": "device_lock", "locked": true]
+        try expect(TossConnectionStatus.deviceLock(lockEvent) == true, "well-formed lock event")
+        try expect(TossConnectionStatus.deviceLock(["schema_version": 1, "event": "device_lock", "locked": false]) == false, "unlocked reading")
+        try expect(TossConnectionStatus.deviceLock(["schema_version": 1, "event": "device_lock", "locked": 1]) == nil, "lock value must be a boolean")
+        try expect(TossConnectionStatus.deviceLock(["schema_version": 1, "event": "device_lock"]) == nil, "lock value is required")
+        try expect(TossConnectionStatus.deviceLock(lockEvent.merging(["extra": "x"]) { a, _ in a }) == nil, "no extra fields")
+        try expect(TossConnectionStatus.event(lockEvent) == nil, "a lock event is not a connection event")
         guard CommandLine.arguments.count == 3 else {
             throw Failure(description: "Supply absolute Python and synthetic fixture paths")
         }
@@ -61,6 +69,43 @@ struct CaptureWorkerTests {
         try expect(CaptureProgressPolicy.shouldShow(startedAt: 100, now: 102, finished: false), "waiting at 2 seconds shows progress")
         try expect(!CaptureProgressPolicy.shouldShow(startedAt: 100, now: 103, finished: true), "finished capture never reopens a slow notice")
 
+        do {
+            let (padFolder, basePad) = try context("two-pad", "connection-events")
+            let (phoneFolder, basePhone) = try context("two-phone", "connection-events")
+            var padConfig = basePad; padConfig.deviceClass = "iPad"
+            var phoneConfig = basePhone; phoneConfig.deviceClass = "iPhone"
+            let pad = CaptureWorker(wifiHedgingEnabled: false), phone = CaptureWorker(wifiHedgingEnabled: false)
+            defer { pad.stop(); phone.stop() }
+            try pad.prepare(configuration: padConfig); try phone.prepare(configuration: phoneConfig)
+            try await waitUntil(within: 2) { pad.connectionStatus.state == .ready && phone.connectionStatus.state == .ready }
+            try "delay".write(to: padFolder.appendingPathComponent("mode"), atomically: true, encoding: .utf8)
+            try "normal".write(to: phoneFolder.appendingPathComponent("mode"), atomically: true, encoding: .utf8)
+            let padBox = Box(), phoneBox = Box()
+            try request(pad, padConfig, padFolder, padBox)
+            try request(phone, phoneConfig, phoneFolder, phoneBox)
+            let phoneReply = try await response(phoneBox, within: 2)
+            let padReply = try await response(padBox, within: 2)
+            try expect(phoneReply.exit == 0 && phoneReply.json["device_class"] as? String == "iPhone", "Phone reply misrouted")
+            try expect(padReply.exit == 0 && padReply.json["device_class"] as? String == "iPad", "Pad reply misrouted")
+            try expect(padBox.responses.count == 1 && phoneBox.responses.count == 1, "Two devices created duplicate replies")
+            for (folder, kind) in [(padFolder, "iPad"), (phoneFolder, "iPhone")] {
+                try expect(audit(folder).filter { $0["event"] as? String == "request" }.allSatisfy {
+                    $0["device_class"] as? String == kind
+                }, "Every capture must explicitly carry its pinned device class")
+                try expect(audit(folder).first?["device_class"] as? String == kind, "Worker startup omitted device class")
+            }
+            let padTiming = audit(padFolder).first?["timings_file"] as? String
+            let phoneTiming = audit(phoneFolder).first?["timings_file"] as? String
+            try expect(padTiming != nil && phoneTiming != nil && padTiming != phoneTiming, "Devices shared speed training samples")
+            pad.stop()
+            try expect(phone.connectionStatus.state == .ready, "Stopping iPad affected iPhone status")
+            try "wrong-device-class".write(to: phoneFolder.appendingPathComponent("mode"), atomically: true, encoding: .utf8)
+            let wrong = Box()
+            try request(phone, phoneConfig, phoneFolder, wrong)
+            let rejected = try await response(wrong, within: 2)
+            try expect(rejected.exit == 1 && rejected.json["reason"] as? String == "capture_integrity_failed", "Cross-device reply was not rejected")
+            print("PASS independent device workers, request tags, speed samples, status and cross-device rejection")
+        }
         do {
             let (folder, config) = try context("prepare-reuse", "normal")
             let worker = CaptureWorker(wifiHedgingEnabled: false); defer { worker.stop() }
@@ -323,13 +368,8 @@ struct CaptureWorkerTests {
                        "USB keeps the short stall limit")
             try expect(CaptureWorker.attemptLimits(["stall": 2500], role: .wifiPrimary) == ["stall": 2500],
                        "Wi-Fi keeps the longer stall limit")
-            var drop = USBDropNotice()
-            try expect(!drop.shouldShow(externalConnected: false, usbBack: false, at: 1), "really unplugged: no notice")
-            try expect(!drop.shouldShow(externalConnected: nil, usbBack: false, at: 1), "unknown power: no notice")
-            try expect(!drop.shouldShow(externalConnected: true, usbBack: true, at: 1), "USB came back: no notice")
-            try expect(drop.shouldShow(externalConnected: true, usbBack: false, at: 1), "still powered: notice")
-            try expect(!drop.shouldShow(externalConnected: true, usbBack: false, at: 500), "quiet for ten minutes")
-            try expect(drop.shouldShow(externalConnected: true, usbBack: false, at: 601), "notice again after ten minutes")
+            try expect(CaptureWorker.attemptLimits(["stall": 800], role: .usbPrimary) == ["stall": 800],
+                       "a shorter configured stall limit stays on USB")
             defaults.register(defaults: ["firstByteLimitMs": 50.0, "pressCapMs": 31000.0])
             let clamped = CaptureWorker.progressLimits(defaults)
             try expect(clamped["first_byte"] == 200 && clamped["press_cap"] == 30000 && clamped["stall"] == 2500,
@@ -441,6 +481,36 @@ struct CaptureWorkerTests {
             }
             try expect(audit(folder).filter { $0["event"] as? String == "request" && $0["transport"] as? String == "wifi" }.isEmpty, "a reconnecting USB session was silently bypassed by Wi-Fi")
             print("PASS three serial requests retain USB preference during reconnect")
+        }
+        do {
+            var devices: [(String, URL, CaptureWorker.Configuration, CaptureWorker)] = []
+            for kind in ["iPad", "iPhone"] {
+                let (folder, original) = try context("two-usb-" + kind, "usb-reconnecting")
+                var config = original; config.deviceClass = kind
+                try Data().write(to: folder.appendingPathComponent("usb-present"))
+                let worker = CaptureWorker(wifiHedgingEnabled: false)
+                devices.append((kind, folder, config, worker))
+                try worker.prepare(configuration: config)
+            }
+            defer { devices.forEach { $0.3.stop() } }
+            try await waitUntil(within: 2) {
+                devices.allSatisfy { item in audit(item.1).contains { $0["event"] as? String == "started" && $0["transport"] as? String == "usb" } }
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+            for _ in 0..<3 {
+                let boxes = [Box(), Box()]
+                for (index, item) in devices.enumerated() { try request(item.3, item.2, item.1, boxes[index]) }
+                for (index, item) in devices.enumerated() {
+                    let reply = try await response(boxes[index], within: 2)
+                    try expect(reply.exit == 0 && reply.json["device_class"] as? String == item.0, "USB result crossed device identity")
+                    try expect(reply.json["transport"] as? String == "authenticated_usb", "present reconnecting device bypassed USB")
+                }
+            }
+            for (kind, folder, _, _) in devices {
+                let requests = audit(folder).filter { $0["event"] as? String == "request" }
+                try expect(requests.count == 3 && requests.allSatisfy { $0["transport"] as? String == "usb" && $0["device_class"] as? String == kind }, "two devices must each retain their own USB process and request pin")
+            }
+            print("PASS simultaneous iPad/iPhone USB lanes retain identity and USB priority for three rounds")
         }
         do {
             let (folder, config) = try context("usb-draining-queue", "usb-held-after-fallback")
@@ -727,7 +797,8 @@ struct CaptureWorkerTests {
         }
         for (mode, direct) in [("flow-12mb", false), ("flow-slow-wifi", false), ("flow-slow-wifi", true),
                                ("flow-no-bytes", false), ("flow-stalled", false), ("flow-too-long", false)] {
-            let (folder, config) = try context(mode + (direct ? "-direct" : ""), mode)
+            let (folder, baseConfig) = try context(mode + (direct ? "-direct" : ""), mode)
+            var config = baseConfig; config.deviceClass = "iPhone"
             let worker = CaptureWorker(wifiHedgingEnabled: false, wifiOnly: direct); defer { worker.stop() }
             var progress: [Double] = []
             worker.onCaptureProgress = { _, got, total in if total > 0 { progress.append(got / total) } }
@@ -741,7 +812,7 @@ struct CaptureWorkerTests {
                            "flowing transfer or its progress was cut off")
             } else if mode == "flow-slow-wifi" {
                 try expect(elapsed >= 10 && elapsed < 12 && progress.count > 20 && progress.last! > 0.9,
-                           "iPad transfer must finish beyond the old 8-second cutoff, direct=\(direct)")
+                           "iPhone transfer must finish beyond the old 8-second cutoff, direct=\(direct)")
             } else if mode == "flow-too-long" { try expect(elapsed >= 29.9 && elapsed < 31, "30-second hard cap moved") }
             else if mode == "flow-stalled" {
                 try expect(result.json["reason"] as? String == "stall_timeout" && elapsed >= 2.5 && elapsed < 4.4,

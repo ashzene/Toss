@@ -1,0 +1,229 @@
+import Foundation
+
+func L(_ en: String, _ zh: String) -> String { en }
+enum TargetKind: String { case chatGPT, claude; var displayName: String { rawValue } }
+protocol ChatLease { var name: String { get }; func sameDestination(as other: any ChatLease) -> Bool }
+extension ChatLease { func sameDestination(as other: any ChatLease) -> Bool { name == other.name } }
+struct Lease: ChatLease { let name: String }
+typealias TossConfiguration = String
+enum TossError: Error { case targetLaunched, activationFailed }
+enum TargetFailure: Error, Hashable {
+    case windowUnavailable, windowsAmbiguous, treeUnavailable, webAreaUnavailable, composerUnavailable,
+         composersAmbiguous, conversationUnavailable, currentThreadUnavailable, modalPresent, targetChanged
+}
+enum ActivationPolicy { static func isReady(_ ready: Bool) -> Bool { ready } }
+@MainActor enum TargetActivator {
+    enum Outcome { case alreadyFront, activated, launched, failed }
+    static var front: TargetKind? = .chatGPT
+    static var alwaysReady = true
+    static var activations = 0
+    static var delay: UInt64 = 0
+    static func observe(_ kind: TargetKind) -> Bool { alwaysReady || front == kind }
+    static func bringForward(_ kind: TargetKind, shouldContinue: () -> Bool) async throws -> Outcome {
+        if observe(kind) { return .alreadyFront }
+        activations += 1
+        if delay > 0 { try await Task.sleep(nanoseconds: delay) }
+        guard shouldContinue() else { return .failed }
+        front = kind; return .activated
+    }
+}
+enum iPadWaker { static func poke() {} }
+struct CaptureRecord {
+    let startedAt: Date; let target: String
+    var deviceClass: String?; var queued: String?
+}
+@MainActor final class FakeTarget {
+    var lease = Lease(name: "initial")
+    var unavailable = false
+    var requiresFocus = false
+    var focusRecoveries = 0
+    var focusDelay: UInt64 = 0
+    func locateLease() throws -> any ChatLease {
+        if unavailable || requiresFocus { throw TargetFailure.currentThreadUnavailable }; return lease
+    }
+    func locateForCaptureLease(shouldContinue: (Int32) -> Bool) async throws -> any ChatLease {
+        if requiresFocus {
+            guard shouldContinue(1) else { throw TargetFailure.targetChanged }
+            focusRecoveries += 1
+            if focusDelay > 0 { try await Task.sleep(nanoseconds: focusDelay) }
+            guard shouldContinue(1) else { throw TargetFailure.targetChanged }
+            requiresFocus = false
+        }
+        return try locateLease()
+    }
+    func raiseLeaseWindow(_ lease: any ChatLease) async throws {}
+    func openLeaseConversation(_ lease: any ChatLease) throws { self.lease = Lease(name: lease.name) }
+}
+@MainActor final class FakeWorker {
+    struct Config { let deviceClass: DeviceClass }
+    struct Pending { let id: String; let file: URL; let done: (Data, Int32) -> Void }
+    let kind: DeviceClass
+    var pending: Pending?
+    var starts: [String] = []
+    var isBusy: Bool { pending != nil }
+    struct Connection { enum State { case ready, failed }; var state = State.ready }
+    var connectionStatus = Connection()
+    var deviceLocked: Bool?
+    init(_ kind: DeviceClass) { self.kind = kind }
+    func capture(configuration: Config, requestID: String, file: URL, completion: @escaping (Data, Int32) -> Void) throws {
+        precondition(configuration.deviceClass == kind, "worker device mismatch")
+        precondition(pending == nil, "overlapping same-device RPC")
+        precondition(file.lastPathComponent.hasPrefix(kind.rawValue + "-"), "wrong image device filename")
+        starts.append(requestID); pending = Pending(id: requestID, file: file, done: completion)
+    }
+    func finish(reason: String? = nil) {
+        guard let request = pending else { preconditionFailure("no pending RPC") }
+        pending = nil
+        let data = try! JSONSerialization.data(withJSONObject: ["schema_version": 1, "request_id": request.id,
+            "ok": reason == nil, "reason": reason ?? "captured", "device_class": kind.rawValue])
+        request.done(data, reason == nil ? 0 : 1)
+    }
+}
+enum CaptureProgressPolicy { static let noticeDelay = 2.0 }
+@MainActor final class DeviceCaptureAdapterFixture {
+    struct EarlyCapture {
+        let id: UInt64; let uuid: String; let image: URL; let deviceClass: DeviceClass
+        var result: (data: Data, exitCode: Int32)?
+        var receivedAt: Double?
+    }
+    struct Transaction {
+        let id: UInt64; let uuid: String; let image: URL; let deviceClass: DeviceClass
+        let lease: any ChatLease
+        var kind: TargetKind = .chatGPT
+        var destinationChanged = false
+        var receivedAt: Double?
+        var receipt: Bool?
+        var pastePosted = false
+        var clipboard: Bool?
+    }
+    final class Animation {
+        var isLanding = false
+        func begin(requestID: UInt64) {}
+        func showTransferNotice(_ text: String) {}
+        func cancel(requestID: UInt64) {}
+        func detachLanding() {}
+        func detachToast() {}
+    }
+    final class Menu { func nudge() {} }
+    final class Removals { func removeItem(at: URL) throws {} }
+    let fm = Removals()
+    var core = DualHotkeyCore(tapSelectionEnabled: true)
+    var capturePipeline = DeviceCapturePipeline()
+    var deviceGesture = DeviceCaptureGesture()
+    var devicePressRouting = DevicePressRouting()
+    var deferredDeviceSelection: (chord: HotkeyChord, at: Double, lease: (any ChatLease)?)?
+    let captureWorkers: [DeviceClass: FakeWorker] = [.iPad: FakeWorker(.iPad), .iPhone: FakeWorker(.iPhone)]
+    let padTarget = FakeTarget(), phoneTarget = FakeTarget()
+    var pairedDeviceClass: DeviceClass? = .iPad
+    var pairedDeviceClasses: Set<DeviceClass> = [.iPad, .iPhone]
+    var blackFramePresses: Set<Double> = []
+    var enabled = true
+    var uninstalling = false
+    var manualDeliveryPaused = false
+    var deliveryBindingMissing = false
+    var deliveryCaptureID: String?
+    var pipelineCaptures: [UInt64: EarlyCapture] = [:]
+    var pipelineProgress: [String: (received: Double, expected: Double)] = [:]
+    var slowPipelineIDs: Set<String> = []
+    var burstLeases: [String: String] = [:]
+    var queuedBindings: [Double: any ChatLease] = [:]
+    var queuedPrefetch: (capture: EarlyCapture, pressedAt: Double, arrivedAt: Double?)?
+    var prefetchRequest: HotkeyRequest?
+    var startingQueuedPress = false
+    var transaction: Transaction?
+    var earlyCapture: EarlyCapture?
+    var earlyTargetFailure: Bool?
+    var abandonedCaptureIDs: [DeviceClass: String] = [:]
+    var slowCaptureID: String?
+    var backendTimings: [String: Double] = [:]
+    var connectionReused: Bool?
+    var activationTask: (id: UInt64, task: Task<Void, Never>)?
+    var earlyFocusTask: (id: UInt64, task: Task<Void, Never>)?
+    var lastKeys = ModifierSnapshot()
+    var busyRepeatsTotal = 0
+    let cache = URL(fileURLWithPath: "/synthetic-never-written")
+    let captureAnimation = Animation()
+    var menuStatus: Menu? = Menu()
+    var targetings: [(DeviceClass, String, Bool)] = []
+    var deliveries: [(DeviceClass, String, String)] = []
+    var failures: [DeviceClass] = []
+    var failureReasons: [String] = []
+    func targetFor(_ kind: TargetKind) -> FakeTarget { kind == .chatGPT ? padTarget : phoneTarget }
+    func configuration() throws -> String { "synthetic" }
+    func workerConfiguration(_ value: String, deviceClass: DeviceClass) throws -> FakeWorker.Config { .init(deviceClass: deviceClass) }
+    func cancelActivation() { activationTask?.task.cancel(); activationTask = nil; discardEarlyCapture() }
+    func discardEarlyCapture() { earlyCapture = nil }
+    var setupErrors = 0
+    func captureSetupFailed(_ request: HotkeyRequest, _ error: Error) { setupErrors += 1; earlyTargetFailure = true }
+    func startEarlyCapture(_ request: HotkeyRequest, config: String) {
+        precondition(queuedPrefetch != nil, "retarget must adopt a staged UUID, not make another RPC")
+        let saved = queuedPrefetch!.capture
+        earlyCapture = EarlyCapture(id: request.id, uuid: saved.uuid, image: saved.image,
+            deviceClass: saved.deviceClass, result: saved.result, receivedAt: saved.receivedAt)
+        queuedPrefetch = nil; prefetchRequest = request
+    }
+    func beginCapture(_ request: HotkeyRequest, kind: TargetKind, config: String, lease: any ChatLease) throws {
+        let saved = earlyCapture!
+        let bound = queuedBindings.removeValue(forKey: request.startedAt)
+        let destinationChanged = deliveryBindingMissing || (bound != nil && !bound!.sameDestination(as: lease))
+        targetings.append((saved.deviceClass, lease.name, captureWorkers[saved.deviceClass]!.isBusy))
+        transaction = Transaction(id: request.id, uuid: saved.uuid, image: saved.image, deviceClass: saved.deviceClass,
+            lease: lease, kind: kind, destinationChanged: destinationChanged, receivedAt: saved.receivedAt)
+        earlyCapture = nil
+        if let result = saved.result { deliverCaptureResult(request, uuid: saved.uuid, image: saved.image, data: result.data, exitCode: result.exitCode) }
+    }
+    func refreshMenuStatus() {}
+    func writeLastRun() {}
+    func updateTransferNotice() {}
+    var targetlessFinishes = 0
+    final class Interaction {
+        var isObserving = false
+        var interventionPIDs: Set<Int32> = []
+        func start() { isObserving = true; interventionPIDs = [] }
+    }
+    let newDraftInteraction = Interaction()
+    var failureCategory = "none", backendReason = "none"
+    var targetKind = TargetKind.chatGPT
+    var diagnosticRequestStartedAt: Double = 0
+    var captureRecord: CaptureRecord?
+    var stages: [String] = []
+    func selectedDeviceClass(requestID: UInt64) -> DeviceClass? { capturePipeline.delivering?.deviceClass }
+    func settlePendingClipboard() {}
+    func finishCaptureRecord(outcome: String) { captureRecord = nil }
+    func setStatus(_ text: String, code: String) { stages.append(code) }
+    func finishTargetlessCapture() { targetlessFinishes += 1 }
+    func captureFailureReason(_ data: Data, exitCode: Int32, requestID: String) -> String? {
+        if case .failure(let reason) = CaptureCompletionPolicy.classify(data, exitCode: exitCode, requestID: requestID) { return reason }
+        return nil
+    }
+    func finishEarlyCaptureFailure(_ request: HotkeyRequest, data: Data, exitCode: Int32) -> Bool { false }
+    func handle(_ actions: [HotkeyAction]) {
+        for action in actions {
+            switch action {
+            case .capture(let request):
+                startCapture(request)
+            case .pasteIntent(let request, let token):
+                guard let tx = transaction else { preconditionFailure("no target") }
+                deliveries.append((tx.deviceClass, tx.lease.name, token))
+                core.appendFinished(requestID: request.id)
+                transaction = nil
+                startQueuedPress()
+            default: break
+            }
+        }
+    }
+    func captureReturned(_ request: HotkeyRequest, data: Data, exitCode: Int32) {
+        guard let tx = transaction else { preconditionFailure("no target") }
+        let object = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+        precondition(object["device_class"] as? String == tx.deviceClass.rawValue, "wrong device delivered")
+        if exitCode != 0 {
+            failures.append(tx.deviceClass)
+            failureReasons.append(object["reason"] as? String ?? "")
+            _ = core.captureFailed(requestID: request.id, at: ProcessInfo.processInfo.systemUptime)
+            transaction = nil; startQueuedPress(); return
+        }
+        transaction?.receipt = true
+        handle(core.captureSucceeded(requestID: request.id, imageToken: tx.uuid, at: ProcessInfo.processInfo.systemUptime))
+    }
+    // PRODUCTION_METHODS
+}

@@ -10,8 +10,8 @@ struct CaptureReceipt {
     let byteCount: Int
 
     static func validate(json: Data, exitCode: Int32, requestID: String, triggeredAt: Double,
-                         now: Double, file: URL) throws -> CaptureReceipt {
-        guard exitCode == 0, json.count < 16_384,
+                         now: Double, file: URL, deviceClass: DeviceClass? = .iPad) throws -> CaptureReceipt {
+        guard let deviceClass, exitCode == 0, json.count < 16_384,
               let value = try JSONSerialization.jsonObject(with: json) as? [String: Any],
               value["ok"] as? Bool == true, value["schema_version"] as? Int == 1,
               value["request_id"] as? String == requestID,
@@ -19,7 +19,7 @@ struct CaptureReceipt {
               ["authenticated_wifi", "authenticated_usb"].contains(transport),
               value["source"] as? String == "DVT_takeScreenshot",
               let width = value["width"] as? Int, let height = value["height"] as? Int,
-              Self.screenDimensionsOK(width: width, height: height),
+              Self.screenDimensionsOK(width: width, height: height, deviceClass: deviceClass),
               let bytes = value["bytes"] as? Int, bytes > 0, bytes <= 40 * 1024 * 1024,
               let hash = value["sha256"] as? String,
               let started = value["request_started_monotonic"] as? Double,
@@ -48,11 +48,17 @@ struct CaptureReceipt {
         return CaptureReceipt(capturedAt: captured, expiresAt: captured + 10, byteCount: bytes)
     }
 
-    // Same rule as Backend/capture_once.py screen_dimensions_ok: any iPad screen.
-    static func screenDimensionsOK(width: Int, height: Int) -> Bool {
+    // The paired class is snapshotted by the app, not inferred from untrusted receipt dimensions.
+    // The default preserves existing iPad-only callers; production always passes its paired class.
+    static func screenDimensionsOK(width: Int, height: Int, deviceClass: DeviceClass = .iPad) -> Bool {
         guard width > 0, height > 0 else { return false }
         let short = min(width, height), long = max(width, height)
         let ratio = Double(long) / Double(short)
-        return (1000...2400).contains(short) && (1400...3000).contains(long) && ratio >= 1.2 && ratio <= 1.6
+        switch deviceClass {
+        case .iPad:
+            return (1000...2400).contains(short) && (1400...3000).contains(long) && ratio >= 1.2 && ratio <= 1.6
+        case .iPhone:
+            return (700...1400).contains(short) && (1300...3000).contains(long) && ratio >= 1.70 && ratio <= 2.25
+        }
     }
 }

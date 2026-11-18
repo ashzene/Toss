@@ -7,6 +7,10 @@ import Foundation
 enum ToastCopy {
     enum Language { case english, chinese }
     static var language: Language { AppLanguage.isChinese ? .chinese : .english }
+    static func unlock(_ device: String, language: Language = language) -> String {
+        if language == .chinese { return "请解锁 \(device)。" }
+        return Translations.text("Unlock your \(device).")
+    }
     struct Strings {
         let codex: String
         let claude: String
@@ -24,16 +28,16 @@ enum ToastCopy {
         case .english:
             return Strings(codex: Translations.text("Tossed successfully"), claude: Translations.text("Tossed successfully"),
                            failure: Translations.text("Didn't attach"), manualPaste: Translations.text("Copied — paste it yourself"),
-                           blackScreen: Translations.text("iPad screenshot is black"),
-                           slow: Translations.text("iPad connection too slow"), notConnected: Translations.text("iPad not connected"),
-                           pairing: Translations.text("Pair your iPad again"), unconfirmed: Translations.text("Check your draft"),
+                           blackScreen: Translations.text("\(deviceEN) screenshot is black"),
+                           slow: Translations.text("\(deviceEN) connection too slow"), notConnected: Translations.text("\(deviceEN) not connected"),
+                           pairing: Translations.text("Pair your \(deviceEN) again"), unconfirmed: Translations.text("Check your draft"),
                            notifications: Translations.text("Show notifications"))
         case .chinese:
             return Strings(codex: "已成功 Toss", claude: "已成功 Toss",
                            failure: "没贴进去", manualPaste: "已复制，可以手动粘贴",
-                           blackScreen: "iPad 截图是黑的",
-                           slow: "iPad 连接太慢", notConnected: "iPad 没连上",
-                           pairing: "需要重新配对 iPad", unconfirmed: "看看草稿里有没有",
+                           blackScreen: "\(deviceZH) 截图是黑的",
+                           slow: "\(deviceZH) 连接太慢", notConnected: "\(deviceZH) 没连上",
+                           pairing: "需要重新配对 \(deviceZH)", unconfirmed: "看看草稿里有没有",
                            notifications: "显示通知")
         }
     }
@@ -52,14 +56,20 @@ struct ToastContent: Equatable {
     }
 
     // Report the observed frame content; black pixels alone do not verify lock/sleep state.
-    static func failure(reason: String, code: String, cue: Bool, backend: String? = nil,
+    static func failure(reason: String, code: String, cue: Bool, backend: String? = nil, unlockDevice: String? = nil,
                         language: ToastCopy.Language = ToastCopy.language) -> Self? {
         // Keep silent cancellation, setup and connection checks silent, even if
         // a future caller accidentally passes cue: true for one of those paths.
         guard cue, ["capture_setup_failed", "capture_result_failed", "append_failed", "append_unconfirmed",
                     "copied_for_manual_paste"].contains(code)
         else { return nil }
-        return Self(kind: .failure, title: failureTitle(code: code, backend: backend, copy: ToastCopy.strings(language)),
+        let title: String
+        if code == "capture_result_failed", let unlockDevice {
+            title = ToastCopy.unlock(unlockDevice, language: language)
+        } else {
+            title = failureTitle(code: code, backend: backend, copy: ToastCopy.strings(language))
+        }
+        return Self(kind: .failure, title: title,
                     reason: showsFailureReason ? shortReason(reason) : "")
     }
 

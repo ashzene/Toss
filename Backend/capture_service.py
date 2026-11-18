@@ -37,6 +37,9 @@ PRECONNECT_TIMEOUT = 20.0
 WARM_PRECONNECT_TIMEOUT = 150.0
 WARM_CHECK_SECONDS = 1.0   # was 3.0: reconnect sooner after a drop (2026-10-24)
 WARM_BACKOFF_SECONDS = (2.0, 5.0, 10.0, 20.0, 30.0, 60.0)
+WARM_BACKOFF_LOCKED_MAX = 10.0  # A locked device may be opened any moment: notice it soon after.
+LOCK_CHECK_SECONDS = 2.0
+LOCK_READ_TIMEOUT = 1.5
 MOUNT_TIMEOUT = 120.0
 DEVELOPER_SERVICE = "com.apple.instruments.dtservicehub"
 SCREENSHOT_TIMEOUT = MAX_TRANSFER_BUDGET
@@ -185,6 +188,28 @@ class CaptureSession:
         self.progress_fail_fast = False
         self.pending_rpc = None
         self.developer_image_mounted = False
+        self.device_provider = None
+
+    def _live_device(self):
+        self._check_live()
+        if self.device_provider is None:
+            raise once.CaptureFailure("worker_failed")
+        return self.device_provider
+
+    async def get_value(self, key=None):
+        """One lockdown value over this session's transport. Takes no frame."""
+        return await self._live_device().get_value(key=key)
+
+    async def reopen_lockdown(self):
+        """A cut-off read leaves the lockdown connection unusable, and over RemoteXPC it cannot
+        re-establish itself (checked on a real iPhone, 2026-11-06). The screenshot channel is separate."""
+        from pymobiledevice3.lockdown import create_using_remote
+        device = self._live_device()
+        with contextlib.suppress(Exception):
+            await device.lockdown.close()
+        device.lockdown = await create_using_remote(
+            await device.start_lockdown_service("com.apple.mobile.lockdown.remote.trusted"),
+            identifier=device.udid)
 
     def _check_live(self):
         if self.closing:
@@ -241,6 +266,7 @@ class CaptureSession:
             await screenshot.__aenter__()
             self._check_live()
             self.screenshot = screenshot
+            self.device_provider = provider
             self.ready = True
             # Public DTX lifecycle signal; this wait sends no request. The
             # existing relay watcher turns outer tunnel loss into DTX EOF.
@@ -415,7 +441,11 @@ class CaptureService:
     def __init__(self, state_dir, output_dir, idle_seconds=DEFAULT_IDLE_SECONDS, *,
                  connection_factory=CaptureSession, capture=fresh_screenshot,
                  cleanup_seconds=0.75, keep_warm=False, connection_events=None, transport="wifi",
-                 attempt_events=None, progress_events=None, timing_path=None):
+                 attempt_events=None, progress_events=None, timing_path=None, device_class=None):
+        if device_class is not None:
+            from paired_devices import resolve_state
+            state_dir = resolve_state(state_dir, device_class)
+        self.device_class = device_class
         self.state_dir = Path(os.path.abspath(state_dir))
         self.output_dir = Path(os.path.abspath(output_dir))
         self.idle_seconds = idle_seconds
@@ -444,11 +474,16 @@ class CaptureService:
         # The native app pins this to Application Support even when legacy
         # config points pairing state elsewhere. Standalone/injected services
         # remain isolated beside their state directory unless explicitly set.
-        timing_path = Path(timing_path) if timing_path is not None else self.state_dir.parent / "screenshot-success-times.json"
+        timing_path = Path(timing_path) if timing_path is not None else (
+            self.state_dir if device_class is not None else self.state_dir.parent) / "screenshot-success-times.json"
         if not timing_path.is_absolute():
             raise once.CaptureFailure("invalid_arguments")
         self.success_timings = SuccessTimingStore(timing_path)
         self.last_connection_event = None
+        self.device_locked = None  # Latest reading; survives a dropped connection on purpose.
+        self.lock_reported = None
+        self.lock_checked_at = 0.0
+        self.lock_read_broken = False
         if os.geteuid() == 0:
             raise once.CaptureFailure("root_execution_not_allowed")
         if not math.isfinite(idle_seconds) or not 0 < idle_seconds <= MAX_IDLE_SECONDS:
@@ -476,8 +511,42 @@ class CaptureService:
                                       "state": state, "reason": safe})
         self.last_connection_event = event
 
+    async def _report_lock_state(self):
+        """Is the device locked? Never takes a frame and never affects the session.
+
+        A read that fails says nothing, because no answer is not the same as locked.
+        The next check reopens the lockdown connection first, so one slow read cannot
+        leave an old reading in place on a healthy session.
+        """
+        now = time.monotonic()
+        if self.connection_events is None or now - self.lock_checked_at < LOCK_CHECK_SECONDS:
+            return
+        self.lock_checked_at = now
+        read = getattr(self.provider, "get_value", None)
+        if read is None:
+            return
+        try:
+            async with asyncio.timeout(LOCK_READ_TIMEOUT):
+                if self.lock_read_broken:
+                    await self.provider.reopen_lockdown()
+                    self.lock_read_broken = False
+                value = await read(key="PasswordProtected")
+        except Exception:
+            self.lock_read_broken = True
+            return
+        if not isinstance(value, bool):
+            return
+        self.device_locked = value
+        if value != self.lock_reported:
+            await self.connection_events({"schema_version": 1, "event": "device_lock", "locked": value})
+            self.lock_reported = value
+
     def _default_stall(self):
         return USB_STALL_LIMIT if self.transport == "usb" else STALL_LIMIT
+
+    def _warm_backoff(self, failures):
+        delay = WARM_BACKOFF_SECONDS[min(failures, len(WARM_BACKOFF_SECONDS)) - 1]
+        return min(delay, WARM_BACKOFF_LOCKED_MAX) if self.device_locked else delay
 
     def _check_output_directory(self):
         once.check_private_directory(self.output_dir, "output_parent_not_private")
@@ -524,9 +593,13 @@ class CaptureService:
             self.seen.add(request_id)
             base_keys = {"action", "request_id", "output_file", "timeout"}
             attempt_keys = {"attempt_id", "deadline_monotonic"}
-            limit_keys = {"limits_ms", "screenshot_deadline_monotonic", "press_started_monotonic"}
+            limit_keys = {"limits_ms", "screenshot_deadline_monotonic", "device_class", "press_started_monotonic"}
             if (set(value) - limit_keys) not in (base_keys, base_keys | attempt_keys) or value["action"] != "capture":
                 raise once.CaptureFailure("invalid_arguments")
+            if "device_class" in value or self.device_class is not None:
+                pinned_class = once.read_device_pin(self.state_dir)["device_class"]
+                if value.get("device_class") != pinned_class or (self.device_class is not None and pinned_class != self.device_class):
+                    raise once.CaptureFailure("unexpected_device_pin")
             limits = {}
             if "limits_ms" in value:
                 given = value["limits_ms"]
@@ -577,6 +650,8 @@ class CaptureService:
 
     async def _close_session(self):
         context, self.context, self.provider = self.context, None, None
+        self.lock_reported = None
+        self.lock_read_broken = False
         if context is None:
             return
         # asyncio.wait_for waits indefinitely if a dependency ignores cancellation.
@@ -690,6 +765,8 @@ class CaptureService:
                     continue
                 if self._request_running() or self.lock.locked() or self._connection_healthy():
                     failures = 0 if self._connection_healthy() else failures
+                    if self._connection_healthy() and not self._request_running() and not self.lock.locked():
+                        await self._report_lock_state()
                     await asyncio.sleep(WARM_CHECK_SECONDS)
                     continue
                 self.preconnect_task = None
@@ -704,7 +781,7 @@ class CaptureService:
                     failures = 0
                     continue
                 failures += 1
-                await asyncio.sleep(WARM_BACKOFF_SECONDS[min(failures, len(WARM_BACKOFF_SECONDS)) - 1])
+                await asyncio.sleep(self._warm_backoff(failures))
         except asyncio.CancelledError:
             pass
 
@@ -901,6 +978,7 @@ class CaptureService:
                         if self._exists(request["output_file"].name):
                             raise once.CaptureFailure("output_already_exists")
                         once.check_state(self.state_dir)
+                        device_class = once.read_device_pin(self.state_dir)["device_class"]
                         if self.terminal:
                             raise once.CaptureFailure("worker_failed")
                         self._cancel_idle()
@@ -971,7 +1049,7 @@ class CaptureService:
                         if captured > budget.deadline:
                             raise once.CaptureFailure("timeout")
                         validation_started = time.monotonic()
-                        data, metadata = once.prepare_png(data, timings=flags)
+                        data, metadata = once.prepare_png(data, device_class, timings=flags)
                         if time.monotonic() > budget.deadline:
                             raise once.CaptureFailure("timeout")
                         self._publish(data, request, started, captured)
@@ -1231,6 +1309,7 @@ def main(argv=None):
         start_watchdog(parent_pid, terminating)
         parser = once.QuietParser(description=__doc__)
         parser.add_argument("--state-dir", type=Path, required=True)
+        parser.add_argument("--device-class", choices=("iPad", "iPhone"))
         parser.add_argument("--output-dir", type=Path, required=True)
         parser.add_argument("--timings-file", type=Path,
                             help="Private success-timing JSON, independent of the pairing-state location")
@@ -1245,6 +1324,9 @@ def main(argv=None):
         parser.add_argument("--worker-role", choices=("wifi_primary", "usb_primary", "wifi_standby"))
         parser.add_argument("--watch-usb", action="store_true")
         args = parser.parse_args(argv)
+        if args.device_class is not None:
+            from paired_devices import resolve_state
+            args.state_dir = resolve_state(args.state_dir, args.device_class)
         routing_metadata = args.worker_role is not None
         args.worker_role = args.worker_role or args.transport + "_primary"
         if (args.worker_role.startswith("usb") != (args.transport == "usb")
@@ -1259,6 +1341,8 @@ def main(argv=None):
             writer = ReceiptWriter(original_stdout)
             async def emit(value):
                 # Routing metadata only; no device identifier or endpoint leaves the worker.
+                if args.device_class is not None:
+                    value = {**value, "device_class": args.device_class}
                 routed = {**value, "worker_role": args.worker_role,
                           "transport": value.get("transport", "authenticated_" + args.transport)}
                 await writer.emit(routed if routing_metadata else value)
@@ -1278,7 +1362,8 @@ def main(argv=None):
                                      transport=args.transport, timing_path=args.timings_file,
                                      attempt_events=emit if routing_metadata and args.transport == "usb" else None,
                                      progress_events=emit if routing_metadata and args.connection_events else None,
-                                     connection_events=emit if args.connection_events else None)
+                                     connection_events=emit if args.connection_events else None,
+                                     device_class=args.device_class)
             reader = asyncio.StreamReader(limit=MAX_LINE_BYTES)
             transport, _ = await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin.buffer)
             observer = None

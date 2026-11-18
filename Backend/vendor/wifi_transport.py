@@ -48,7 +48,7 @@ def select_lan_interfaces(ports, addresses, stats) -> tuple:
 
     Wi-Fi stays eligible exactly as before, even while it rejoins a network.
     Another port must be up with a private IPv4 address: idle Thunderbolt
-    bridge members, virtual adapters and an iPad's own USB network link
+    bridge members, virtual adapters and an iPad/iPhone's own USB network link
     (IPv6 link-local only, and never named as a LAN port here) are excluded.
     """
     wifi, wired = [], []
@@ -57,7 +57,8 @@ def select_lan_interfaces(ports, addresses, stats) -> tuple:
             continue
         if port.startswith(WIFI_PORTS):
             wifi.append(device)
-        elif ("iPad" not in port and device in stats and stats[device].isup
+        elif (not any(name in port for name in ("iPad", "iPhone"))
+                and device in stats and stats[device].isup
                 and has_lan_ipv4(addresses.get(device, ()))):
             wired.append(device)
     return tuple(wifi + wired)

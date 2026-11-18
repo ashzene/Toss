@@ -21,7 +21,7 @@ if [[ "$TASK_VERSION" != <-> ]] || (( TASK_VERSION < 10 )); then
 fi
 "$TASK_EXEC" --unregister-login-item
 /bin/rm -rf -- "$TASK_APP" "$TASK_SUPPORT" "$TASK_CACHE"
-# Accessibility stays granted (2026-10-29): a reinstall then works at once instead of
+# Accessibility stays granted (Ashley 2026-10-29): a reinstall then works at once instead of
 # asking again. The entry can be removed by hand in System Settings → Privacy & Security.
 print 'Login item unregistered. Toss, its runtime, local pairing files, and screenshot cache have been removed.'
 print 'Trust and Developer Mode on your iPad are unchanged. You can change them in iPad Settings.'

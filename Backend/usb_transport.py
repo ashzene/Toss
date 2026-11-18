@@ -5,14 +5,13 @@ import asyncio
 from contextlib import asynccontextmanager, suppress
 import fcntl
 import importlib.metadata
-import json
 import os
 from pathlib import Path
 import stat
 
 import capture_once as once
 import link_timeline
-from ipad_probe import ProbeFailure, fingerprint
+from ipad_probe import ProbeFailure, fingerprint, read_device_pin
 from remote_pairing_transport import configure, load_record
 
 LIBRARY_VERSION = "11.31.0"
@@ -21,9 +20,7 @@ USBMUX_SOCKET = "/var/run/usbmuxd"
 
 def pinned_identity(state):
     once.check_state(Path(state))
-    pin = json.loads((Path(state) / "target.json").read_text())
-    if not isinstance(pin.get("model"), str) or not pin["model"].startswith("iPad"):
-        raise ProbeFailure("unexpected_device_pin")
+    pin = read_device_pin(state)
     record = load_record(Path(state), pin)
     if record is None:
         raise ProbeFailure("initial_usb_remote_pairing_required")

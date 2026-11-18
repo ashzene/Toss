@@ -152,6 +152,7 @@ struct TossStatusPresentation {
     var summaryTone: NSColor?
     var lastCaptureResult: TossCaptureResult?
     var captureInProgress = false
+    var deviceConnections: [(String, TossConnectionStatus)] = []
 }
 
 // Paints the popover (arrow included) in the website colour instead of the
@@ -315,10 +316,11 @@ final class TossStatusPanel: NSViewController {
     func update(_ value: TossStatusPresentation) {
         loadViewIfNeeded()
         let connection = value.connection
-        let route = connection.state == .ready ? connection.transportLabel.map { " · " + $0 } ?? "" : ""
+        // Two devices: each line below carries its own route, so the summary has none.
+        let route = value.deviceConnections.count > 1 ? "" : connection.state == .ready ? connection.transportLabel.map { " · " + $0 } ?? "" : ""
         summary.show(value.summary.isEmpty ? nil : value.summary + route, dot: value.summaryTone)
         var detail = connection.state == .connecting ? value.retryError : connection.errorMessage
-        if !value.paired { detail = L("Pair your iPad in Settings to start.", "先在设置里配对 iPad。") }
+        if !value.paired { detail = L("Pair your \(deviceEN) in Settings to start.", "先在设置里配对 \(deviceZH)。") }
         let inProgress = value.captureInProgress || value.phase == .preparing || value.phase.animates
         captureCaption.stringValue = inProgress ? L("Current screenshot", "当前截图") : L("Last screenshot", "上一张截图")
         let receipt = inProgress ? nil : value.lastCaptureResult
@@ -341,7 +343,7 @@ final class TossStatusPanel: NSViewController {
                 job.show(L("Uploading", "正在上传"))
             case .slow:
                 job.show(L("Taking longer…", "比平时慢…"))
-                if detail == nil { detail = L("Still waiting for your iPad. Your shortcut was received.", "还在等 iPad。快捷键已经收到了。") }
+                if detail == nil { detail = L("Still waiting for your \(deviceEN). Your shortcut was received.", "还在等 \(deviceZH)。快捷键已经收到了。") }
             case .completed:
                 job.show(L("Added to chat", "已放进聊天"), dot: SettingsStyle.ok)
             case .failed:
@@ -350,6 +352,11 @@ final class TossStatusPanel: NSViewController {
             case .cancelled:
                 job.show(L("Cancelled", "已取消"))
             }
+        }
+        if value.deviceConnections.count > 1 {
+            // One line per device, the iPad first (DeviceCopy.connectionLines).
+            let devices = DeviceCopy.connectionLines(value.deviceConnections)
+            detail = [devices, detail].compactMap { $0 }.joined(separator: "\n")
         }
         note.stringValue = detail ?? ""
         stack.setCustomSpacing(detail == nil ? 16 : 8, after: summary)
@@ -444,10 +451,10 @@ final class TossStatusController: NSObject, NSPopoverDelegate {
         icon.setUploading(value.phase.animates, tint: value.uploadTarget?.color)
         let connection: String
         switch value.connection.state {
-        case .ready: connection = L("iPad Connected", "iPad 已连接") + (value.connection.transportLabel.map { " · " + $0 } ?? "")
-        case .connecting: connection = L("Connecting to iPad", "正在连接 iPad")
-        case .failed, .disconnected: connection = L("iPad Not Connected", "iPad 没连上")
-        case .notChecked: connection = value.paired ? L("Connection Not Checked", "还没检查连接") : L("iPad Not Paired", "iPad 还没配对")
+        case .ready: connection = L("\(deviceEN) Connected", "\(deviceZH) 已连接") + (value.connection.transportLabel.map { " · " + $0 } ?? "")
+        case .connecting: connection = L("Connecting to \(deviceEN)", "正在连接 \(deviceZH)")
+        case .failed, .disconnected: connection = L("\(deviceEN) Not Connected", "\(deviceZH) 没连上")
+        case .notChecked: connection = value.paired ? L("Connection Not Checked", "还没检查连接") : L("Nothing Paired Yet", "还没配对设备")
         }
         let activity = value.phase == .slow ? L(" · Screenshot is taking longer; still waiting", " · 截图比平时慢，还在等") :
             (value.phase.animates ? L(" · Uploading screenshot", " · 正在上传截图") : "")

@@ -17,8 +17,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private var toggleItem: NSMenuItem!
     private var settingsWindow: NSWindow?
     private var windowToggle: NSButton?
-    private var loginToggle: NSButton?
-    private var toastToggle: NSButton?
+    private var loginToggle: SettingsSwitch?
+    private var toastToggle: SettingsSwitch?
     private var loginMenuItem: NSMenuItem?
     private var startupStatus: NSTextField?
     private var startupChangeTask: Task<Void, Never>?
@@ -47,6 +47,21 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private var lastCaptureResult: TossCaptureResult?
     private lazy var captureHistory = CaptureHistory(url: base.appendingPathComponent("capture-history.jsonl"))
     private let setupWizard = SetupWizard()
+    private var pairedDevice = PairedDevicesState()
+    // App-wide copy can read pairedDeviceClass?.displayName / .osName in one line.
+    var pairedDeviceClass: DeviceClass? { pairedDevice.primary }
+    var pairedDeviceClasses: Set<DeviceClass> { pairedDevice.classes }
+    // Visible text names the device being set up, else the paired one (DeviceCopy.swift).
+    private var setupDeviceClass: DeviceClass?
+    // The guide opened to set up a device: it may be the other one, so it names no device until one is plugged in.
+    private var guideAwaitsDevice = false
+    private var captureDeviceClass: DeviceClass? {
+        core.activeRequestID.flatMap { selectedDeviceClass(requestID: $0) }
+    }
+    private func updateDeviceCopy() {
+        DeviceCopy.bothPaired = pairedDeviceClasses.count == 2
+        DeviceCopy.deviceClass = (setupDeviceClass ?? captureDeviceClass ?? (guideAwaitsDevice ? nil : pairedDeviceClass))?.rawValue
+    }
     private var setupStatus: NSTextField?
     private var setupButtons: [NSButton] = []
     private var settingsStack: NSStackView?
@@ -56,11 +71,14 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private var accessButton: NSButton?
     private var networkState: SettingsStatus?
     private var networkDetail: NSTextField?
+    // The notes under the two shortcuts: with an iPad and an iPhone paired they add "twice for iPhone".
+    private var shortcutNotes: [NSTextField] = []
     private var networkButton: NSButton?
     private var settingsMore: NSMenu?
     private var checkMenuItem: NSMenuItem?
     private var forgetMenuItem: NSMenuItem?
     private var lastSetupCode = "not_run"
+    private var setupDeviceHash: String?
     private var setupPrompt: NSAlert?
     private var setupAutoStarted = false
     private var onboarding: OnboardingController?
@@ -79,9 +97,10 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private var targetKind: TargetKind = .chatGPT
     private var target: ChatTarget { targetFor(targetKind) }
     // Both Options → ChatGPT/Codex, both Shifts → Claude; one transaction at a time.
-    private var core = DualHotkeyCore(captureTimeout: 45, imageLifetime: 10)
+    private var core = DualHotkeyCore(captureTimeout: 45, imageLifetime: 10, tapSelectionEnabled: true)
     // Wakes the iPad's Wi-Fi from the first chord key; never part of detection.
-    private let iPadWaker = IPadWaker()
+    private let deviceWakers: [DeviceClass: IPadWaker] = [.iPad: IPadWaker(), .iPhone: IPadWaker()]
+    private var iPadWaker: IPadWaker { deviceWakers[activeDeviceClass]! }
     private let sighter = AttachmentSighter()
     private var predictedSlot: CGRect?
     private var predictionNote = "-"
@@ -106,11 +125,52 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private var lastKeys = ModifierSnapshot()
     private var timer: Timer?
     private var enabled = false
-    private let captureWorker = CaptureWorker(wifiHedgingEnabled: false)
-    private var usbDropNotice = USBDropNotice()
-    private var usbDropCheckRunning = false
-    private var capturePipeline = CapturePipeline()
+    private let captureWorkers: [DeviceClass: CaptureWorker] = [.iPad: CaptureWorker(wifiHedgingEnabled: false), .iPhone: CaptureWorker(wifiHedgingEnabled: false)]
+    private var devicePressRouting = DevicePressRouting()
+    private var activeDeviceClass: DeviceClass {
+        transaction?.deviceClass ?? earlyCapture?.deviceClass ??
+            (core.activeRequestID.map { selectedDeviceClass(requestID: $0) } ?? pairedDeviceClass) ?? .iPad
+    }
+    private var captureWorker: CaptureWorker { captureWorkers[activeDeviceClass]! }
+    private var anyWorkerBusy: Bool { captureWorkers.values.contains { $0.isBusy } }
+    // The keys choose the device: one press iPad, two presses iPhone. USB only decides the route.
+    // A connected, unlocked device can take either press while the other is locked or offline.
+    private func deviceThatIsOn(_ wanted: DeviceClass) -> DeviceClass {
+        devicePressRouting.device(wanted: wanted, paired: pairedDeviceClasses,
+            closed: Set(captureWorkers.filter { $0.value.deviceLocked == true }.keys),
+            ready: Set(captureWorkers.filter { $0.value.connectionStatus.state == .ready }.keys),
+            at: ProcessInfo.processInfo.systemUptime)
+    }
+    private func lockedAlternate(for wanted: DeviceClass) -> DeviceClass? {
+        devicePressRouting.lockedAlternate(for: wanted, paired: pairedDeviceClasses,
+            closed: Set(captureWorkers.filter { $0.value.deviceLocked == true }.keys),
+            ready: Set(captureWorkers.filter { $0.value.connectionStatus.state == .ready }.keys),
+            at: ProcessInfo.processInfo.systemUptime)
+    }
+    private var singlePressDevice: DeviceClass? { pairedDeviceClass.map(deviceThatIsOn) }
+    private var doublePressDevice: DeviceClass { deviceThatIsOn(.iPhone) }
+    private func selectedDeviceClass(requestID: UInt64) -> DeviceClass? {
+        capturePipeline.delivering?.deviceClass ?? (core.selectsSecondary(requestID: requestID) ? doublePressDevice : singlePressDevice)
+    }
+    private func selectedDeviceClass(pressedAt: Double) -> DeviceClass? {
+        capturePipeline.press(at: pressedAt)?.deviceClass ?? (core.selectsSecondary(pressedAt: pressedAt) ? doublePressDevice : singlePressDevice)
+    }
+    private func stopWorkers() { captureWorkers.values.forEach { $0.stop() } }
+    private func prepareWorkers(_ config: TossConfiguration) throws {
+        for kind in DeviceClass.allCases where pairedDeviceClasses.contains(kind) {
+            if let directory = pairedDevice.directories[kind] { deviceWakers[kind]?.useStateDirectory(directory) }
+            if captureWorkers[kind]?.isBusy == false {
+                try captureWorkers[kind]?.prepare(configuration: workerConfiguration(config, deviceClass: kind))
+            }
+        }
+    }
+    private var capturePipeline = DeviceCapturePipeline()
     private var chordDetector = CaptureChordDetector()
+    private var deviceGesture = DeviceCaptureGesture()
+    private var deferredDeviceSelection: (chord: HotkeyChord, at: Double, lease: (any ChatLease)?)?
+    private var blackFramePresses: Set<Double> = []
+    private var usbDropNotice = USBDropNotice()
+    private var usbDropChecks: Set<DeviceClass> = []
     private var pipelineCaptures: [UInt64: EarlyCapture] = [:]
     private var pipelineProgress: [String: (received: Double, expected: Double)] = [:]
     private var slowPipelineIDs: Set<String> = []
@@ -154,6 +214,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         let id: UInt64
         let uuid: String
         let image: URL
+        let deviceClass: DeviceClass
         var result: (data: Data, exitCode: Int32)?
         var receivedAt: Double?
         // A prefetched failure ended its waiting batch when it arrived. Presses made
@@ -187,7 +248,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     // The early request of a keypress that already ended (see discardEarlyCapture). On a slow
     // link it can still occupy the worker when the next key arrives; that key must not then
     // fail as "busy" (2026-10-24 16:46: it silently hung for 45 s).
-    private var abandonedCaptureID: String?
+    private var abandonedCaptureIDs: [DeviceClass: String] = [:]
     // Focuses the leased composer while the iPad screenshot is in flight, so the
     // paste step finds it focused already. Focus only; every paste check stays.
     private var earlyFocusTask: (id: UInt64, task: Task<Void, Never>)?
@@ -209,6 +270,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         let lease: any ChatLease
         let kind: TargetKind
         let image: URL
+        let deviceClass: DeviceClass
         var clipboard: ClipboardTransaction?
         var pastePosted = false
         var appendConfirmed = false
@@ -424,9 +486,9 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         guard pathUpdates > 1 else { return } // The first update is the current state.
         networkRewarm?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.enabled, !self.sleeping, !self.hasActiveWork, !self.captureWorker.isBusy,
+            guard let self, self.enabled, !self.sleeping, !self.hasActiveWork, !self.anyWorkerBusy,
                   self.transaction == nil, !self.setupWizard.isRunning else { return }
-            self.captureWorker.invalidateWiFi()
+            self.captureWorkers.values.forEach { $0.invalidateWiFi() }
             self.rewarmWorker(after: 0)
         }
         networkRewarm = work
@@ -438,6 +500,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     func prepareInterface() {
         guard !interfacePrepared else { return }
         interfacePrepared = true
+        refreshPairedDevice()
         startKeepAliveCheck()
         // Load once without playing. Never put audio I/O in the capture path.
         // Toss's own cues (Assets/Sounds, Ashley's picks); there is no Codex fallback.
@@ -466,7 +529,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         _ = add(menu, L("Check Current Target · No Paste", "检查当前目标 · 不粘贴"), #selector(checkTarget))
         _ = add(menu, L("Cancel Capture", "取消截图"), #selector(cancelCurrent))
         menu.addItem(.separator())
-        _ = add(menu, L("Check iPad Connection", "检查 iPad 连接"), #selector(runSetup))
+        _ = add(menu, L("Check Connection", "检查连接"), #selector(runSetup))
         _ = add(menu, L("Allow Accessibility Access…", "允许辅助功能…"), #selector(requestAccessibility))
         _ = add(menu, L("Installation and Usage Guide", "安装和使用说明"), #selector(showInstructions))
         _ = add(menu, L("View Diagnostics", "查看诊断信息"), #selector(showDiagnostics))
@@ -474,16 +537,23 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         _ = add(menu, L("Quit", "退出"), #selector(quit))
         menuStatus = makeStatusController(item: item, menu: menu)
-        for worker in [captureWorker] {
-            worker.onConnectionChange = { [weak self] _ in
+        for (kind, worker) in captureWorkers {
+            worker.onConnectionChange = { [weak self] status in
                 guard let self else { return }
-                let status = self.currentConnection
-                if status.state == .ready || status.state == .notChecked { self.lastConnectionFailure = nil }
-                else if status.state == .failed { self.lastConnectionFailure = status.errorMessage }
+                self.devicePressRouting.observe(kind, unavailable: status.state != .ready && status.state != .notChecked,
+                                                at: ProcessInfo.processInfo.systemUptime)
+                if kind == self.activeDeviceClass {
+                    if status.state == .ready || status.state == .notChecked { self.lastConnectionFailure = nil }
+                    else if status.state == .failed { self.lastConnectionFailure = status.errorMessage }
+                }
                 self.refreshMenuStatus()
-                self.recordConnectionEvent(status)
+                self.recordConnectionEvent(status, deviceClass: kind)
             }
-            worker.onUSBLost = { [weak self] in self?.checkUSBDrop() }
+            worker.onUSBLost = { [weak self] in self?.checkUSBDrop(kind) }
+            worker.onDeviceLockChange = { [weak self] in
+                self?.refreshSettingsUI()
+                self?.writeLastRun()
+            }
             worker.onCaptureSlow = { [weak self] requestID in
                 guard let self else { return }
                 self.slowPipelineIDs.insert(requestID)
@@ -541,7 +611,6 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
-        window.backgroundColor = SettingsStyle.background
         let content = window.contentView!
         let inner = SettingsStyle.settingsWidth - 2 * SettingsStyle.margin
         let stack = NSStackView()
@@ -656,12 +725,15 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         place(header, gap: SettingsStyle.settingsSectionGap + 2)
 
         place(heading(L("Shortcuts", "快捷键"), size: 18), gap: 8)
-        place(list([row("ChatGPT / Codex", detail(L("Left and right Option together", "左右两个 Option 一起按")), [keys("⌥")]),
-                    row("Claude", detail(L("Left and right Shift together", "左右两个 Shift 一起按")), [keys("⇧")])]), gap: SettingsStyle.settingsSectionGap)
+        let optionNote = detail(DeviceCopy.shortcutNote(option: true, twoDevices: false))
+        let shiftNote = detail(DeviceCopy.shortcutNote(option: false, twoDevices: false))
+        shortcutNotes = [optionNote, shiftNote]
+        place(list([row("ChatGPT / Codex", optionNote, [keys("⌥")]),
+                    row("Claude", shiftNote, [keys("⇧")])]), gap: SettingsStyle.settingsSectionGap)
 
         // Setup: pairing, Accessibility, live iPad connection, login item.
         place(heading(L("Setup", "常规"), size: 18), gap: 8)
-        let pairDetail = detail(hasPairing ? "" : L("Connect with USB once and unlock it.", "用数据线连一次，并解锁 iPad。"))
+        let pairDetail = detail(hasPairing ? "" : L("Connect with USB once and unlock it.", "用数据线连一次，并解锁 \(deviceZH)。"))
         setupStatus = pairDetail
         let pairStatus = SettingsStatus()
         pairState = pairStatus
@@ -688,7 +760,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         notifications.setAccessibilityLabel(ToastCopy.strings().notifications)
         notifications.state = toastPreferences.enabled ? .on : .off
         toastToggle = notifications
-        place(list([row("iPad", pairDetail, [pairStatus, pairButton]),
+        place(list([row(DeviceCopy.label, pairDetail, [pairStatus, pairButton]),
                     row(L("Accessibility", "辅助功能"), accessDetail, [accessStatus, accessButtonView]),
                     row(L("Connection", "连接"), networkDetailView, [networkStatus, networkButtonView]),
                     row(L("Launch at login", "登录时打开"), loginNote, [login]),
@@ -704,13 +776,13 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             more.addItem(entry)
             return entry
         }
-        checkMenuItem = moreItem(L("Check iPad", "检查 iPad"), #selector(runSetup))
+        checkMenuItem = moreItem(L("Check Connection", "检查连接"), #selector(runSetup))
         _ = moreItem(L("Cancel Capture", "取消截图"), #selector(cancelCurrent))
         _ = moreItem(L("Refresh Access", "刷新权限"), #selector(refreshPermissions))
         more.addItem(.separator())
         _ = moreItem(L("Copy Diagnostics", "复制诊断信息"), #selector(copyDiagnostics))
         more.addItem(.separator())
-        forgetMenuItem = moreItem(L("Forget iPad…", "忘记这台 iPad…"), #selector(forgetDevice))
+        forgetMenuItem = moreItem(L("Forget This Device…", "忘记这台设备…"), #selector(forgetDevice))
         settingsMore = more
         let footer = hstack([SettingsPill(L("Setup guide", "设置引导"), target: self, action: #selector(openOnboarding)),
                              SettingsPill(L("Diagnostics", "诊断信息"), target: self, action: #selector(showDiagnostics)),
@@ -725,6 +797,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         refreshStartupUI()
         refreshSettingsUI()
         window.center()
+        SettingsStyle.applyUnifiedWindowStyle(in: window, backgroundColor: SettingsStyle.settingsBackground)
     }
 
     // Settings → Language: Follow System (default) and every AppLanguage. Each choice is named in its own
@@ -763,11 +836,22 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         #if TOSS_RENDER
         if let connection = RenderState.connection { return connection }
         #endif
-        let connection = captureWorker.connectionStatus
-        return networkAvailable == false && hasPairing && !connection.isHealthyUSB
-            ? TossConnectionStatus(state: .disconnected, reason: "network_unavailable")
-            : connection
+        return deviceConnections[activeDeviceClass] ?? .notChecked
     }
+
+    // Public data for Claude's per-device UI. Never treat a ready sibling as proof of this link.
+    var deviceConnections: [DeviceClass: TossConnectionStatus] {
+        Dictionary(uniqueKeysWithValues: pairedDeviceClasses.map { kind in
+            let status = captureWorkers[kind]!.connectionStatus
+            return (kind, networkAvailable == false && !status.isHealthyUSB
+                ? TossConnectionStatus(state: .disconnected, reason: "network_unavailable") : status)
+        })
+    }
+
+    private var deviceConnectionRows: [(String, TossConnectionStatus)] {
+        DeviceClass.allCases.compactMap { kind in deviceConnections[kind].map { (kind.rawValue, $0) } }
+    }
+
 
     @objc private func retryConnection() { recheckMenuConnection() }
 
@@ -788,6 +872,11 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private func refreshSettingsUI() {
         guard settingsWindow != nil else { return }
         toastToggle?.state = toastPreferences.enabled ? .on : .off
+        if shortcutNotes.count == 2 {
+            let two = pairedDeviceClasses.count == 2
+            shortcutNotes[0].stringValue = DeviceCopy.shortcutNote(option: true, twoDevices: two)
+            shortcutNotes[1].stringValue = DeviceCopy.shortcutNote(option: false, twoDevices: two)
+        }
         let paired = hasPairing
         let access = permissionsReady
         let connection = currentConnection
@@ -804,7 +893,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         if paired && !pairing && ["ready", "not_run", "cancelled"].contains(lastSetupCode) { setupStatus?.isHidden = true }
         else { setupStatus?.isHidden = setupStatus?.stringValue.isEmpty ?? true }
         checkMenuItem?.isEnabled = paired && !pairing
-        forgetMenuItem?.isEnabled = paired && !pairing
+        forgetMenuItem?.isEnabled = paired && !pairing && !hasActiveWork
 
         accessState?.show(access ? L("Allowed", "已允许") : nil, dot: SettingsStyle.ok)
         accessButton?.isHidden = access
@@ -814,7 +903,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         switch (paired, connection.state) {
         case (false, _):
             networkState?.show(L("After pairing", "配对后可用"))
-            networkDetail?.stringValue = L("Keep iPad unlocked, on the same Wi-Fi.", "iPad 保持解锁，连同一个 Wi-Fi。")
+            networkDetail?.stringValue = L("Keep \(deviceEN) unlocked, on the same Wi-Fi.", "\(deviceZH) 保持解锁，连同一个 Wi-Fi。")
             networkButton?.isHidden = true
         case (true, .ready):
             // Not "Same network": a USB connection needs no shared Wi-Fi (UI copy review 2026-10-28).
@@ -828,7 +917,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             networkButton?.isHidden = false
         case (true, .disconnected), (true, .failed):
             networkState?.show(L("Not connected", "没连上"), dot: SettingsStyle.accent)
-            networkDetail?.stringValue = connection.errorMessage ?? L("Unlock iPad, use the same Wi-Fi.", "解锁 iPad，连同一个 Wi-Fi。")
+            networkDetail?.stringValue = connection.errorMessage ?? L("Unlock \(deviceEN), use the same Wi-Fi.", "解锁 \(deviceZH)，连同一个 Wi-Fi。")
             networkButton?.title = L("Retry", "重试")
             networkButton?.isHidden = false
         case (true, .notChecked):
@@ -837,8 +926,30 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             networkButton?.title = L("Check", "检查")
             networkButton?.isHidden = false
         }
-        networkButton?.isEnabled = !sleeping && !hasActiveWork && !captureWorker.isBusy &&
+        networkButton?.isEnabled = !sleeping && !hasActiveWork && !anyWorkerBusy &&
             !pairing && enableTask == nil
+        if pairedDeviceClasses.count == 2 {
+            // Two devices: the row says how many are in, the note gives each device its own line.
+            let rows = deviceConnectionRows
+            let ready = rows.filter { $0.1.state == .ready }.count
+            let down = rows.contains { $0.1.state == .disconnected || $0.1.state == .failed }
+            // Ashley 2026-11-02: name the device that is out, not "one of them".
+            let downNames = DeviceCopy.names(rows.filter { $0.1.state == .disconnected || $0.1.state == .failed }.map { $0.0 })
+            let connectingNames = DeviceCopy.names(rows.filter { $0.1.state == .connecting }.map { $0.0 })
+            if ready == rows.count { networkState?.show(L("Both connected", "都已连上"), dot: SettingsStyle.ok) }
+            else if down && ready == 0 && !rows.contains(where: { $0.1.state == .connecting }) {
+                networkState?.show(L("Neither connected", "都没连上"), dot: SettingsStyle.accent)
+            }
+            else if down { networkState?.show(L("\(downNames) not connected", "\(downNames) 没连上"), dot: SettingsStyle.accent) }
+            else if rows.contains(where: { $0.1.state == .connecting }) {
+                networkState?.show(L("Connecting \(connectingNames)…", "正在连接 \(connectingNames)…"), dot: SettingsStyle.accent)
+            }
+            else { networkState?.show(nil) }
+            networkDetail?.stringValue = DeviceCopy.connectionLines(rows)
+            let connecting = rows.contains { $0.1.state == .connecting }
+            networkButton?.title = down || connecting ? L("Retry", "重试") : L("Check", "检查")
+            networkButton?.isHidden = ready == rows.count
+        }
 
         let summary = statusSummary
         settingsState?.show(summary.text, dot: summary.tone)
@@ -861,16 +972,30 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             return (startup.desiredEnabled ? L("Waiting for ChatGPT or Claude to open", "等 ChatGPT 或 Claude 打开") : L("Off · Shortcuts are paused", "已关闭 · 快捷键暂停"),
                     SettingsStyle.muted)
         }
+        if pairedDeviceClasses.count == 2 {
+            // Two devices: name the ones that need attention, else say both are in.
+            let rows = deviceConnectionRows
+            let down = rows.filter { $0.1.state == .disconnected || $0.1.state == .failed }.map { $0.0 }
+            let connecting = rows.filter { $0.1.state == .connecting }.map { $0.0 }
+            let ready = rows.filter { $0.1.state == .ready }.map { $0.0 }
+            if down.count == 2 { return (L("On · Neither device connected", "已打开 · 都没连上"), SettingsStyle.accent) }
+            let downNames = DeviceCopy.names(down), connectingNames = DeviceCopy.names(connecting), readyNames = DeviceCopy.names(ready)
+            if !down.isEmpty { return (L("On · \(downNames) not connected", "已打开 · \(downNames) 没连上"), SettingsStyle.accent) }
+            if !connecting.isEmpty { return (L("Connecting to \(connectingNames)…", "正在连接 \(connectingNames)…"), SettingsStyle.accent) }
+            if ready.isEmpty { return (L("On · Press both Option or both Shift", "已打开 · 按两个 Option 或两个 Shift"), SettingsStyle.ok) }
+            if ready.count == 2 { return (L("Ready · Both connected", "就绪 · 都已连上"), SettingsStyle.ok) }
+            return (L("Ready · \(readyNames) connected", "就绪 · \(readyNames) 已连接"), SettingsStyle.ok)
+        }
         switch currentConnection.state {
         case .ready:
             if currentConnection.transport != "wifi",
                UserDefaults.standard.object(forKey: OnboardingPolicy.wirelessKey) as? Bool == false {
                 return (words.cableOnlyStatus, SettingsStyle.muted)
             }
-            return (L("Ready · iPad connected", "就绪 · iPad 已连接"), SettingsStyle.ok)
-        case .connecting: return (L("Connecting to iPad…", "正在连接 iPad…"), SettingsStyle.accent)
+            return (L("Ready · \(deviceEN) connected", "就绪 · \(deviceZH) 已连接"), SettingsStyle.ok)
+        case .connecting: return (L("Connecting to \(deviceEN)…", "正在连接 \(deviceZH)…"), SettingsStyle.accent)
         case .notChecked: return (L("On · Press both Option or both Shift", "已打开 · 按两个 Option 或两个 Shift"), SettingsStyle.ok)
-        case .disconnected, .failed: return (L("On · iPad not connected", "已打开 · iPad 没连上"), SettingsStyle.accent)
+        case .disconnected, .failed: return (L("On · \(deviceEN) not connected", "已打开 · \(deviceZH) 没连上"), SettingsStyle.accent)
         }
     }
 
@@ -895,23 +1020,25 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         onboarding?.setTransport(currentConnection.state == .ready ? currentConnection.transportLabel : nil)
         menuStatus?.update(.init(connection: currentConnection,
             phase: phase, paired: hasPairing, enabled: enabled,
-            canRecheck: !sleeping && !hasActiveWork && !captureWorker.isBusy &&
+            canRecheck: !sleeping && !hasActiveWork && !anyWorkerBusy &&
                 !setupWizard.isRunning && enableTask == nil,
             lastMessage: lastStatus, retryError: lastConnectionFailure,
             uploadTarget: targetKind == .claude ? .claude : .codex,
             summary: summary.text, summaryTone: summary.tone,
-            lastCaptureResult: lastCaptureResult, captureInProgress: captureRecord != nil))
+            lastCaptureResult: lastCaptureResult, captureInProgress: captureRecord != nil,
+            deviceConnections: deviceConnectionRows))
         refreshSettingsUI()
     }
 
     private func recheckMenuConnection() {
-        guard !uninstalling, !sleeping, !hasActiveWork, !captureWorker.isBusy,
+        guard !uninstalling else { return }
+        guard !sleeping, !hasActiveWork, !anyWorkerBusy,
               !setupWizard.isRunning, enableTask == nil else { return }
         guard hasPairing else { showSettings(); return }
         do {
             let config = try configuration()
-            captureWorker.stop()
-            try captureWorker.prepare(configuration: workerConfiguration(config))
+            stopWorkers()
+            try prepareWorkers(config)
         } catch {
             failure(error, code: "connection_check_failed")
         }
@@ -947,7 +1074,6 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         afterSettingsShown()
     }
 
-    // Manual app entry is always recoverable after an incomplete/dismissed setup.
     @discardableResult private func openSetupIfNeeded() -> Bool {
         guard OnboardingPolicy.opensFromIcon(paired: hasPairing, guideVisible: onboarding?.isVisible == true) else { return false }
         showOnboarding()
@@ -988,10 +1114,11 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
 
     private func pairedUSBSetupHashes() -> [String: String] {
         var hashes: [String: String] = [:]
-        if let config = try? runtimeConfiguration(),
-           let data = try? Data(contentsOf: URL(fileURLWithPath: config.state_dir + "/target.json")),
-           let pin = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let hash = pin["device_hash"] as? String { hashes["iPad"] = hash }
+        for (kind, directory) in pairedDevice.directories {
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: directory + "/target.json")),
+               let pin = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let hash = pin["device_hash"] as? String { hashes[kind.rawValue] = hash }
+        }
         return hashes
     }
 
@@ -999,15 +1126,24 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         guard !uninstalling, !terminating else { return }
         let paired = hasPairing
         let hashes = pairedUSBSetupHashes()
+        let candidates = usbSetupPolicy.pending(paired: hashes, iPadOnly: false, hasPairing: paired)
+        let otherSetupTarget = !SetupWizard.canAttachUSBPrompt(
+            running: setupWizard.isRunning, targetHash: setupDeviceHash, code: lastSetupCode,
+            candidateHashes: candidates.map(\.deviceHash))
         let blocked = core.isBusy || hasActiveWork || transaction != nil || enableTask != nil ||
-            captureWorker.isBusy || sleeping || runtimeQuarantined || onboarding != nil
-        let candidates = usbSetupPolicy.pending(paired: hashes, iPadOnly: true, hasPairing: paired)
-        if usbSetupPolicy.take(paired: hashes, iPadOnly: true, hasPairing: paired, blocked: blocked) != nil {
+            anyWorkerBusy || sleeping || runtimeQuarantined || onboarding != nil || otherSetupTarget
+        if let device = usbSetupPolicy.take(paired: hashes, iPadOnly: false, hasPairing: paired, blocked: blocked) {
             openOnboarding()
             usbSetupPolicy.automaticPresented(candidates, visible: onboarding?.isVisible == true)
+            // An existing run owns its target and its copy; opening only attaches UI.
+            if !setupWizard.isRunning {
+                setupDeviceClass = DeviceClass(rawValue: device.deviceClass)
+                updateDeviceCopy()
+                onboarding?.setDeviceClass(setupDeviceClass)
+            }
         }
         // Only an outstanding insertion needs this timer; an idle listener has no polling.
-        let pending = !usbSetupPolicy.pending(paired: hashes, iPadOnly: true, hasPairing: paired).isEmpty
+        let pending = !usbSetupPolicy.pending(paired: hashes, iPadOnly: false, hasPairing: paired).isEmpty
         if pending && usbSetupRetry == nil {
             usbSetupRetry = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
                 Task { @MainActor in self?.offerUSBSetup() }
@@ -1151,7 +1287,6 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         do {
             let config = try configuration()
             guard AXIsProcessTrusted(), CGPreflightPostEventAccess() else { throw TossError.accessibilityPermission }
-            iPadWaker.useStateDirectory(config.state_dir)
             toggleItem.title = L("Cancel Enabling", "取消打开")
             windowToggle?.title = SettingsStyle.shortToggle(L("Cancel Enabling", "取消打开"))
             setStatus(L("Preparing chat access and the wireless connection… About 3 seconds.", "正在准备聊天窗口和无线连接…约 3 秒。"), code: "preparing_accessibility")
@@ -1162,7 +1297,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
                 do {
                     try Task.checkCancellation()
                     guard self.enableGeneration == generation else { throw TossError.cancelled }
-                    try self.captureWorker.prepare(configuration: self.workerConfiguration(config))
+                    try self.prepareWorkers(config)
                     try await self.prepareRunningTargets()
                     try Task.checkCancellation()
                     guard self.enableGeneration == generation else { throw TossError.cancelled }
@@ -1192,7 +1327,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
                     self.setStatus(L("Enabled: both Option keys → ChatGPT; both Shift keys → Claude", "已打开：两个 Option → ChatGPT；两个 Shift → Claude"), code: "ready")
                 } catch {
                     guard !Task.isCancelled, self.enableGeneration == generation else { return }
-                    self.captureWorker.stop()
+                    self.stopWorkers()
                     self.enableTask = nil
                     let title = self.startup.desiredEnabled ? L("Disable Auto-Resume", "关闭自动恢复") : L("Enable Shortcuts", "打开快捷键")
                     self.toggleItem.title = title
@@ -1215,7 +1350,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private static func shortEnableFailure(_ error: Error) -> String {
         if let error = error as? TossError {
             switch error {
-            case .configuration: return "pair your iPad in Settings"
+            case .configuration: return "pair your \(deviceEN) in Settings"
             case .accessibilityPermission, .inputPermission: return "allow Accessibility access"
             case .monitorUnavailable: return "could not listen for shortcuts"
             case .backendUnavailable: return "capture service unavailable"
@@ -1265,7 +1400,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func readKeys() {
-        guard enabled else { return }
+        guard enabled, !setupWizard.isRunning else { return }
         let keys = KeyMonitor.modifiers()
         _ = chordDetector.observe(keys, allow: false)
         handle(core.observe(keys, at: ProcessInfo.processInfo.systemUptime, allowNewCapture: false))
@@ -1274,7 +1409,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private func receiveKeys(_ keys: ModifierSnapshot, at timestamp: Double) {
         let previousKeys = lastKeys
         lastKeys = keys
-        guard enabled else { return }
+        guard enabled, !setupWizard.isRunning else { return }
         let now = ProcessInfo.processInfo.systemUptime
         switch HotkeyEventAdmission.evaluate(timestamp: timestamp, now: now,
                                              ignoreThrough: ignoreKeyboardEventsThrough) {
@@ -1293,8 +1428,9 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             if allowNewCapture, captureWorker.connectionStatus.state == .ready,
                keys.startsChord(after: previousKeys) { iPadWaker.poke() }
             handle(core.observe(keys, at: now, allowNewCapture: false))
-            if let chord = chordDetector.observe(keys, allow: allowNewCapture) {
-                admitCapture(chord, at: now)
+            if let chord = chordDetector.observe(keys, allow: allowNewCapture, at: timestamp,
+                    partialReleaseWindow: pairedDeviceClasses.count == 2 ? DualHotkeyCore.doublePressWindow : 0) {
+                selectCapture(chord, at: timestamp)
             }
         }
     }
@@ -1303,6 +1439,10 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         for action in actions {
             switch action {
             case .capture(let request): startCapture(request)
+            case .retarget(let request): retargetCapture(request)
+            case .retargetQueued(let pressedAt):
+                if queuedPrefetch?.pressedAt == pressedAt { discardQueuedPrefetch() }
+                prefetchQueuedScreenshot()
             case .pasteIntent(let request, let token): beginAppend(request, token: token)
             case .busyRepeat(let id, let phase):
                 // Acknowledged and logged; the core also queues the press, which starts as a new
@@ -1349,10 +1489,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private func runtimeConfiguration() throws -> TossConfiguration {
         guard let python = Bundle.main.resourceURL?.appendingPathComponent("Runtime/python/bin/python3").path,
               fm.isExecutableFile(atPath: python) else { throw TossError.backendUnavailable }
-        let root = base.appendingPathComponent("DeviceState", isDirectory: true)
-        let state = IPadPairingState.existingDirectory(in: root) ?? root
         return TossConfiguration(python: python,
-                                 state_dir: state.path)
+                                 state_dir: base.appendingPathComponent("DeviceState", isDirectory: true).path)
     }
 
     // A browser download marks every file; macOS then blocks the bundled Python
@@ -1363,13 +1501,20 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         return getxattr(python, "com.apple.quarantine", nil, 0, 0, 0) >= 0
     }
 
+    private func refreshPairedDevice() {
+        guard let config = try? runtimeConfiguration() else { pairedDevice.forget(); updateDeviceCopy(); return }
+        pairedDevice.restore(root: config.state_dir,
+            read: { try? Data(contentsOf: URL(fileURLWithPath: $0)) }, exists: { fm.fileExists(atPath: $0) })
+        updateDeviceCopy()
+    }
+
     private var hasPairing: Bool {
         #if TOSS_RENDER
+        if let devices = RenderState.pairedDevices { pairedDevice = devices; return pairedDeviceClass != nil }
         if let paired = RenderState.paired { return paired }
         #endif
-        guard let config = try? runtimeConfiguration() else { return false }
-        return fm.fileExists(atPath: config.state_dir + "/strict-remote-pairing.plist")
-            && fm.fileExists(atPath: config.state_dir + "/target.json")
+        refreshPairedDevice()
+        return pairedDeviceClass != nil
     }
 
     private func configuration() throws -> TossConfiguration {
@@ -1390,7 +1535,9 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         // Pairing a new iPad goes through the step-by-step setup; "Check" on a paired one stays here.
         if !hasPairing { showOnboarding(); return }
         showSettings()
-        startSetup(action: "auto")
+        // One device: unchanged from the iPad build (USB auto setup re-checks the pairing). Two devices: the USB auto
+        // setup could act on whichever one is plugged in, so "Check" only rebuilds each device's own connection.
+        if pairedDeviceClasses.count == 2 { recheckMenuConnection() } else { startSetup(action: "auto") }
     }
 
     private func startSetup(action: String) {
@@ -1404,11 +1551,15 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         }
         try? fm.createDirectory(atPath: base.path, withIntermediateDirectories: true,
                                 attributes: [.posixPermissions: 0o700])
-        // One owner of the iPad link at a time: pause the capture worker.
-        captureWorker.stop()
+        // Setup owns pairing records; resume each independent worker when it finishes.
+        stopWorkers()
+        _ = core.reset()
+        onboarding?.setDeviceClass(nil)
         setupButtons.first?.title = L("Cancel Pairing", "取消配对")
         setupButtons.dropFirst().forEach { $0.isEnabled = false }
-        setupStatus?.stringValue = L("Checking your iPad…", "正在检查 iPad…")
+        setupStatus?.stringValue = L("Checking your \(deviceEN)…", "正在检查 \(deviceZH)…")
+        setupDeviceHash = nil
+        lastSetupCode = "not_run"
         setupWizard.run(python: config.python, script: script, action: action, stateDirectory: config.state_dir,
                         progress: { [weak self] result in self?.setupProgress(result) },
                         completion: { [weak self] result in self?.setupFinished(result) })
@@ -1418,6 +1569,12 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private func setupProgress(_ result: SetupWizard.Result) {
         guard !uninstalling else { return }
         lastSetupCode = result.code
+        setupDeviceHash = result.setupDeviceHash
+        // Name the device in this result before any text below is generated.
+        if ["no_usb_ipad", "multiple_usb_ipads", "mixed_usb_devices", "unsupported_device"].contains(result.code) {
+            setupDeviceClass = nil
+        } else if let found = result.deviceClass { setupDeviceClass = found }
+        updateDeviceCopy()
         setupStatus?.stringValue = SetupWizard.message(for: result)
         // Still no Trust after 30 s: the one grey line becomes the replug hint.
         if result.code == "trust_needed" {
@@ -1433,20 +1590,30 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             }
         } else { trustWaitStarted = nil }
         updateSetupPrompt(SetupWizard.needsIPadAction(result.code) ? result : nil)
-        onboarding?.setupCode(result.code, final: false, ipados: result.ipados)
+        onboarding?.setupCode(result.code, final: false, ipados: result.ipados,
+                              deviceClass: result.deviceClass, osVersion: result.osVersion)
         refreshMenuStatus()
     }
 
     private func setupFinished(_ result: SetupWizard.Result) {
         guard !uninstalling else { return }
+        ignoreKeyboardEventsThrough = ProcessInfo.processInfo.systemUptime
+        _ = core.observe(KeyMonitor.modifiers(), at: ignoreKeyboardEventsThrough, allowNewCapture: false)
         lastSetupCode = result.code
+        setupDeviceHash = nil
+        setupDeviceClass = result.deviceClass   // the device just seen, or nil
+        // Read committed target.json, including USB-only pairing; progress is not proof of pairing.
+        refreshPairedDevice()
         setupButtons.first?.title = hasPairing ? L("Check", "检查") : L("Pair", "配对")
         setupButtons.forEach { $0.isEnabled = true }
         setupStatus?.stringValue = SetupWizard.message(for: result)
         updateSetupPrompt(nil)
         if result.code == "ready" { UserDefaults.standard.set(true, forKey: OnboardingPolicy.wirelessKey) }
         if result.code == "wifi_unreachable" { UserDefaults.standard.set(false, forKey: OnboardingPolicy.wirelessKey) }
-        onboarding?.setupCode(result.code, final: true, ipados: result.ipados)
+        onboarding?.setupCode(result.code, final: true, ipados: result.ipados,
+                              deviceClass: result.deviceClass ?? pairedDeviceClass, osVersion: result.osVersion)
+        setupDeviceClass = nil
+        updateDeviceCopy()
         refreshMenuStatus()
         recordDiagnosticEvent()
         rewarmWorker(after: 0.5)
@@ -1494,7 +1661,19 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Onboarding (step-by-step first setup)
 
-    @objc private func openOnboarding() { usbSetupPolicy.markPresented(); showOnboarding() }
+    @objc private func openOnboarding() {
+        guard !core.isBusy else { return }
+        usbSetupPolicy.markPresented()
+        if !setupWizard.isRunning {
+            // Copy first: the guide draws on reset and redraws a step only when its status changes.
+            setupDeviceClass = nil
+            guideAwaitsDevice = true
+            updateDeviceCopy()
+            let controller = onboarding ?? makeOnboarding()
+            controller.resetForDeviceSetup()
+        }
+        showOnboarding()
+    }
 
     // System Settings → Menu Bar (macOS 26: the Control Center settings extension).
     private func openMenuBarSettings() {
@@ -1595,8 +1774,6 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         if let opened = RenderState.onOpenInterface { opened("setup"); return }
         #endif
         prepareInterface()
-        menuStatus?.closePanel()
-        settingsWindow?.orderOut(nil)
         NSApp.setActivationPolicy(.regular)
         let controller = onboarding ?? makeOnboarding()
         controller.setAccessibility(permissionsReady)
@@ -1608,7 +1785,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         // A pairing already running shows on its step, but never skips the Accessibility step.
         if setupWizard.isRunning, permissionsReady, controller.flow.step.rawValue < OnboardingStep.cable.rawValue {
             controller.jump(to: .cable)
-            controller.setupCode(lastSetupCode, final: false, ipados: nil)
+            controller.setupCode(lastSetupCode, final: false, ipados: nil, deviceClass: setupDeviceClass)
         }
         updateSetupPrompt(nil)
         controller.show()
@@ -1618,6 +1795,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
 
     private func makeOnboarding() -> OnboardingController {
         let controller = OnboardingController()
+        controller.setDeviceClass(pairedDeviceClass)
         controller.onRequestAccessibility = { [weak self] in self?.requestAccessibility() }
         controller.onStartSetup = { [weak self] in
             guard let self else { return }
@@ -1646,8 +1824,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             self?.relaunch()
         }
         controller.onFinish = {}
-        // Closing never cancels pairing. Until a device is paired, launch/Dock/status
-        // entry offers this guide again even if an earlier step was dismissed.
+        // Closing it any way (done, cable only, or early) never cancels a running pairing and never
+        // reopens it at the next launch; "Set Up iPad…" under More opens it again.
         controller.onClose = { [weak self, weak controller] in
             guard let self else { return }
             let dismissedAutomatic = self.usbSetupPolicy.closed(
@@ -1657,6 +1835,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
                 UserDefaults.standard.set(true, forKey: OnboardingPolicy.seenKey)
             }
             self.onboarding = nil
+            self.guideAwaitsDevice = false
+            self.updateDeviceCopy()
             if self.hasPairing && self.permissionsReady { self.autoEnableIfFirstRun() }
             self.refreshSettingsUI()
             self.refreshMenuStatus()
@@ -1666,30 +1846,80 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func forgetDevice() {
-        guard !uninstalling, !setupWizard.isRunning, let config = try? runtimeConfiguration() else { return }
+        guard !uninstalling else { return }
+        guard !setupWizard.isRunning, !hasActiveWork, let config = try? runtimeConfiguration(),
+              let script = Bundle.main.resourceURL?.appendingPathComponent("Backend/setup_device.py").path,
+              let primary = pairedDeviceClass else { return }
+        var kinds: [DeviceClass] = [primary]
+        if pairedDeviceClasses.count == 2 {
+            let choose = NSAlert()
+            choose.messageText = L("Forget which device?", "忘记哪一台？")
+            choose.informativeText = L("Forgetting one leaves the other paired.", "只忘一台时，另一台不受影响。")
+            choose.addButton(withTitle: "iPad"); choose.addButton(withTitle: "iPhone")
+            choose.addButton(withTitle: L("Forget Both", "都忘掉"))
+            choose.addButton(withTitle: L("Cancel", "取消"))
+            switch choose.runModal() {
+            case .alertFirstButtonReturn: kinds = [.iPad]
+            case .alertSecondButtonReturn: kinds = [.iPhone]
+            case .alertThirdButtonReturn: kinds = [.iPad, .iPhone]
+            default: return
+            }
+        }
         let alert = NSAlert()
-        alert.messageText = L("Forget this iPad?", "忘记这台 iPad？")
-        alert.informativeText = L("This removes pairing files from this Mac. You will need to pair again via USB. Trust settings on the iPad are unchanged.", "会删掉这台 Mac 上的配对文件，之后要用数据线重新配对。iPad 上的「信任」设置不变。")
-        alert.addButton(withTitle: L("Forget", "忘记"))
+        if kinds.count == 2 {
+            alert.messageText = L("Forget both devices?", "两台都忘掉？")
+            alert.informativeText = L("This removes the pairing files for the iPad and the iPhone from this Mac. You will need to pair again via USB. Trust settings on both devices are unchanged.",
+                                      "会删掉这台 Mac 上 iPad 和 iPhone 的配对文件，之后要用数据线重新配对。两台上的「信任」设置不变。")
+            alert.addButton(withTitle: L("Forget Both", "都忘掉"))
+        } else {
+            let kind = kinds[0]
+            alert.messageText = L("Forget this \(kind.displayName)?", "忘记这台 \(kind.displayName)？")
+            alert.informativeText = L("This removes its pairing files from this Mac. You will need to pair again via USB. Trust settings on the \(kind.displayName) are unchanged.",
+                                      "会删掉这台 Mac 上它的配对文件，之后要用数据线重新配对。\(kind.displayName) 上的「信任」设置不变。")
+            alert.addButton(withTitle: L("Forget", "忘记"))
+        }
         alert.addButton(withTitle: L("Cancel", "取消"))
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        if enabled || enableTask != nil {
-            startup.rememberEnabled(false)
-            stop(reason: L("iPad forgotten. Pair again before enabling shortcuts.", "已忘记这台 iPad。重新配对后再打开快捷键。"))
-            refreshStartupUI()
+        for kind in kinds {
+            captureWorkers[kind]?.stop()
+            deviceWakers[kind]?.setKeepAlive(false)
         }
-        captureWorker.stop()
-        let forgottenHash = pairedUSBSetupHashes()["iPad"]
-        for name in ["strict-remote-pairing.plist", "target.json"] {
-            try? fm.removeItem(atPath: config.state_dir + "/" + name)
+        forget(kinds, python: config.python, script: script, stateDirectory: config.state_dir)
+    }
+
+    /// Forgets the devices one after another (the wizard runs one process at a time),
+    /// then shows one status line for the whole request.
+    private func forget(_ kinds: [DeviceClass], python: String, script: String, stateDirectory: String) {
+        guard let kind = kinds.first else { return }
+        let forgottenHash = pairedUSBSetupHashes()[kind.rawValue]
+        setupWizard.run(python: python, script: script, action: "forget", stateDirectory: stateDirectory,
+                        deviceClass: kind) { [weak self] result in
+            guard let self else { return }
+            if result.code == "not_paired", let forgottenHash { self.usbSetupPolicy.forget(forgottenHash) }
+            let rest = Array(kinds.dropFirst())
+            if result.code == "not_paired", !rest.isEmpty {
+                self.forget(rest, python: python, script: script, stateDirectory: stateDirectory)
+                return
+            }
+            self.refreshPairedDevice()
+            if result.code == "not_paired" {
+                self.setupDeviceClass = nil
+                self.updateDeviceCopy()
+                self.onboarding?.setDeviceClass(self.pairedDeviceClass)
+                self.lastSetupCode = "forgotten"
+                self.setupAutoStarted = false
+                self.setupStatus?.stringValue = self.pairedDeviceClasses.isEmpty
+                    ? L("Forgotten. Plug in and unlock to pair again.", "已忘记。插线解锁就会重新配对。")
+                    : L("Forgot this \(kind.displayName).", "已忘记这台 \(kind.displayName)。")
+                if self.pairedDeviceClasses.isEmpty {
+                    self.startup.rememberEnabled(false)
+                    self.stop(reason: L("Device forgotten. Pair again before enabling shortcuts.", "已忘记这台设备。重新配对后再打开快捷键。"))
+                    UserDefaults.standard.removeObject(forKey: OnboardingPolicy.wirelessKey)
+                }
+            } else { self.setupStatus?.stringValue = SetupWizard.message(for: result) }
+            self.refreshMenuStatus()
+            self.rewarmWorker(after: 0)
         }
-        if !hasPairing, let forgottenHash { usbSetupPolicy.forget(forgottenHash) }
-        lastSetupCode = "forgotten"
-        UserDefaults.standard.removeObject(forKey: OnboardingPolicy.wirelessKey)
-        setupAutoStarted = false
-        setupStatus?.stringValue = L("Forgotten. Plug in and unlock to pair again.", "已忘记。插线解锁就会重新配对。")
-        refreshSettingsUI()
-        afterSettingsShown()
     }
 
     private func startCapture(_ request: HotkeyRequest) {
@@ -1698,7 +1928,6 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         iPadWaker.poke()
         captureAnimation.begin(requestID: request.id)
         updateTransferNotice()
-        diagnosticRequestStartedAt = request.startedAt
         // Every composer can lose the user's intent while capture/AX work runs.
         // Record navigation/edit interactions from before locating it until paste.
         newDraftInteraction.start()
@@ -1708,10 +1937,14 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         connectionReused = nil
         let kind: TargetKind = DualHotkeyCore.chord(of: request.id) == .options ? .chatGPT : .claude
         targetKind = kind
-        if captureRecord != nil { finishCaptureRecord(outcome: "unfinished") }
-        captureRecord = CaptureRecord(
-            startedAt: Date(timeIntervalSinceNow: request.startedAt - ProcessInfo.processInfo.systemUptime),
-            target: kind.rawValue)
+        if captureRecord == nil || diagnosticRequestStartedAt != request.startedAt {
+            if captureRecord != nil { finishCaptureRecord(outcome: "unfinished") }
+            captureRecord = CaptureRecord(
+                startedAt: Date(timeIntervalSinceNow: request.startedAt - ProcessInfo.processInfo.systemUptime),
+                target: kind.rawValue)
+            captureRecord?.deviceClass = selectedDeviceClass(requestID: request.id)?.rawValue
+        }
+        diagnosticRequestStartedAt = request.startedAt
         let config: TossConfiguration
         do { config = try configuration() } catch { captureSetupFailed(request, error); return }
         let queued = startingQueuedPress
@@ -1730,14 +1963,19 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
                 startEarlyCapture(request, config: config)
                 guard core.activeRequestID == request.id else { return }
                 try beginCapture(request, kind: kind, config: config, lease: targetFor(kind).locateLease())
-            } catch { captureSetupFailed(request, error) }
-            return
+                return
+            } catch TargetFailure.currentThreadUnavailable {
+                // The editor can be present before its focus-dependent current
+                // row is published. Continue through capture-only focus recovery.
+            } catch { captureSetupFailed(request, error); return }
         }
         // 0.7.1: another app (or Space, a minimized/hidden window) is in front.
         // Jump to the target's own focused window first; the lease checks below
         // are unchanged and still refuse anything they cannot prove.
         setStatus(L("Switching to \(kind.displayName)…", "正在切换到 \(kind.displayName)…"), code: "activating_target")
-        startEarlyCapture(request, config: config)
+        // A failed fast locate already owns this screenshot. Keep that request,
+        // including a second tap's device selection; never issue a replacement RPC.
+        if earlyCapture?.id != request.id { startEarlyCapture(request, config: config) }
         guard core.activeRequestID == request.id else { return }
         let task = Task { @MainActor [weak self] in
             do {
@@ -1796,11 +2034,13 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     // A worker still busy with an abandoned request is stopped, so this keypress gets a
     // fresh one; a request that belongs to a live keypress is never touched.
     private func releaseAbandonedCapture() {
-        if let abandoned = abandonedCaptureID, captureWorker.pendingRequestID == abandoned { captureWorker.stop() }
-        abandonedCaptureID = nil
+        let kind = activeDeviceClass
+        if let abandoned = abandonedCaptureIDs[kind], captureWorker.pendingRequestID == abandoned { captureWorker.stop() }
+        abandonedCaptureIDs.removeValue(forKey: kind)
     }
 
     private func startEarlyCapture(_ request: HotkeyRequest, config: TossConfiguration) {
+        guard let deviceClass = selectedDeviceClass(requestID: request.id) else { return }
         // Adopt the one result belonging to this press. Freshness is measured at receipt;
         // delayed UI delivery never authorizes a second screenshot.
         if let prefetch = queuedPrefetch, prefetch.pressedAt == request.startedAt {
@@ -1810,7 +2050,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             adoptedPrefetchArrivedAt = prefetch.arrivedAt
             let adopted = prefetch.capture
             earlyCapture = EarlyCapture(id: request.id, uuid: adopted.uuid, image: adopted.image,
-                result: adopted.result, receivedAt: adopted.receivedAt, queueFailureHandled: adopted.queueFailureHandled)
+                deviceClass: adopted.deviceClass, result: adopted.result, receivedAt: adopted.receivedAt, queueFailureHandled: adopted.queueFailureHandled)
             if let result = adopted.result,
                finishEarlyCaptureFailure(request, data: result.data, exitCode: result.exitCode) { return }
             refreshMenuStatus()
@@ -1823,24 +2063,14 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         discardQueuedPrefetch()
         releaseAbandonedCapture()
         let uuid = UUID().uuidString.lowercased()
-        let image = cache.appendingPathComponent("iPad-\(uuid).png")
+        let image = cache.appendingPathComponent(deviceClass.captureFilename(uuid: uuid))
         do {
             try captureWorker.capture(configuration: workerConfiguration(config),
                 requestID: uuid, file: image, timeout: 40) { [weak self] data, exitCode in
                     guard let self, !self.uninstalling else { return }
-                    if self.transaction?.id == request.id, self.transaction?.uuid == uuid {
-                        self.captureReturned(request, data: data, exitCode: exitCode)
-                    } else if self.earlyCapture?.id == request.id, self.earlyCapture?.uuid == uuid {
-                        if !self.finishEarlyCaptureFailure(request, data: data, exitCode: exitCode) {
-                            self.earlyCapture?.result = (data, exitCode)
-                        }
-                    } else {
-                        // A discarded early request (see discardEarlyCapture):
-                        // never used, its private file is removed on arrival.
-                        try? self.fm.removeItem(at: image)
-                    }
+                    self.deliverCaptureResult(request, uuid: uuid, image: image, data: data, exitCode: exitCode)
                 }
-            earlyCapture = EarlyCapture(id: request.id, uuid: uuid, image: image)
+            earlyCapture = EarlyCapture(id: request.id, uuid: uuid, image: image, deviceClass: deviceClass)
             refreshMenuStatus()
         } catch {
             // Worker busy/unavailable: beginCapture() requests it after locate.
@@ -1853,7 +2083,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         guard let early = earlyCapture else { return }
         earlyCapture = nil
         earlyTargetFailure = nil
-        abandonedCaptureID = early.uuid
+        abandonedCaptureIDs[early.deviceClass] = early.uuid
         // Speed (提速副本): an unanswered request no longer stops the worker.
         // Stopping it threw away the authenticated iPad connection, so the next
         // keypress paid a multi-second reconnect. The late receipt is ignored
@@ -1861,20 +2091,78 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         try? fm.removeItem(at: early.image)
     }
 
+    // Retain the original lease/activation task. Only the screenshot generation changes.
+    private func retargetCapture(_ request: HotkeyRequest) {
+        guard core.activeRequestID == request.id, transaction?.pastePosted != true,
+              transaction?.clipboard == nil, let config = try? configuration() else { return }
+        let previous = transaction
+        let targetFailure = earlyTargetFailure
+        if let previous {
+            abandonedCaptureIDs[previous.deviceClass] = previous.uuid
+            try? fm.removeItem(at: previous.image)
+            transaction = nil
+        }
+        discardEarlyCapture()
+        slowCaptureID = nil
+        backendTimings = [:]
+        connectionReused = nil
+        startEarlyCapture(request, config: config)
+        earlyTargetFailure = targetFailure
+        if earlyTargetFailure != nil { finishTargetlessCapture(); return }
+        if let previous {
+            do {
+                try beginCapture(request, kind: previous.kind, config: config, lease: previous.lease)
+                transaction?.destinationChanged = previous.destinationChanged
+            } catch { captureSetupFailed(request, error) }
+        }
+    }
+
+    // A fast speculative result (including a failure) cannot escape before selection closes.
+    // The UUID check also drops a late iPad result after the same request switched to iPhone.
+    private func deliverCaptureResult(_ request: HotkeyRequest, uuid: String, image: URL,
+                                      data: Data, exitCode: Int32) {
+        guard !uninstalling else { return }
+        guard core.activeRequestID == request.id,
+              (transaction?.id == request.id && transaction?.uuid == uuid) ||
+                (earlyCapture?.id == request.id && earlyCapture?.uuid == uuid) else {
+            try? fm.removeItem(at: image)
+            return
+        }
+        let delay = selectionDeadline(pressedAt: request.startedAt) - ProcessInfo.processInfo.systemUptime
+        if delay > 0 {
+            if earlyCapture?.uuid == uuid { earlyCapture?.result = (data, exitCode) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.deliverCaptureResult(request, uuid: uuid, image: image, data: data, exitCode: exitCode)
+            }
+            return
+        }
+        if transaction?.uuid == uuid {
+            guard transaction?.receipt == nil else { return }
+            captureReturned(request, data: data, exitCode: exitCode)
+        } else if !finishEarlyCaptureFailure(request, data: data, exitCode: exitCode) {
+            earlyCapture?.result = (data, exitCode)
+        }
+    }
+
     // Right after activation (or a Space switch) the web view may still be
     // publishing its window/AX tree. Only these not-yet-visible failures are
     // re-read, briefly; a found composer or chat is never second-guessed.
     private func locateAfterActivation(_ kind: TargetKind, queued: Bool = false) async throws -> any ChatLease {
         var settling: Set<TargetFailure> = [.windowUnavailable, .windowsAmbiguous, .treeUnavailable,
-            .webAreaUnavailable, .composerUnavailable, .composersAmbiguous, .conversationUnavailable,
-            .currentThreadUnavailable]
+            .webAreaUnavailable, .composerUnavailable, .composersAmbiguous, .conversationUnavailable]
         // A queued press: the previous paste may still hold a short-lived dialog layer; wait up to
         // ~1.2 s for it. A dialog that stays is still refused (nothing is pasted under it).
         if queued { settling.insert(.modalPresent) }
         let attempts = QueuedDestinationPolicy.locateAttempts(queued: queued)
         var attempt = 0
         while true {
-            do { return try targetFor(kind).locateLease() }
+            do {
+                return try await targetFor(kind).locateForCaptureLease(shouldContinue: { [weak self] pid in
+                    guard let self else { return false }
+                    return self.enabled && self.newDraftInteraction.isObserving &&
+                        !self.newDraftInteraction.interventionPIDs.contains(pid)
+                })
+            }
             catch let error as TargetFailure where attempt < attempts && settling.contains(error) {
                 attempt += 1
                 try await Task.sleep(nanoseconds: 120_000_000)
@@ -1899,7 +2187,9 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
 
     private func beginCapture(_ request: HotkeyRequest, kind: TargetKind, config: TossConfiguration,
                               lease: any ChatLease) throws {
-        setStatus(L("Chat verified. Preparing to capture your iPad…", "聊天确认好了，准备截取 iPad…"), code: "target_located")
+        guard let deviceClass = selectedDeviceClass(requestID: request.id) else { throw TossError.configuration }
+        DeviceCopy.deviceClass = deviceClass.rawValue
+        setStatus(L("Chat verified. Preparing to capture your \(deviceEN)…", "聊天确认好了，准备截取 \(deviceZH)…"), code: "target_located")
         let bound = queuedBindings.removeValue(forKey: request.startedAt)
         let destinationChanged = deliveryBindingMissing || QueuedDestinationPolicy.outcome(bound: bound != nil,
             sameDestination: bound?.sameDestination(as: lease) ?? false) == .manualPaste
@@ -1907,35 +2197,41 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         adoptedPrefetchArrivedAt = nil
         if let early = earlyCapture, early.id == request.id {
             earlyCapture = nil
-            transaction = Transaction(id: request.id, uuid: early.uuid, lease: lease, kind: kind, image: early.image)
+            transaction = Transaction(id: request.id, uuid: early.uuid, lease: lease, kind: kind,
+                                      image: early.image, deviceClass: early.deviceClass)
             transaction?.destinationChanged = destinationChanged
             transaction?.receivedAt = early.receivedAt
             startEarlyFocus(request.id, kind: kind, lease: lease)
             showCaptureStatus(requestID: early.uuid)
-            if let result = early.result { captureReturned(request, data: result.data, exitCode: result.exitCode) }
+            if let result = early.result {
+                deliverCaptureResult(request, uuid: early.uuid, image: early.image, data: result.data, exitCode: result.exitCode)
+            }
             return
         }
         guard capturePipeline.delivering == nil else { throw TossError.captureFailed }
         let uuid = UUID().uuidString.lowercased()
-        let image = cache.appendingPathComponent("iPad-\(uuid).png")
-        transaction = Transaction(id: request.id, uuid: uuid, lease: lease, kind: kind, image: image)
+        let image = cache.appendingPathComponent(deviceClass.captureFilename(uuid: uuid))
+        transaction = Transaction(id: request.id, uuid: uuid, lease: lease, kind: kind,
+                                  image: image, deviceClass: deviceClass)
         transaction?.destinationChanged = destinationChanged
         startEarlyFocus(request.id, kind: kind, lease: lease)
         releaseAbandonedCapture()
         try captureWorker.capture(configuration: workerConfiguration(config),
             requestID: uuid, file: image, timeout: 40) { [weak self] data, exitCode in
                 guard let self else { return }
-                guard self.transaction?.id == request.id else { return }
-                self.captureReturned(request, data: data, exitCode: exitCode)
+                guard self.transaction?.id == request.id, self.transaction?.uuid == uuid else {
+                    try? self.fm.removeItem(at: image); return
+                }
+                self.deliverCaptureResult(request, uuid: uuid, image: image, data: data, exitCode: exitCode)
             }
         showCaptureStatus(requestID: uuid)
     }
 
     private func showCaptureStatus(requestID: String) {
         if slowCaptureID == requestID {
-            setStatus(L("Screenshot is taking longer. Still waiting for your iPad…", "截图比平时慢，还在等 iPad…"), code: "capture_slow")
+            setStatus(L("Screenshot is taking longer. Still waiting for your \(deviceEN)…", "截图比平时慢，还在等 \(deviceZH)…"), code: "capture_slow")
         } else {
-            setStatus(L("Capturing a new iPad screenshot…", "正在截取 iPad 屏幕…"), code: "capturing")
+            setStatus(L("Capturing a new \(deviceEN) screenshot…", "正在截取 \(deviceZH) 屏幕…"), code: "capturing")
         }
     }
 
@@ -1975,12 +2271,17 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
 
     private func finishTargetlessCapture() {
         guard let failed = earlyTargetFailure, let early = earlyCapture, let result = early.result else { return }
+        let delay = selectionDeadline(pressedAt: failed.request.startedAt) - ProcessInfo.processInfo.systemUptime
+        if delay > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.finishTargetlessCapture() }
+            return
+        }
         earlyTargetFailure = nil
         recordCaptureReceipt(result.data)
         do {
             _ = try CaptureReceipt.validate(json: result.data, exitCode: result.exitCode,
                 requestID: early.uuid, triggeredAt: failed.request.startedAt,
-                now: early.receivedAt ?? ProcessInfo.processInfo.systemUptime, file: early.image)
+                now: early.receivedAt ?? ProcessInfo.processInfo.systemUptime, file: early.image, deviceClass: early.deviceClass)
             let clipboard = try ClipboardTransaction.continuing(inheritedClipboard)
             try clipboard.publish(file: early.image)
             try clipboard.validate()
@@ -1996,12 +2297,13 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func workerConfiguration(_ config: TossConfiguration) throws -> CaptureWorker.Configuration {
+    private func workerConfiguration(_ config: TossConfiguration, deviceClass: DeviceClass? = nil) throws -> CaptureWorker.Configuration {
         guard !runtimeQuarantined else { throw TossError.backendUnavailable }
         guard let backend = Bundle.main.resourceURL?.appendingPathComponent("Backend/capture_service.py"),
               fm.fileExists(atPath: backend.path) else { throw TossError.backendUnavailable }
         return .init(python: config.python, script: backend.path,
-                     stateDirectory: config.state_dir, outputDirectory: cache.path)
+                     stateDirectory: config.state_dir, outputDirectory: cache.path,
+                     deviceClass: (deviceClass ?? activeDeviceClass).rawValue)
     }
 
     private func recordCaptureReceipt(_ data: Data) {
@@ -2024,6 +2326,10 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             }
             connectionReused = object["connection_reused"] as? Bool
             captureRecord?.takeImage(from: object)
+            // The worker that answered, so a double press is not recorded under its first device.
+            if let device = (object["device_class"] as? String).flatMap(DeviceClass.init(rawValue:)) {
+                captureRecord?.deviceClass = device.rawValue
+            }
         }
     }
 
@@ -2037,6 +2343,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     // without waiting for a chat lease (or allowing that late lease to restart the press).
     @discardableResult
     private func finishEarlyCaptureFailure(_ request: HotkeyRequest, data: Data, exitCode: Int32) -> Bool {
+        guard ProcessInfo.processInfo.systemUptime >= selectionDeadline(pressedAt: request.startedAt) else { return false }
         guard let early = earlyCapture, early.id == request.id,
               let reason = CaptureCompletionPolicy.failureBeforeTarget(
                 CaptureCompletionPolicy.classify(data, exitCode: exitCode, requestID: early.uuid),
@@ -2058,7 +2365,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             recordCaptureReceipt(data)
             transaction?.receipt = try CaptureReceipt.validate(json: data, exitCode: exitCode,
                 requestID: tx.uuid, triggeredAt: request.startedAt,
-                now: tx.receivedAt ?? ProcessInfo.processInfo.systemUptime, file: tx.image)
+                now: tx.receivedAt ?? ProcessInfo.processInfo.systemUptime, file: tx.image, deviceClass: tx.deviceClass)
             setStatus(L("Screenshot received. Rechecking the current chat…", "截图收到了，再确认一下当前聊天…"), code: "revalidating_capture")
             // 0.7.1: no full tree read here. The full lease (window, chat, draft,
             // attachments, focus) is validated once more right before the sole
@@ -2239,29 +2546,37 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
                 self.transaction?.pasteConsumptionConfirmed = true
                 self.sighter.cancel()
                 let prePasteTiles = self.prePaste?.tiles ?? []
-                // Follow the new tile for 600 ms: it may still grow (Claude 160 -> 173 pt). The copy
-                // grows with it at once; the settled frame and the growth are learned for next time.
+                let chatCard = tx.kind == .chatGPT ? self.chatGPTTarget.latestConfirmedChatCard : nil
+                let followsChatCard = chatCard != nil
+                // Chat can shift the existing tile during the whole landing.
+                // Other layouts keep the short, size-only growth probe.
                 if let confirmedTile = chatTarget.latestConfirmedAttachmentFrame {
                     let id = tx.id, claude = tx.kind == .claude, app = claude ? "claude" : "codex"
                     let before = self.prePaste, first = self.firstTileRaw ?? confirmedTile
-                    let source = self.slotMemory?.finalWidth == nil ? "observed" : "memory"
+                    let source = followsChatCard ? "chat-card" : (self.slotMemory?.finalWidth == nil ? "observed" : "memory")
                     // Codex tiles never grow; a Claude card ends at its remembered size (unknown: no early release).
                     let expectedFinal: CGSize? = claude
                         ? AttachmentSighting.loadMemory(app).flatMap { m in m.finalWidth.flatMap { w in m.finalHeight.map { CGSize(width: w, height: $0) } } }
                         : confirmedTile.size
                     self.landingSettle.begin(id)
                     self.grower.follow(composer: tx.lease.composerElement, filename: tx.image.lastPathComponent,
-                                       from: confirmedTile, expectedFinal: expectedFinal) { rect in
+                                       from: confirmedTile, duration: followsChatCard ? CaptureCardTiming.landingTotal + 0.1 : 0.6,
+                                       expectedFinal: expectedFinal, trackingCard: chatCard) { rect in
                         DispatchQueue.main.async { [weak self] in
                             guard let self else { return }
-                            self.captureAnimation.grow(requestID: id, toAX: self.landingFrame(rect, claude: claude, tiles: prePasteTiles))
+                            if followsChatCard { self.captureAnimation.followConfirmedChatCard(requestID: id, frameAX: rect) }
+                            else { self.captureAnimation.grow(requestID: id, toAX: self.landingFrame(rect, claude: claude, tiles: prePasteTiles)) }
                         }
                     } settled: {
                         DispatchQueue.main.async { [weak self] in self?.landingSettle.settle(id) }
+                    } lost: {
+                        DispatchQueue.main.async { [weak self] in
+                            self?.captureAnimation.followConfirmedChatCard(requestID: id, frameAX: nil)
+                        }
                     } done: { final, settledAt in
                         DispatchQueue.main.async { [weak self] in
                             guard let self else { return }
-                            if let before, let learned = AttachmentSighting.learn(AttachmentSighting.loadMemory(app),
+                            if !followsChatCard, let before, let learned = AttachmentSighting.learn(AttachmentSighting.loadMemory(app),
                                     composer: before.composer, tiles: before.tiles, confirmed: final, first: first) {
                                 AttachmentSighting.saveMemory(learned, app: app)
                             }
@@ -2270,6 +2585,10 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
                                 first.width, first.height, final.width, final.height,
                                 g.map { String(format: "left%.2f/down%.2f", $0.left, $0.down) } ?? "none",
                                 settledAt * 1000, source)
+                            if followsChatCard {
+                                self.growthNote += String(format: "; moved=%.0fx%.0f",
+                                    abs(final.minX - confirmedTile.minX), abs(final.minY - confirmedTile.minY))
+                            }
                         }
                     }
                 }
@@ -2289,7 +2608,9 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
                 let result = ToastContent.success(target: tx.kind)
                 let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
                 self.captureAnimation.confirmed(requestID: tx.id,
-                    destinationAXFrame: chatTarget.latestConfirmedAttachmentFrame.map { self.landingFrame($0, claude: tx.kind == .claude, tiles: prePasteTiles) },
+                    destinationAXFrame: chatTarget.latestConfirmedAttachmentFrame.map {
+                        followsChatCard ? $0 : self.landingFrame($0, claude: tx.kind == .claude, tiles: prePasteTiles)
+                    },
                     targetPID: tx.lease.pid,
                     look: CaptureTileLook.forTarget(claude: tx.kind == .claude, darkAppearance: dark),
                     title: result.title,
@@ -2501,8 +2822,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             // Stopping the worker drops the queued press's in-flight screenshot without an
             // answer; forget it so that press captures afresh instead of waiting for it.
             if let prefetch = queuedPrefetch, prefetch.capture.result == nil {
-                queuedPrefetch = nil
-                try? fm.removeItem(at: prefetch.capture.image)
+                discardQueuedPrefetch()
             }
             captureWorker.stop()
             rewarmWorker(after: 0.5)
@@ -2531,7 +2851,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         slowCaptureID = nil
         ignoreKeyboardEventsThrough = ProcessInfo.processInfo.systemUptime
         _ = core.reset(keepQueue: true)
-        if core.queuedCount == 0 { burstLeases.removeAll() } // the burst is over
+        if !capturePipeline.isBusy { burstLeases.removeAll() } // the burst is over
         // A fresh HID baseline can arm only if Options are actually released.
         // Held/busy chords still require their subsequent complete release.
         _ = core.observe(KeyMonitor.modifiers(), at: ignoreKeyboardEventsThrough, allowNewCapture: false)
@@ -2549,6 +2869,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         guard enabled, !manualDeliveryPaused, transaction == nil, activationTask == nil, !core.isBusy else { return }
         if let delivered = capturePipeline.delivering {
             queuedBindings.removeValue(forKey: delivered.at)
+            pipelineCaptures.removeValue(forKey: delivered.id)
             if let uuid = deliveryCaptureID {
                 slowPipelineIDs.remove(uuid); pipelineProgress.removeValue(forKey: uuid)
             }
@@ -2558,6 +2879,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         pumpCaptures()
         // Held keys only postpone Cmd+V, never activation or locating the chat.
         guard let press = capturePipeline.takeForTargeting(), let saved = pipelineCaptures.removeValue(forKey: press.id) else {
+            if !capturePipeline.isBusy { burstLeases.removeAll() }
             updateTransferNotice()
             refreshMenuStatus()
             writeLastRun()
@@ -2577,12 +2899,138 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
 
     private func prefetchQueuedScreenshot() { pumpCaptures() }
 
-    private func admitCapture(_ chord: HotkeyChord, at: Double) {
+    private func selectionDeadline(pressedAt: Double) -> Double {
+        max(deviceGesture.selectionDeadline(pressedAt: pressedAt), core.selectionDeadline(pressedAt: pressedAt))
+    }
+
+    private func selectCapture(_ chord: HotkeyChord, at: Double) {
+        guard let primary = singlePressDevice else { return }
+        switch deviceGesture.observe(chord, at: at, primary: primary, dual: pairedDeviceClasses.count == 2) {
+        case .capture(let chord, let at, let deviceClass):
+            deferredDeviceSelection = nil
+            if !admitCapture(chord, at: at, deviceClass: deviceClass), pairedDeviceClasses.count == 2 {
+                // A full lane must not prevent the second tap from selecting the
+                // other device's independent lane. This is intent only, not a queue slot.
+                let kind: TargetKind = chord == .options ? .chatGPT : .claude
+                deferredDeviceSelection = (chord, at, try? targetFor(kind).locateLease())
+            }
+        case .retarget(let at): retargetPipelineCapture(at: at)
+        case .consumed: break
+        }
+    }
+
+    // A black screenshot means that device is off: hand the press to the other one, once, if it is connected.
+    private func fallBackFromBlackFrame(_ press: DeviceCapturePipeline.Press, uuid: String, data: Data, exit: Int32) -> Bool {
+        let other = press.deviceClass.other
+        blackFramePresses = blackFramePresses.filter { press.at - $0 < 60 }
+        guard pairedDeviceClasses.count == 2,
+              captureFailureReason(data, exitCode: exit, requestID: uuid) == "black_frame_rejected",
+              captureWorkers[other]?.connectionStatus.state == .ready,
+              captureWorkers[other]?.deviceLocked != true,
+              !(capturePipeline.delivering?.id == press.id && (transaction?.pastePosted == true || transaction?.clipboard != nil)),
+              blackFramePresses.insert(press.at).inserted else { return false }
+        pipelineProgress.removeValue(forKey: uuid); slowPipelineIDs.remove(uuid)
+        retargetPipelineCapture(at: press.at, to: other)
+        return true
+    }
+
+    // USB data dropped: wait out a brief re-attach, then ask the device over Wi-Fi whether it still has power.
+    private func checkUSBDrop(_ kind: DeviceClass) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, !self.uninstalling, !self.setupWizard.isRunning,
+                  self.captureWorkers[kind]?.usbConnected == false,
+                  !self.usbDropChecks.contains(kind),
+                  let config = try? self.configuration(),
+                  let script = Bundle.main.resourceURL?.appendingPathComponent("Backend/usb_power_check.py").path else { return }
+            self.usbDropChecks.insert(kind)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: config.python)
+            process.arguments = ["-B", script, "--state-dir", config.state_dir, "--device-class", kind.rawValue]
+            process.environment = CaptureWorkerProcess.backendEnvironment
+            let output = Pipe()
+            process.standardOutput = output
+            process.standardError = FileHandle.nullDevice
+            // The helper bounds itself and exits on its own watchdog; this is the outer limit.
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                var powered: Bool?
+                if (try? process.run()) != nil {
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 20) { if process.isRunning { process.terminate() } }
+                    let data = output.fileHandleForReading.readDataToEndOfFile()
+                    process.waitUntilExit()
+                    let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                    powered = object?["external_connected"] as? Bool
+                }
+                let reading = powered
+                DispatchQueue.main.async {
+                    self?.usbDropChecks.remove(kind)
+                    self?.finishUSBDropCheck(kind, powered: reading)
+                }
+            }
+        }
+    }
+
+    private func finishUSBDropCheck(_ kind: DeviceClass, powered: Bool?) {
+        guard !uninstalling, usbDropNotice.shouldShow(kind, externalConnected: powered,
+            usbBack: captureWorkers[kind]?.usbConnected == true, at: ProcessInfo.processInfo.systemUptime) else { return }
+        let name = kind.rawValue
+        let title = L("\(name) USB dropped\nReplug; resume charging if paused", "\(name) 的 USB 断了\n重插一下；暂停充电的话先恢复")
+        captureAnimation.showTransferNotice(title)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.updateTransferNotice() }
+    }
+
+    private func retargetPipelineCapture(at: Double, to device: DeviceClass? = nil) {
+        guard let old = capturePipeline.press(at: at) else {
+            if let selection = deferredDeviceSelection, selection.at == at {
+                deferredDeviceSelection = nil
+                admitCapture(selection.chord, at: at, deviceClass: doublePressDevice, binding: selection.lease, bindingCaptured: true)
+            }
+            return
+        }
+        let target = device ?? doublePressDevice
+        guard old.deviceClass != target else { return }
+        let wasDelivering = capturePipeline.delivering?.id == old.id
+        if wasDelivering, transaction?.pastePosted == true || transaction?.clipboard != nil { return }
+        if let saved = pipelineCaptures.removeValue(forKey: old.id) {
+            try? fm.removeItem(at: saved.image)
+            slowPipelineIDs.remove(saved.uuid); pipelineProgress.removeValue(forKey: saved.uuid)
+        }
+        _ = capturePipeline.remove(at: at)
+        guard let next = capturePipeline.admit(old.chord, at: at, deviceClass: target, queued: old.queued) else {
+            queuedBindings.removeValue(forKey: at)
+            if wasDelivering {
+                cancelActivation()
+                if let tx = transaction { try? fm.removeItem(at: tx.image); captureAnimation.cancel(requestID: tx.id) }
+                transaction = nil; prefetchRequest = nil; queuedPrefetch = nil; deliveryCaptureID = nil
+                _ = core.reset(keepQueue: true)
+            }
+            captureAnimation.showTransferNotice(L("Busy — try again shortly", "忙着传图，请稍后再试"))
+            startQueuedPress()
+            return
+        }
+        if wasDelivering, capturePipeline.reserveForTargeting(next.id),
+           let request = core.recaptureDelivery(at: ProcessInfo.processInfo.systemUptime) {
+            // Keep the original lease/activation; only the screenshot UUID/device changes.
+            let uuid = UUID().uuidString.lowercased()
+            let image = cache.appendingPathComponent(next.deviceClass.captureFilename(uuid: uuid))
+            let saved = EarlyCapture(id: next.id, uuid: uuid, image: image, deviceClass: next.deviceClass)
+            pipelineCaptures[next.id] = saved
+            deliveryCaptureID = uuid
+            queuedPrefetch = (saved, at, nil)
+            retargetCapture(request)
+        }
+        pumpCaptures()
+        startQueuedPress(waited: 1)
+        updateTransferNotice()
+    }
+
+    @discardableResult
+    private func admitCapture(_ chord: HotkeyChord, at: Double, deviceClass: DeviceClass,
+                              binding: (any ChatLease)? = nil, bindingCaptured: Bool = false) -> Bool {
         if manualDeliveryPaused { manualDeliveryPaused = false; startQueuedPress() }
-        guard let press = capturePipeline.admit(chord, at: at) else {
+        guard let press = capturePipeline.admit(chord, at: at, deviceClass: deviceClass) else {
             menuStatus?.nudge()
             captureAnimation.showTransferNotice(L("Busy — try again shortly", "忙着传图，请稍后再试"))
-            return
+            return false
         }
         if capturePipeline.running.count + capturePipeline.waitingCount > 1 { busyRepeatsTotal += 1 }
         pumpCaptures()
@@ -2590,80 +3038,112 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         // activate/locate path immediately, including when its app is in the back.
         if press.queued {
             let kind: TargetKind = chord == .options ? .chatGPT : .claude
-            if let lease = try? targetFor(kind).locateLease() { queuedBindings[press.at] = lease }
+            if bindingCaptured { queuedBindings[press.at] = binding }
+            else if let lease = try? targetFor(kind).locateLease() { queuedBindings[press.at] = lease }
         }
         startQueuedPress(waited: 1)
         updateTransferNotice()
+        return true
     }
 
     private func pumpCaptures() {
-        guard enabled, !captureWorker.isBusy else { return }
-        for (slot, press) in capturePipeline.startAvailable() {
-            let uuid = UUID().uuidString.lowercased()
-            let file = cache.appendingPathComponent("iPad-\(uuid).png")
-            pipelineCaptures[press.id] = EarlyCapture(id: press.id, uuid: uuid, image: file)
-            DispatchQueue.main.asyncAfter(deadline: .now() + CaptureProgressPolicy.noticeDelay) { [weak self] in
-                guard let self, self.pipelineCaptures[press.id]?.uuid == uuid ||
-                    (self.deliveryCaptureID == uuid && self.core.isBusy) else { return }
-                self.slowPipelineIDs.insert(uuid)
-                self.updateTransferNotice()
-            }
-            let worker = captureWorker
-            do {
-                let config = try configuration()
-                try worker.capture(configuration: workerConfiguration(config), requestID: uuid, file: file) {
-                    [weak self] data, exit in
-                    guard let self else { try? FileManager.default.removeItem(at: file); return }
-                    guard !self.uninstalling else { return }
-                    // The standby route failed for a non-timeout reason: retry on the first route.
-                    if ParallelCaptureFallbackPolicy.retryOnFirstRoute(slot: slot,
-                           reason: self.captureFailureReason(data, exitCode: exit, requestID: uuid)),
-                       self.capturePipeline.deferredToFirstRoute(press.id, slot: slot) {
-                        try? FileManager.default.removeItem(at: file)
-                        self.pipelineCaptures.removeValue(forKey: press.id)
-                        self.pipelineProgress.removeValue(forKey: uuid)
-                        self.slowPipelineIDs.remove(uuid)
+        guard enabled else { return }
+        let busy = Set(captureWorkers.filter { $0.value.isBusy }.map { $0.key })
+        for (_, press) in capturePipeline.startAvailable(excluding: busy) {
+            let uuid = pipelineCaptures[press.id]?.uuid ?? UUID().uuidString.lowercased()
+            let file = cache.appendingPathComponent(press.deviceClass.captureFilename(uuid: uuid))
+            pipelineCaptures[press.id] = EarlyCapture(id: press.id, uuid: uuid, image: file, deviceClass: press.deviceClass)
+            if capturePipeline.delivering?.id == press.id { pipelineCaptures.removeValue(forKey: press.id) }
+
+            // A second tap can still change the device. For a known blocked
+            // press, wait for that choice before trying to start a transfer.
+            let delay = selectionDeadline(pressedAt: press.at) - ProcessInfo.processInfo.systemUptime
+            if delay > 0, lockedAlternate(for: press.deviceClass) != nil {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self, self.capturePipeline.running[press.deviceClass]?.id == press.id else { return }
+                    guard self.pipelineCaptures[press.id]?.uuid == uuid ||
+                        (self.deliveryCaptureID == uuid && self.core.isBusy) else {
+                        self.capturePipeline.remove(at: press.at)
                         self.pumpCaptures()
+                        self.startQueuedPress()
                         return
                     }
-                    guard self.capturePipeline.completed(press.id, slot: slot) else {
-                        try? FileManager.default.removeItem(at: file); return
-                    }
-                    self.receivePipelineCapture(press, uuid: uuid, data: data, exit: exit)
-                    if exit == 0, let progress = self.pipelineProgress[uuid], progress.expected > 0 {
-                        self.pipelineProgress[uuid] = (progress.expected, progress.expected)
-                    }
-                    if let reason = self.captureFailureReason(data, exitCode: exit, requestID: uuid),
-                       CaptureQueueFailurePolicy.affectsQueuedPresses(reason),
-                       self.captureWorker.connectionStatus.state == .failed {
-                        for dropped in self.capturePipeline.disconnected() { self.queuedBindings.removeValue(forKey: dropped.at) }
-                    }
-                    self.pumpCaptures()
-                    self.startQueuedPress()
+                    self.startPipelineCapture(press, uuid: uuid, file: file)
                 }
-            } catch {
-                let data = (try? JSONSerialization.data(withJSONObject: ["schema_version": 1,
-                    "request_id": uuid, "ok": false, "reason": "worker_failed"])) ?? Data()
-                pipelineCaptures[press.id]?.result = (data, 1)
-                _ = capturePipeline.completed(press.id, slot: slot)
-                DispatchQueue.main.async { [weak self] in self?.pumpCaptures(); self?.startQueuedPress() }
+            } else {
+                startPipelineCapture(press, uuid: uuid, file: file)
             }
         }
         updateTransferNotice()
     }
 
-    private func receivePipelineCapture(_ press: CapturePipeline.Press, uuid: String, data: Data, exit: Int32) {
+    private func startPipelineCapture(_ press: DeviceCapturePipeline.Press, uuid: String, file: URL) {
+        let slot = press.deviceClass
+        guard enabled, !uninstalling, capturePipeline.running[slot]?.id == press.id else { return }
+        func finishWithoutTransfer(reason: String) {
+            let data = (try? JSONSerialization.data(withJSONObject: ["schema_version": 1,
+                "request_id": uuid, "ok": false, "reason": reason, "device_class": slot.rawValue])) ?? Data()
+            _ = capturePipeline.completed(press.id, slot: slot)
+            receivePipelineCapture(press, uuid: uuid, data: data, exit: 1)
+            DispatchQueue.main.async { [weak self] in self?.pumpCaptures(); self?.startQueuedPress() }
+        }
+        // Re-read the connection and lock state after the selection window.
+        if lockedAlternate(for: slot) != nil {
+            finishWithoutTransfer(reason: "alternate_device_locked")
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + CaptureProgressPolicy.noticeDelay) { [weak self] in
+            guard let self, self.pipelineCaptures[press.id]?.uuid == uuid ||
+                (self.deliveryCaptureID == uuid && self.core.isBusy) else { return }
+            self.slowPipelineIDs.insert(uuid)
+            self.updateTransferNotice()
+        }
+        let worker = captureWorkers[slot]!
+        do {
+            let config = try configuration()
+            try worker.capture(configuration: workerConfiguration(config, deviceClass: slot), requestID: uuid, file: file) {
+                [weak self] data, exit in
+                guard let self else { try? FileManager.default.removeItem(at: file); return }
+                guard !self.uninstalling else { return }
+                guard self.capturePipeline.completed(press.id, slot: slot) else {
+                    try? FileManager.default.removeItem(at: file)
+                    self.pipelineProgress.removeValue(forKey: uuid); self.slowPipelineIDs.remove(uuid)
+                    self.pumpCaptures(); self.startQueuedPress()
+                    return
+                }
+                if self.fallBackFromBlackFrame(press, uuid: uuid, data: data, exit: exit) {
+                    try? FileManager.default.removeItem(at: file)
+                    return
+                }
+                self.receivePipelineCapture(press, uuid: uuid, data: data, exit: exit)
+                if exit == 0, let progress = self.pipelineProgress[uuid], progress.expected > 0 {
+                    self.pipelineProgress[uuid] = (progress.expected, progress.expected)
+                }
+                if let reason = self.captureFailureReason(data, exitCode: exit, requestID: uuid),
+                   CaptureQueueFailurePolicy.affectsQueuedPresses(reason),
+                   worker.connectionStatus.state == .failed {
+                    for dropped in self.capturePipeline.disconnected(deviceClass: slot) { self.queuedBindings.removeValue(forKey: dropped.at) }
+                }
+                self.pumpCaptures()
+                self.startQueuedPress()
+            }
+        } catch {
+            finishWithoutTransfer(reason: "worker_failed")
+        }
+    }
+
+    private func receivePipelineCapture(_ press: DeviceCapturePipeline.Press, uuid: String, data: Data, exit: Int32) {
         guard !uninstalling else { return }
         let arrived = ProcessInfo.processInfo.systemUptime
         if deliveryCaptureID == uuid, let request = prefetchRequest {
             if transaction?.uuid == uuid {
                 transaction?.receivedAt = arrived
-                captureReturned(request, data: data, exitCode: exit)
+                deliverCaptureResult(request, uuid: uuid, image: transaction!.image, data: data, exitCode: exit)
             } else if earlyCapture?.uuid == uuid {
                 earlyCapture?.result = (data, exit)
                 earlyCapture?.receivedAt = arrived
                 if earlyTargetFailure != nil { finishTargetlessCapture() }
-                else { _ = finishEarlyCaptureFailure(request, data: data, exitCode: exit) }
+                else { deliverCaptureResult(request, uuid: uuid, image: earlyCapture!.image, data: data, exitCode: exit) }
             }
         } else {
             pipelineCaptures[press.id]?.result = (data, exit)
@@ -2677,7 +3157,10 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         for saved in pipelineCaptures.values { try? fm.removeItem(at: saved.image) }
         pipelineCaptures.removeAll(); pipelineProgress.removeAll(); slowPipelineIDs.removeAll()
         deliveryCaptureID = nil; queuedBindings.removeAll()
-        captureWorker.stop()
+        stopWorkers()
+        deviceGesture.reset()
+        deferredDeviceSelection = nil
+        blackFramePresses.removeAll()
         captureAnimation.hideTransferNotice()
     }
 
@@ -2700,17 +3183,20 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
 
     // Only a complete, valid image survives a link-wide failure. A pending request is
     // retired, not turned into a new 4.5-second request when its turn arrives.
-    private func endUncapturedQueuedPresses(after reason: String, reportingFailureAt: Double? = nil) {
+    private func endUncapturedQueuedPresses(after reason: String, reportingFailureAt: Double? = nil,
+                                           deviceClass: DeviceClass? = nil) {
         guard CaptureQueueFailurePolicy.affectsQueuedPresses(reason) else { return }
         var capturedAt: Double?
         if let prefetch = queuedPrefetch, let result = prefetch.capture.result,
            (try? CaptureReceipt.validate(json: result.data, exitCode: result.exitCode,
                 requestID: prefetch.capture.uuid, triggeredAt: prefetch.pressedAt,
-                now: ProcessInfo.processInfo.systemUptime, file: prefetch.capture.image)) != nil {
+                now: ProcessInfo.processInfo.systemUptime, file: prefetch.capture.image,
+                deviceClass: prefetch.capture.deviceClass)) != nil {
             capturedAt = prefetch.pressedAt
         }
         core.discardUncapturedQueuedPresses(after: reason, capturedAt: capturedAt,
-                                            reportingFailureAt: reportingFailureAt)
+            reportingFailureAt: reportingFailureAt,
+            secondaryDevice: pairedDeviceClasses.count == 2 && (deviceClass ?? activeDeviceClass) == .iPhone)
         if let prefetch = queuedPrefetch, !core.queue.contains(where: { $0.at == prefetch.pressedAt }) {
             discardQueuedPrefetch()
             releaseAbandonedCapture()
@@ -2721,7 +3207,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         guard let prefetch = queuedPrefetch else { return }
         queuedPrefetch = nil
         if prefetch.capture.result != nil { try? fm.removeItem(at: prefetch.capture.image) }
-        else { abandonedCaptureID = prefetch.capture.uuid } // removed on arrival; worker released below
+        else { abandonedCaptureIDs[prefetch.capture.deviceClass] = prefetch.capture.uuid } // removed on arrival; worker released below
     }
 
     private func stop(reason: String) {
@@ -2729,10 +3215,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         enableGeneration &+= 1
         enableTask?.cancel(); enableTask = nil
         enabled = false
-        capturePipeline.reset()
-        pipelineCaptures.values.forEach { try? fm.removeItem(at: $0.image) }
-        pipelineCaptures.removeAll(); slowPipelineIDs.removeAll(); pipelineProgress.removeAll()
-        deliveryCaptureID = nil
+        cancelPendingCaptures()
         chordDetector = CaptureChordDetector()
         enableFailureReason = nil
         timer?.invalidate(); timer = nil
@@ -2743,6 +3226,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         queuedBindings.removeAll()
         burstLeases.removeAll()
         cleanup(cancelProcess: true)
+        stopWorkers()
+        deviceWakers.values.forEach { $0.setKeepAlive(false) }
         // Quit/disable: put back what the user had copied. These snapshots exist only in memory.
         if let pending = pendingClipboard { pending.clipboard.restoreIfStillOwned(); pendingClipboard = nil }
         inheritedClipboard?.restoreIfStillOwned(); inheritedClipboard = nil
@@ -2757,11 +3242,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     @objc private func cancelCurrent() {
         guard !uninstalling else { return }
         if enableTask != nil { stop(reason: L("Enabling cancelled", "已取消打开")); return }
-        capturePipeline.reset()
-        pipelineCaptures.values.forEach { try? fm.removeItem(at: $0.image) }
-        pipelineCaptures.removeAll(); pipelineProgress.removeAll(); slowPipelineIDs.removeAll()
-        deliveryCaptureID = nil; queuedBindings.removeAll()
-        captureAnimation.hideTransferNotice()
+        cancelPendingCaptures()
+        chordDetector = CaptureChordDetector()
         appendTask?.cancel()
         handle(core.reset())
         cleanup(cancelProcess: true)
@@ -2771,59 +3253,15 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
 
     // Authenticate the wireless connection ahead of the next keypress so it is
     // not paid for after the press. Connection only: never a screenshot.
-    // USB data dropped: wait out a brief re-attach, then ask the device over Wi-Fi whether it still has power.
-    private func checkUSBDrop() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            guard let self, !self.uninstalling, !self.setupWizard.isRunning,
-                  !self.captureWorker.usbConnected, !self.usbDropCheckRunning,
-                  let config = try? self.configuration(),
-                  let script = Bundle.main.resourceURL?.appendingPathComponent("Backend/usb_power_check.py").path else { return }
-            self.usbDropCheckRunning = true
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: config.python)
-            process.arguments = ["-B", script, "--state-dir", config.state_dir]
-            process.environment = CaptureWorkerProcess.backendEnvironment
-            let output = Pipe()
-            process.standardOutput = output
-            process.standardError = FileHandle.nullDevice
-            // The helper bounds itself and exits on its own watchdog; this is the outer limit.
-            DispatchQueue.global(qos: .utility).async { [weak self] in
-                var powered: Bool?
-                if (try? process.run()) != nil {
-                    DispatchQueue.global().asyncAfter(deadline: .now() + 20) { if process.isRunning { process.terminate() } }
-                    let data = output.fileHandleForReading.readDataToEndOfFile()
-                    process.waitUntilExit()
-                    let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-                    powered = object?["external_connected"] as? Bool
-                }
-                let reading = powered
-                DispatchQueue.main.async {
-                    self?.usbDropCheckRunning = false
-                    self?.finishUSBDropCheck(powered: reading)
-                }
-            }
-        }
-    }
-
-    private func finishUSBDropCheck(powered: Bool?) {
-        guard !uninstalling, usbDropNotice.shouldShow(externalConnected: powered,
-            usbBack: captureWorker.usbConnected, at: ProcessInfo.processInfo.systemUptime) else { return }
-        let name = "iPad"
-        let title = L("\(name) USB dropped\nReplug; resume charging if paused", "\(name) 的 USB 断了\n重插一下；暂停充电的话先恢复")
-        captureAnimation.showTransferNotice(title)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.updateTransferNotice() }
-    }
-
     private func rewarmWorker(after delay: TimeInterval) {
         guard enabled, !sleeping else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             // Pairing owns the iPad link while it runs.
             guard let self, self.enabled, !self.sleeping, self.enableTask == nil,
-                  !self.hasActiveWork, !self.captureWorker.isBusy, !self.setupWizard.isRunning,
-                  let config = try? self.configuration(),
-                  let worker = try? self.workerConfiguration(config) else { return }
-            // No-op while a healthy worker is already running.
-            try? self.captureWorker.prepare(configuration: worker)
+                  !self.hasActiveWork, !self.anyWorkerBusy, !self.setupWizard.isRunning,
+                  let config = try? self.configuration() else { return }
+            // No-op for each healthy device; one offline device cannot replace the other.
+            try? self.prepareWorkers(config)
         }
     }
 
@@ -2832,7 +3270,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         // Do not carry an in-flight keypress or old wireless transport across
         // sleep. No wake path requests a screenshot.
         if hasActiveWork || transaction != nil || enableTask != nil { cancelCurrent() }
-        captureWorker.stop()
+        stopWorkers()
         handle(core.reset())
         ignoreKeyboardEventsThrough = ProcessInfo.processInfo.systemUptime
     }
@@ -2927,7 +3365,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         exportingLogs = true
         menuStatus?.setExportingLogs(true)
         let support = base
-        let app = LogExporter.AppInfo.current
+        var app = LogExporter.AppInfo.current
+        app.pairedDeviceTypes = pairedDeviceClasses.map { $0.rawValue }
         logExportQueue.async { [weak self] in
             let result = Result { () throws -> URL in
                 let archive = try LogExporter().export(support: support, destination: destination, app: app)
@@ -2941,7 +3380,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private func finishLogExport(_ result: Result<URL, Error>) {
         guard !uninstalling else { return }
         // Selecting in Finder changes focus. Let an active screenshot finish first.
-        if core.isBusy || transaction != nil {
+        if core.isBusy || transaction != nil || (!manualDeliveryPaused && capturePipeline.isBusy) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in self?.finishLogExport(result) }
             return
         }
@@ -2972,6 +3411,14 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             "connection_reason": currentConnection.reason,
             "network_available": networkAvailable as Any? ?? NSNull(),
             "target_app": targetKind.rawValue, "setup_code": lastSetupCode, "paired": hasPairing,
+            "device_class": pairedDeviceClass?.rawValue as Any? ?? NSNull(),
+            "device_locked": Dictionary(uniqueKeysWithValues: DeviceClass.allCases.compactMap { kind in
+                captureWorkers[kind]?.deviceLocked.map { (kind.rawValue, $0) }
+            }),
+            "device_connections": deviceConnectionRows.map { name, status in
+                ["device_class": name, "state": status.state.rawValue,
+                 "reason": status.reason, "transport": status.transport ?? "none"]
+            },
             "runtime_quarantined": runtimeQuarantined,
             "claude_accessibility_preparation": claudeTarget.accessibilityPreparationSummary,
             "failure_category": failureCategory, "backend_reason": backendReason, "busy_repeats_total": busyRepeatsTotal,
@@ -3012,11 +3459,14 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             text.autoresizingMask = [.width]
             text.textContainer?.widthTracksTextView = true
             text.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-            // Toss paper in light mode; dark mode keeps the system text background.
-            text.backgroundColor = SettingsStyle.dynamic(SettingsStyle.paper, .textBackgroundColor)
+            // Share the same window background in both appearances.
+            text.backgroundColor = SettingsStyle.background
+            text.drawsBackground = false
+            scroll.drawsBackground = false
             text.textContainerInset = NSSize(width: 14, height: 14)
             scroll.documentView = text
             window.contentView!.addSubview(scroll)
+            SettingsStyle.applyUnifiedWindowStyle(in: window)
             window.center()
             diagnosticWindow = window
             diagnosticText = text
@@ -3048,9 +3498,9 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         if diagnosticEvents.count > 20 { diagnosticEvents.removeFirst(diagnosticEvents.count - 20) }
         writeLastRun()
     }
-    private func recordConnectionEvent(_ status: TossConnectionStatus) {
+    private func recordConnectionEvent(_ status: TossConnectionStatus, deviceClass: DeviceClass) {
         connectionEvents.append(["time": Self.diagnosticDateFormatter.string(from: Date()),
-                                 "state": status.state.rawValue, "reason": status.reason])
+                                 "state": status.state.rawValue, "reason": status.reason, "device_class": deviceClass.rawValue])
         if connectionEvents.count > 10 { connectionEvents.removeFirst(connectionEvents.count - 10) }
         writeLastRun()
     }
@@ -3059,7 +3509,9 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         guard var record = captureRecord else { return }
         captureRecord = nil
         lastCaptureResult = record.menuResult(outcome: outcome)
+        updateDeviceCopy()
         record.timings = backendTimings
+        if let device = transaction?.deviceClass { record.deviceClass = device.rawValue }
         record.connectionReused = connectionReused
         if targetKind == .claude, ["composerUnavailable", "composersAmbiguous"].contains(failureCategory) {
             record.composers = claudeTarget.lastComposerCount
@@ -3118,8 +3570,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         case "preparing_accessibility": phase = L("Preparing chat access", "准备聊天窗口")
         case "activating_target": phase = L("Switching to the target window", "切换到目标窗口")
         case "locating_target", "capture_setup_failed": phase = L("Checking the window and chat", "检查窗口和聊天")
-        case "target_located", "capturing": phase = L("Capturing a new iPad screenshot", "截取 iPad 屏幕")
-        case "capture_slow": phase = L("Screenshot is taking longer; still waiting for your iPad", "截图比平时慢，还在等 iPad")
+        case "target_located", "capturing": phase = L("Capturing a new \(deviceEN) screenshot", "截取 \(deviceZH) 屏幕")
+        case "capture_slow": phase = L("Screenshot is taking longer; still waiting for your \(deviceEN)", "截图比平时慢，还在等 \(deviceZH)")
         case "revalidating_capture", "capture_result_failed", "captured": phase = L("Verifying the screenshot and chat", "确认截图和聊天")
         case "focusing_composer", "append_failed": phase = L("Focusing the composer and attaching the screenshot", "聚焦输入框并贴上截图")
         case "paste_posted", "append_unconfirmed", "append_confirmed": phase = L("Confirming the attachment", "确认附件")
@@ -3132,17 +3584,39 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     }
     // cue: a keypress ended without an attachment (not setup, enable or connection checks).
     private func failure(_ error: Error, code: String, cue: Bool = false) {
-        if let known = error as? TargetFailure { failureCategory = String(describing: known) }
+        // Use the attempted device for the error copy unless an unlock hint applies.
+        let pressDevice = transaction?.deviceClass.rawValue ?? earlyCapture?.deviceClass.rawValue ??
+            capturePipeline.delivering?.deviceClass.rawValue ?? captureRecord?.deviceClass
+        let unlockDevice: DeviceClass?
+        if code == "capture_result_failed", let pressDevice, let device = DeviceClass(rawValue: pressDevice) {
+            switch backendReason {
+            case "alternate_device_locked": unlockDevice = device.other
+            case "timeout", "disconnected", "no_authenticated_remote_wifi_connection":
+                unlockDevice = lockedAlternate(for: device)
+            default: unlockDevice = nil
+            }
+        } else {
+            unlockDevice = nil
+        }
+        if let pressDevice { DeviceCopy.deviceClass = pressDevice }
+        defer { updateDeviceCopy() }
+        if let unlockDevice { failureCategory = "unlock_\(unlockDevice.rawValue.lowercased())" }
+        else if let known = error as? TargetFailure { failureCategory = String(describing: known) }
         else if let known = error as? TossError { failureCategory = String(describing: known) }
         else if error is CaptureContractError { failureCategory = "capture_receipt_invalid" }
         else { failureCategory = "internal_error" }
-        let text = code == "append_unconfirmed" ? TossError.unconfirmed.errorDescription! :
-            ((error as? LocalizedError)?.errorDescription ?? L("The operation failed. No automatic retry was made.", "操作失败，没有自动重试。"))
+        let text: String
+        if let unlockDevice { text = ToastCopy.unlock(unlockDevice.rawValue) }
+        else if code == "append_unconfirmed" { text = TossError.unconfirmed.errorDescription! }
+        else { text = (error as? LocalizedError)?.errorDescription ?? L("The operation failed. No automatic retry was made.", "操作失败，没有自动重试。") }
         setStatus(text, code: code)
+        // setStatus can end the capture record, which restores the primary device's name.
+        if let pressDevice { DeviceCopy.deviceClass = pressDevice }
         // Only a failed keypress gets cues; quiet interruptions stay silent. The sound
         // first, then the ✕ toast (if enabled); any other failure shows nothing.
         if cue { playResultCue(failureSound) }
-        if let result = ToastContent.failure(reason: text, code: code, cue: cue, backend: backendReason) {
+        if let result = ToastContent.failure(reason: text, code: code, cue: cue, backend: backendReason,
+                                             unlockDevice: unlockDevice?.rawValue) {
             captureAnimation.failCurrent(title: result.title, toastHold: toastPreferences.enabled ? result.holdDuration : nil)
         } else {
             captureAnimation.dismiss()
@@ -3181,15 +3655,16 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         guard !uninstalling else { return }
         let defaults = UserDefaults.standard
         let anyInput = CGEventType(rawValue: ~0)!
-        let state = KeepAlivePolicy.state(
-            switchOn: defaults.object(forKey: KeepAlivePolicy.switchKey) as? Bool ?? true,
-            enabled: enabled, connected: captureWorker.connectionStatus.state == .ready,
-            secondsSinceInput: CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyInput),
-            idleMinutes: defaults.object(forKey: KeepAlivePolicy.minutesKey) as? Double ?? KeepAlivePolicy.defaultIdleMinutes,
-            screensAsleep: screensAsleep)
-        guard state != keepAliveState else { return }
-        keepAliveState = state
-        iPadWaker.setKeepAlive(state == "on")
+        for kind in DeviceClass.allCases {
+            let state = KeepAlivePolicy.state(
+                switchOn: defaults.object(forKey: KeepAlivePolicy.switchKey) as? Bool ?? true,
+                enabled: enabled && pairedDeviceClasses.contains(kind), connected: deviceConnections[kind]?.state == .ready,
+                secondsSinceInput: CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyInput),
+                idleMinutes: defaults.object(forKey: KeepAlivePolicy.minutesKey) as? Double ?? KeepAlivePolicy.defaultIdleMinutes,
+                screensAsleep: screensAsleep)
+            if kind == activeDeviceClass { keepAliveState = state }
+            deviceWakers[kind]?.setKeepAlive(state == "on")
+        }
     }
 
     private func showAlert(_ title: String, _ text: String) {
@@ -3198,7 +3673,6 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: L("OK", "好"))
         alert.runModal()
     }
-
     @objc private func confirmUninstall() {
         guard !uninstalling, uninstallSheet == nil, let window = settingsWindow else { return }
         // Pairing prompts can already occupy this sheet slot. Dismiss the prompt
@@ -3234,7 +3708,13 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
                 await withCheckedContinuation { continuation in
                     logExportQueue.async { history.flush(); continuation.resume() }
                 }
-                try await captureWorker.stopForUninstall()
+                // Stop both device workers even if one fails to exit.
+                var firstError: Error?
+                for worker in captureWorkers.values {
+                    do { try await worker.stopForUninstall() }
+                    catch { firstError = firstError ?? error }
+                }
+                if let firstError { throw firstError }
             },
             stopSetup: { [self] in try await setupWizard.stopForUninstall() },
             unregisterLogin: { [self] in
@@ -3263,7 +3743,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private func quiesceForUninstall() {
         stopUSBSetupObserver()
         enabled = false
-        captureWorker.beginUninstall()
+        captureWorkers.values.forEach { $0.beginUninstall() }
         setupWizard.cancel()
         enableGeneration &+= 1
         enableTask?.cancel(); enableTask = nil
@@ -3273,7 +3753,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         networkRewarm?.cancel(); networkRewarm = nil
         pathMonitor?.cancel(); pathMonitor = nil
         monitor.stop()
-        iPadWaker.stopForUninstall()
+        deviceWakers.values.forEach { $0.stopForUninstall() }
         appendTask?.cancel(); appendTask = nil
         activationTask?.task.cancel(); activationTask = nil
         earlyFocusTask?.task.cancel(); earlyFocusTask = nil
@@ -3284,6 +3764,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         inheritedClipboard?.restoreIfStillOwned()
         transaction = nil; pendingClipboard = nil; inheritedClipboard = nil
         capturePipeline.reset(); _ = core.reset()
+        deferredDeviceSelection = nil
         pipelineCaptures.removeAll(); pipelineProgress.removeAll(); slowPipelineIDs.removeAll()
         captureRecord = nil
         queuedBindings.removeAll(); burstLeases.removeAll()
@@ -3311,13 +3792,11 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     }
     private func purgeOldCaptures() {
         guard let files = try? fm.contentsOfDirectory(at: cache, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
+        let now = Date()
         for file in files {
-            let name = file.lastPathComponent
-            let png = file.pathExtension == "png" &&
-                (name.hasPrefix("iPad-") || name.hasPrefix(".capture-service-"))
-            guard png || name.hasPrefix(".toss-") else { continue }
+            guard CaptureCache.recognizes(file) else { continue }
             if let date = try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
-               date.timeIntervalSinceNow < -86_400 { try? fm.removeItem(at: file) }
+               CaptureCache.shouldRemove(file, modifiedAt: date, now: now) { try? fm.removeItem(at: file) }
         }
     }
 }
@@ -3327,6 +3806,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
 @MainActor
 enum RenderState {
     static var paired: Bool?
+    static var pairedDevices: PairedDevicesState?
     static var permissions: Bool?
     static var connection: TossConnectionStatus?
     static var pairing: Bool?

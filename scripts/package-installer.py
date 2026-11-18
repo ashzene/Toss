@@ -44,12 +44,12 @@ for name, target in [('background.tiff', 'background.tiff'), ('guide.icns', 'Gui
 subprocess.run(['codesign', '--force', '--sign', args.identity, str(installer)], check=True)
 subprocess.run(['codesign', '--verify', '--deep', '--strict', str(installer)], check=True)
 if not args.no_dmg:
-    dmg = out / f"Toss {info['CFBundleShortVersionString']} Nightly for iPad.dmg"
+    dmg = out / f"Toss {info['CFBundleShortVersionString']} Nightly for iPhone+iPad.dmg"
     with tempfile.TemporaryDirectory(prefix='toss-native-install-', dir='/private/tmp') as scratch:
         stage = Path(scratch) / 'stage'; stage.mkdir()
         subprocess.run(['ditto', str(installer), str(stage / installer.name)], check=True)
         image = Path(scratch) / 'Toss.dmg'
-        subprocess.run(['hdiutil', 'create', '-quiet', '-volname', 'Toss ' + info['CFBundleShortVersionString'],
+        subprocess.run(['hdiutil', 'create', '-quiet', '-volname', 'Toss ' + info['CFBundleShortVersionString'] + ' iPhone+iPad',
             '-srcfolder', str(stage), '-format', 'ULMO', str(image)], check=True)
         subprocess.run(['hdiutil', 'verify', str(image)], check=True)
         shutil.copyfile(image, dmg)

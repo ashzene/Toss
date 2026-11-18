@@ -12,12 +12,18 @@ struct LogExporter {
         let url: URL
         let version: String
         let build: String
+        var pairedDeviceTypes: [String] = []
 
         static var current: Self {
             Self(url: Bundle.main.bundleURL,
                  version: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unavailable",
                  build: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unavailable")
         }
+    }
+
+    static func deviceTypes(_ values: [String]) -> String {
+        let types = ["iPad", "iPhone"].filter { values.contains($0) }
+        return types.isEmpty ? "unavailable" : types.joined(separator: " / ")
     }
 
     struct CommandOutput {
@@ -118,6 +124,7 @@ struct LogExporter {
         \(output("/usr/bin/sw_vers", []))
         Toss version: \(app.version)
         Toss build: \(app.build)
+        Paired device types: \(Self.deviceTypes(app.pairedDeviceTypes))
         CDHash: \(cdhash)
         Mac model: \(output("/usr/sbin/sysctl", ["-n", "hw.model"]))
         Exported at: \(timestamp.string(from: date))

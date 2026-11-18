@@ -14,7 +14,7 @@ set -euo pipefail
 name=${1:-"Toss Local Signing"}
 keychain=${2:-"$HOME/Library/Keychains/login.keychain-db"}
 if /usr/bin/security find-identity -p codesigning "$keychain" | /usr/bin/grep -qF "\"$name\""; then
-  print "Signing identity already exists: $name"
+  print "已存在签名身份：$name"
   exit 0
 fi
 work=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/toss-signing.XXXXXX")
@@ -37,5 +37,5 @@ pass=$(/usr/bin/uuidgen)
 /usr/bin/openssl pkcs12 -export -inkey "$work/key.pem" -in "$work/cert.pem" -name "$name" \
   -passout "pass:$pass" -out "$work/identity.p12"
 /usr/bin/security import "$work/identity.p12" -k "$keychain" -P "$pass" -T /usr/bin/codesign >/dev/null
-print "Created signing identity: $name"
-print "scripts/build-release.py will use it from now on."
+print "已创建签名身份：$name"
+print "之后运行 scripts/build-release.py 会自动使用它。"

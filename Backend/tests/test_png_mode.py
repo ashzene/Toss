@@ -70,7 +70,8 @@ def private_fixture(base):
     output.mkdir(mode=0o700)
     for name in ("target.json", "strict-remote-pairing.plist"):
         path = state / name
-        path.write_text("synthetic-placeholder-not-real-pairing")
+        path.write_text(json.dumps({"model": "iPad14,3", "device_hash": "synthetic"})
+                        if name == "target.json" else "synthetic-placeholder-not-real-pairing")
         path.chmod(0o600)
     return state, output
 

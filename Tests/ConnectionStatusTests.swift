@@ -37,6 +37,27 @@ struct ConnectionStatusTests {
                      "stopped", "ready", "hotkey_rejected"] {
             check(!TossTransferPhase.from(code: code).animates)
         }
+        for (device, en, zh, enOS, zhOS): (String?, String, String, String, String) in [
+            (nil, "iPad or iPhone", "iPad 或 iPhone", "iPadOS or iOS", "iPadOS 或 iOS"),
+            ("iPad", "iPad", "iPad", "iPadOS", "iPadOS"), ("iPhone", "iPhone", "iPhone", "iOS", "iOS")
+        ] {
+            let previousDevice = DeviceCopy.deviceClass, previousLanguage = AppLanguage.override
+            DeviceCopy.deviceClass = device
+            defer { DeviceCopy.deviceClass = previousDevice; AppLanguage.override = previousLanguage }
+            let shortName = device ?? "device", subject = device ?? "The device"
+            for (reason, english, chinese) in [
+                ("usb_ipados_unsupported", "USB needs \(enOS) 17.4 or later.", "USB 需要 \(zhOS) 17.4 或更新。"),
+                ("rsd_device_identity_mismatch", "This isn't the paired \(en). Pair it again.", "这不是配对过的 \(zh)，请重新配对。"),
+                ("timeout", "Unlock your \(shortName), use your Mac's network.", "解锁 \(zh)，和 Mac 连同一个网络。"),
+                ("developer_image_unavailable", "\(subject) isn't ready. Unlock it and check again.", "\(zh) 还没准备好，解锁后再检查。"),
+                ("service_unavailable", "\(subject) isn't ready. Unlock it and check again.", "\(zh) 还没准备好，解锁后再检查。"),
+                ("disconnected", "\(en) disconnected. Reconnecting…", "\(zh) 断开了，正在重连…")
+            ] {
+                let status = TossConnectionStatus(state: .failed, reason: reason)
+                AppLanguage.override = false; check(status.errorMessage == english)
+                AppLanguage.override = true; check(status.errorMessage == chinese)
+            }
+        }
         print("Connection status: \(count) assertions passed.")
     }
 }

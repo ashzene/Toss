@@ -37,7 +37,7 @@ struct UninstallTests {
     }
 
     static func compareScripts(_ source: URL) throws {
-        for name in ["Uninstall.command"] {
+        for name in ["Uninstall.command", "卸载.command"] {
             let script = try String(contentsOf: source.appendingPathComponent(name), encoding: .utf8)
             let assignments = try captures(#"^(TASK_[A-Z_]+)="\$HOME/([^"]+)"$"#, in: script)
             let removalLines = script.components(separatedBy: .newlines).filter { $0.hasPrefix("/bin/rm ") }
@@ -58,6 +58,7 @@ struct UninstallTests {
         }
         let build = try String(contentsOf: source.appendingPathComponent("scripts/build-release.py"), encoding: .utf8)
         check(!build.contains("Uninstall.command"), "DMG build no longer stages a command uninstaller")
+        check(build.contains(#"VERSION, BUILD = "1.0.3", "#), "Version stays 1.0.3 (build numbers only go up)")
     }
 
     static func write(_ url: URL, _ text: String = "keep") throws {

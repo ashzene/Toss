@@ -39,25 +39,32 @@ enum ToastTests {
         check(failure.reason.isEmpty, "failure toast has no reason line (Ashley 2026-10-24)")
         check(ToastContent.shortReason("  The draft\nchanged.\tTry again.  ") == "The draft changed. Try again.", "reason is trimmed to one line")
         check(ToastContent.failure(reason: "", code: "append_failed", cue: true, language: .chinese)?.title == "没贴进去", "Chinese failure copy")
-        check(ToastContent.failure(reason: "", code: "capture_result_failed", cue: true, backend: "black_frame_rejected")?.title
-              == "iPad screenshot is black", "black frame: reports content without claiming screen/lock state")
-        check(ToastContent.failure(reason: "", code: "capture_result_failed", cue: true, backend: "black_frame_rejected",
-                                   language: .chinese)?.title == "iPad 截图是黑的", "Chinese black-frame copy")
-        // One title per actual cause (Ashley 2026-10-28).
-        for (backend, english, chinese) in [("timeout", "iPad connection too slow", "iPad 连接太慢"),
-                                            ("slow_threshold", "iPad connection too slow", "iPad 连接太慢"),
-                                            ("first_byte_timeout", "iPad connection too slow", "iPad 连接太慢"),
-                                            ("stall_timeout", "iPad connection too slow", "iPad 连接太慢"),
-                                            ("too_slow", "iPad connection too slow", "iPad 连接太慢"),
-                                            ("no_authenticated_remote_wifi_connection", "iPad not connected", "iPad 没连上"),
-                                            ("worker_failed", "iPad not connected", "iPad 没连上"),
-                                            ("unexpected_device_pin", "Pair your iPad again", "需要重新配对 iPad"),
-                                            ("remote_pair_verify_rejected", "Pair your iPad again", "需要重新配对 iPad"),
-                                            ("capture_integrity_failed", "Didn't attach", "没贴进去")] {
-            check(ToastContent.failure(reason: "", code: "capture_result_failed", cue: true, backend: backend)?.title == english,
-                  "English title for \(backend)")
-            check(ToastContent.failure(reason: "", code: "capture_result_failed", cue: true, backend: backend,
-                                       language: .chinese)?.title == chinese, "Chinese title for \(backend)")
+        for (device, englishName, chineseName): (String?, String, String) in [
+            (nil, "iPad or iPhone", "iPad 或 iPhone"), ("iPad", "iPad", "iPad"), ("iPhone", "iPhone", "iPhone")
+        ] {
+            let previous = DeviceCopy.deviceClass
+            DeviceCopy.deviceClass = device
+            defer { DeviceCopy.deviceClass = previous }
+            check(ToastContent.failure(reason: "", code: "capture_result_failed", cue: true, backend: "black_frame_rejected")?.title
+                  == "\(englishName) screenshot is black", "black frame: reports content without claiming screen/lock state")
+            check(ToastContent.failure(reason: "", code: "capture_result_failed", cue: true, backend: "black_frame_rejected",
+                                       language: .chinese)?.title == "\(chineseName) 截图是黑的", "Chinese black-frame copy")
+            // One title per actual cause (Ashley 2026-10-28).
+            for (backend, english, chinese) in [("timeout", "\(englishName) connection too slow", "\(chineseName) 连接太慢"),
+                                                ("slow_threshold", "\(englishName) connection too slow", "\(chineseName) 连接太慢"),
+                                                ("first_byte_timeout", "\(englishName) connection too slow", "\(chineseName) 连接太慢"),
+                                                ("stall_timeout", "\(englishName) connection too slow", "\(chineseName) 连接太慢"),
+                                                ("too_slow", "\(englishName) connection too slow", "\(chineseName) 连接太慢"),
+                                                ("no_authenticated_remote_wifi_connection", "\(englishName) not connected", "\(chineseName) 没连上"),
+                                                ("worker_failed", "\(englishName) not connected", "\(chineseName) 没连上"),
+                                                ("unexpected_device_pin", "Pair your \(englishName) again", "需要重新配对 \(chineseName)"),
+                                                ("remote_pair_verify_rejected", "Pair your \(englishName) again", "需要重新配对 \(chineseName)"),
+                                                ("capture_integrity_failed", "Didn't attach", "没贴进去")] {
+                check(ToastContent.failure(reason: "", code: "capture_result_failed", cue: true, backend: backend)?.title == english,
+                      "English title for \(backend)")
+                check(ToastContent.failure(reason: "", code: "capture_result_failed", cue: true, backend: backend,
+                                           language: .chinese)?.title == chinese, "Chinese title for \(backend)")
+            }
         }
         check(ToastContent.failure(reason: "", code: "append_unconfirmed", cue: true, language: .chinese)?.title == "看看草稿里有没有",
               "a sent but unconfirmed paste says it may be in the draft")
@@ -65,6 +72,20 @@ enum ToastTests {
               == "Didn't attach", "a stale backend reason does not relabel a setup failure")
         check(ToastContent.failure(reason: "", code: "append_failed", cue: true, backend: "black_frame_rejected")?.title
               == "Didn't attach", "a stale backend reason does not relabel a paste failure")
+        do {
+            let previous = DeviceCopy.deviceClass
+            DeviceCopy.deviceClass = "iPad"
+            defer { DeviceCopy.deviceClass = previous }
+            check(ToastContent.failure(reason: "", code: "capture_result_failed", cue: true, backend: "timeout",
+                                       unlockDevice: "iPhone", language: .chinese)?.title == "请解锁 iPhone。",
+                  "the unlock notice names the connected, locked iPhone")
+            check(ToastContent.failure(reason: "", code: "capture_result_failed", cue: true, backend: "timeout",
+                                       unlockDevice: "iPhone", language: .english)?.title == "Unlock your iPhone.",
+                  "the English notice names iPhone too")
+            check(ToastContent.failure(reason: "", code: "append_failed", cue: true, backend: "timeout",
+                                       unlockDevice: "iPhone")?.title == "Didn't attach",
+                  "paste failures keep their own message")
+        }
         // The original chat could not take the paste: the screenshot stays on the clipboard (2026-10-28).
         check(ToastContent.failure(reason: "", code: "copied_for_manual_paste", cue: true)?.title == "Copied — paste it yourself",
               "manual-paste fallback names what to do")
@@ -105,7 +126,7 @@ enum ToastTests {
                     from: "self.transaction?.appendConfirmed = true"),
               "success: the sound starts (off the main thread) before the toast and jelly are set up")
         check(order("Sources/TossApp.swift", ["if cue { playResultCue(failureSound) }", "captureAnimation.failCurrent("],
-                    from: "let text = code == \"append_unconfirmed\""),
+                    from: "private func failure(_ error:"),
               "failure: the sound plays before the toast")
         check(order("Sources/CaptureAnimation.swift", ["showToast(success: true", "startLanding("],
                     from: "func confirmed(requestID"),
@@ -175,7 +196,7 @@ enum ToastTests {
                                                     "catch TossError.foregroundChanged where foregroundRetries < QueuedDestinationPolicy.foregroundRetriesBeforePaste"],
                         from: "var foregroundRetries = 0"),
                   "every Cmd+V retry re-verifies the focused bound composer first")
-            check(order("Sources/TossApp.swift", ["_ = core.reset(keepQueue: true)", "if core.queuedCount == 0 { burstLeases.removeAll() }"],
+            check(order("Sources/TossApp.swift", ["_ = core.reset(keepQueue: true)", "if !capturePipeline.isBusy { burstLeases.removeAll() }"],
                         from: "private func cleanup"), "the burst's chats are forgotten when the queue runs empty")
             // Queued presses still raise their app with the v21.1 activation path.
             check(order("Sources/TossApp.swift", ["TargetActivator.bringForward(kind", "self.locateAfterActivation(kind, queued: queued)"],
@@ -189,7 +210,7 @@ enum ToastTests {
                     "catch { self.captureSetupFailed(request, error) }"],
                     from: "var lease = try await self.locateAfterActivation(kind, queued: queued)"),
               "activation path: a beginCapture error reaches captureSetupFailed")
-        check(order("Sources/TossApp.swift", ["abandonedCaptureID = early.uuid"], from: "private func discardEarlyCapture()")
+        check(order("Sources/TossApp.swift", ["abandonedCaptureIDs[early.deviceClass] = early.uuid"], from: "private func discardEarlyCapture()")
               && order("Sources/TossApp.swift", ["releaseAbandonedCapture()", "try captureWorker.capture("],
                        from: "private func startEarlyCapture(")
               && order("Sources/TossApp.swift", ["try captureWorker.capture("],
@@ -247,7 +268,7 @@ enum ToastTests {
               "no Codex sound in the app or the bundle")
 
         // Wire the fake-clock scheduler tests to the adapter's actual call path.
-        check(!app.contains("parallelCaptureWorker") && app.contains("private var capturePipeline = CapturePipeline()"),
+        check(!app.contains("parallelCaptureWorker") && app.contains("private var capturePipeline = DeviceCapturePipeline()"),
               "the app uses the serial scheduler and has no Wi-Fi-only second capture lane")
         check(order("Sources/TossApp.swift", ["pumpCaptures()", "startQueuedPress(waited: 1)"], from: "private func admitCapture"),
               "admission starts capture and targeting in the same key callback")

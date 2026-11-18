@@ -19,6 +19,7 @@ struct CaptureRecord {
     // Queued presses: "unbound", "bound", "bound-returned" (went back to its chat), "bound-not-provable"
     // (manual paste). Labels only; no chat names, URLs or window identities are stored.
     var queued: String?
+    var deviceClass: String? // iPad or iPhone: which device this press took.
     var repeats: [(phase: String, ms: Int)] = [] // chords pressed again while this one ran
 
     init(startedAt: Date, target: String) {
@@ -105,6 +106,7 @@ struct CaptureRecord {
             "image": image, "timings_ms": timings.mapValues { ($0 * 10).rounded() / 10 },
             "connection_reused": connectionReused as Any? ?? NSNull()]
         if let composers { object["composers"] = composers }
+        if let deviceClass { object["device_class"] = deviceClass }
         if let queued { object["queued"] = queued }
         if let transport { object["transport"] = transport }
         if !routeAttempts.isEmpty { object["route_attempts"] = routeAttempts }

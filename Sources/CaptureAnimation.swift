@@ -665,6 +665,31 @@ final class CaptureAnimation {
         return max(target.width - current.width, target.height - current.height)
     }
 
+    // An existing Chat thread can move the same native card as its composer reflows.
+    // Move the copy with that card while its original animation continues.
+    func followConfirmedChatCard(requestID: UInt64, frameAX frame: CGRect?) {
+        guard state.requestID == requestID, state.phase == .confirmed else { return }
+        guard let frame else {
+            if lastArrivalStatus == "landing" || lastArrivalStatus == "sampling" {
+                clearFlight()
+                lastArrivalStatus = "fallback-card-lost"
+            }
+            return
+        }
+        guard let current = earlyTileAX, let view = flightView, let panel = flightPanel,
+              lastArrivalStatus == "landing", let primary = NSScreen.screens.first?.frame,
+              !AttachmentSighting.stable(current, frame) else { return }
+        let rect = CGRect(x: frame.minX, y: primary.maxY - frame.maxY,
+                          width: frame.width, height: frame.height)
+        guard panel.frame.contains(rect) else {
+            clearFlight()
+            lastArrivalStatus = "fallback-geometry"
+            return
+        }
+        view.retarget(tile: rect.offsetBy(dx: -panel.frame.minX, dy: -panel.frame.minY), movePatch: true)
+        earlyTileAX = frame
+    }
+
     func confirmed(requestID: UInt64, destinationAXFrame: CGRect? = nil, targetPID: pid_t? = nil,
                    look: CaptureTileLook = .cover, title: String, toastHold: Double?) {
         guard state.finish(requestID, success: true) else { return }
@@ -1137,7 +1162,7 @@ private final class CaptureFlightView: NSView {
 
     // Moves the running copy onto a corrected tile frame at once (no animation of the move);
     // the bounce keeps going, since its keyframes are relative to the anchor.
-    func retarget(tile: CGRect) {
+    func retarget(tile: CGRect, movePatch: Bool = false) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         let m = CaptureJelly.margin
@@ -1150,6 +1175,7 @@ private final class CaptureFlightView: NSView {
             thumbnail.position = CGPoint(x: tile.midX, y: tile.minY)
         }
         picture.frame = thumbnail.bounds.insetBy(dx: m, dy: m)
+        if movePatch, !patch.isHidden { patch.frame = tile.insetBy(dx: -1, dy: -1) }
         CATransaction.commit()
     }
 

@@ -23,9 +23,9 @@ class PowerCheckTests(unittest.TestCase):
         async def fails(_state):
             raise ConnectionError("unreachable")
         output = io.StringIO()
-        with mock.patch.object(check, "read_power", fails), mock.patch.object(check.threading, "Timer") as timer, \
-                contextlib.redirect_stdout(output):
-            self.assertEqual(check.main(["--state-dir", "unused"]), 0)
+        with mock.patch.object(check, "read_power", fails), mock.patch("paired_devices.resolve_state", lambda *_: "state"), \
+                mock.patch.object(check.threading, "Timer") as timer, contextlib.redirect_stdout(output):
+            self.assertEqual(check.main(["--state-dir", "unused", "--device-class", "iPhone"]), 0)
         self.assertEqual(json.loads(output.getvalue()), {"external_connected": None})
         self.assertTrue(timer.return_value.daemon)
         timer.return_value.start.assert_called_once()

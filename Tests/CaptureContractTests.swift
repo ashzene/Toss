@@ -33,10 +33,10 @@ struct CaptureContractTests {
         ]
         func validate(_ value: [String: Any] = base, exit: Int32 = 0,
                       id: String = request, triggered: Double = 198.0,
-                      now: Double = 200.0, at: URL = file) throws -> CaptureReceipt {
+                      now: Double = 200.0, at: URL = file, deviceClass: DeviceClass? = .iPad) throws -> CaptureReceipt {
             try CaptureReceipt.validate(json: JSONSerialization.data(withJSONObject: value),
                                         exitCode: exit, requestID: id, triggeredAt: triggered,
-                                        now: now, file: at)
+                                        now: now, file: at, deviceClass: deviceClass)
         }
         func changed(_ fields: [String: Any]) -> [String: Any] {
             base.merging(fields) { _, new in new }
@@ -44,6 +44,7 @@ struct CaptureContractTests {
         let receipt = try validate()
         expect(receipt.capturedAt == 199.0 && receipt.expiresAt == 209.0)
         expect(receipt.byteCount == bytes.count)
+        expect(try validate(changed(["width": 1179, "height": 2556]), deviceClass: .iPhone).byteCount == bytes.count)
         let landscape = try validate(changed(["width": 2388, "height": 1668]))
         expect(landscape.capturedAt == 199.0)
         expect(try validate(changed(["transport": "authenticated_usb"])).capturedAt == 199.0)
@@ -61,6 +62,31 @@ struct CaptureContractTests {
         _ = try validate(changed(["width": 2064, "height": 2752]))   // iPad Pro 13"
         _ = try validate(changed(["width": 2266, "height": 1488]))   // iPad mini, landscape
         expectThrows { try validate(changed(["width": 1179, "height": 2556])) }   // iPhone-shaped
+
+        // Class-specific rules: SE through the contract's largest/air phones, both orientations.
+        for (width, height) in [(750, 1334), (1179, 2556), (1320, 2868), (1260, 2736)] {
+            for (w, h) in [(width, height), (height, width)] {
+                for transport in ["authenticated_usb", "authenticated_wifi"] {
+                    expect(try validate(changed(["width": w, "height": h, "transport": transport]),
+                                        deviceClass: .iPhone).capturedAt == 199.0)
+                }
+                expectThrows { try validate(changed(["width": w, "height": h]), deviceClass: .iPad) }
+            }
+        }
+        expectThrows { try validate(deviceClass: .iPhone) } // an iPad frame on an iPhone pair
+        expectThrows { try validate(deviceClass: nil) }    // unknown / unsupported pair
+        expectThrows { try validate(changed(["width": 750, "height": 1334, "sha256": "wrong"]), deviceClass: .iPhone) }
+        expectThrows { try validate(changed(["width": 750, "height": 1334]), now: 205.01, deviceClass: .iPhone) }
+        expectThrows { try validate(changed(["width": 750, "height": 1334, "device_class": "iPhone"]), deviceClass: .iPad) }
+        for (width, height, accepted) in [(700, 1300, true), (699, 1300, false),
+                                           (1400, 3000, true), (1401, 3000, false),
+                                           (750, 1299, false), (1400, 3001, false),
+                                           (1000, 1700, true), (1000, 1699, false),
+                                           (800, 1800, true), (800, 1801, false),
+                                           (0, 1334, false), (-750, 1334, false)] {
+            expect(CaptureReceipt.screenDimensionsOK(width: width, height: height, deviceClass: .iPhone) == accepted)
+            expect(CaptureReceipt.screenDimensionsOK(width: height, height: width, deviceClass: .iPhone) == accepted)
+        }
         expectThrows { try validate(changed(["bytes": bytes.count + 1])) }
         expectThrows { try validate(changed(["bytes": 40 * 1024 * 1024 + 1])) }
         expectThrows { try validate(changed(["sha256": String(repeating: "0", count: 64)])) }
@@ -76,11 +102,12 @@ struct CaptureContractTests {
         expectThrows { try validate(changed(["request_completed_monotonic": 198.9])) }
         expectThrows { try validate(changed(["request_completed_monotonic": 201.0])) }
         // Slow transfer duration and stale completed images are separate checks.
-        let slow = changed(["capture_started_monotonic": 198.3,
+        let slow = changed(["width": 1290, "height": 2796,
+                            "capture_started_monotonic": 198.3,
                             "capture_completed_monotonic": 208.3,
                             "request_completed_monotonic": 208.4])
-        expect(try validate(slow, now: 208.5).capturedAt == 208.3)
-        expectThrows { try validate(slow, now: 213.31) }
+        expect(try validate(slow, now: 208.5, deviceClass: .iPhone).capturedAt == 208.3)
+        expectThrows { try validate(slow, now: 213.31, deviceClass: .iPhone) }
         expectThrows { try validate(changed(["capture_started_monotonic": 198.3,
                                            "capture_completed_monotonic": 228.4,
                                            "request_completed_monotonic": 228.5]), now: 228.6) }

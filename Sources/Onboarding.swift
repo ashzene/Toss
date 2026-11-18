@@ -50,6 +50,8 @@ struct OnboardingFlow: Equatable {
     var code: String?            // latest setup_device.py code
     var final = false            // that code ended the run
     var ipados: String?
+    var deviceClass: DeviceClass?
+    var osVersion: String?
     var waitingForUSBSince: Double?
     var developerModeNeededSince: Double?
     var trustSince: Double?      // first trust_needed, for the replug hint after 30 s
@@ -86,6 +88,7 @@ struct OnboardingFlow: Equatable {
     static func stage(for code: String) -> OnboardingStep? {
         switch code {
         case "no_usb_ipad", "multiple_usb_ipads", "unlock_needed", "unsupported_ipados": return .cable
+        case "unsupported_device", "mixed_usb_devices": return .cable
         case "trust_needed": return .trust
         case "developer_mode_auto", "developer_mode_needed", "ipad_restarting", "developer_mode_confirm": return .devmode
         case "pairing_wireless", "preparing_image", "pairing_failed", "developer_image_failed": return .prepare
@@ -106,12 +109,24 @@ struct OnboardingFlow: Equatable {
     // Step number on screen; the menu-bar step only counts when it is part of this run.
     var number: Int { step.rawValue + 1 - (!includesMenuBar && step.rawValue > OnboardingStep.menubar.rawValue ? 1 : 0) }
 
-    mutating func receive(code: String, final: Bool, ipados: String?, at now: Double) {
+    mutating func setDeviceClass(_ value: DeviceClass?) {
+        if value == nil || deviceClass != value { ipados = nil; osVersion = nil }
+        deviceClass = value
+    }
+
+    mutating func receive(code: String, final: Bool, ipados: String?,
+                          deviceClass: DeviceClass? = nil, osVersion: String? = nil, at now: Double) {
         if self.code != code || self.final != final { developerModeNeededSince = nil }
         self.code = code
         self.final = final
         updateTime(at: now)
-        if let ipados { self.ipados = ipados }
+        if ["no_usb_ipad", "multiple_usb_ipads", "mixed_usb_devices", "unsupported_device", "not_paired"].contains(code) {
+            self.deviceClass = nil; self.ipados = nil; self.osVersion = nil
+        } else {
+            if let deviceClass { setDeviceClass(deviceClass) }
+            if let ipados { self.ipados = ipados }
+            if let version = osVersion ?? ipados { self.osVersion = version }
+        }
         if code == "no_usb_ipad" { if waitingForUSBSince == nil { waitingForUSBSince = now } } else { waitingForUSBSince = nil }
         if code == "trust_needed" { if trustSince == nil { trustSince = now } } else { trustSince = nil }
     }
@@ -211,11 +226,11 @@ struct OnboardingCopy {
     var skip: String { t("跳过", "Skip") }
     var cancel: String { t("取消", "Cancel") }
     var cableOnly: String { t("先只用数据线", "Use cable only for now") }
-    var developerModeHint: String { t("没看到「开发者模式」？把 iPad 上的「设置」从后台划掉再打开。", "Don't see Developer Mode? Swipe Settings away and open it again.") }
+    var developerModeHint: String { t("没看到「开发者模式」？把 \(deviceZH) 上的「设置」从后台划掉再打开。", "Don't see Developer Mode? Swipe Settings away and open it again.") }
     var reopen: String { t("重新打开 Toss", "Reopen Toss") }
     var cableOnlyStatus: String { t("只能插线用，无线还没设好", "Cable only · wireless isn't set up yet") }
     func settingUpStatus(code: String) -> String {
-        code == "wifi_waiting" ? t("USB 已连接，正在设置无线连接…", "USB connected · setting up wireless…") : t("正在设置 iPad…", "Setting up iPad…")
+        code == "wifi_waiting" ? t("USB 已连接，正在设置无线连接…", "USB connected · setting up wireless…") : t("正在设置 \(deviceZH)…", "Setting up \(deviceEN)…")
     }
 
     func title(_ step: OnboardingStep) -> String {
@@ -223,29 +238,45 @@ struct OnboardingCopy {
         case .welcome: return t("欢迎使用 Toss", "Welcome to Toss")
         case .access: return t("允许辅助功能", "Allow Accessibility")
         case .menubar: return t("在菜单栏显示 Toss", "Show Toss in the Menu Bar")
-        case .cable: return t("用数据线连接 iPad", "Connect Your iPad with a Cable")
-        case .trust: return t("在 iPad 上点「信任」", "Tap Trust on Your iPad")
+        case .cable: return t("用数据线连接 \(deviceZH)", "Connect Your \(deviceEN) with a Cable")
+        case .trust: return t("在 \(deviceZH) 上点「信任」", "Tap Trust on Your \(deviceEN)")
         case .devmode: return t("打开开发者模式", "Turn On Developer Mode")
-        case .prepare: return t("准备 iPad", "Preparing Your iPad")
+        case .prepare: return t("准备 \(deviceZH)", "Preparing Your \(deviceEN)")
         case .wifi: return t("设置无线连接", "Set Up the Wireless Connection")
         case .tryIt: return t("试一下", "Try It")
         case .done: return t("设置完成", "You're All Set")
         }
     }
     // One short grey line under each title (Ashley 2026-10-30: 「所有这种灰色的字还是一行吧」).
+    // English welcome line by device, each within the one-line width (iPad: unchanged wording).
+    private var welcomeEN: String {
+        switch DeviceCopy.deviceClass {
+        case "iPad"?: return "One shortcut puts your iPad screen into ChatGPT, Codex or Claude."
+        case "iPhone"?: return "One shortcut puts your iPhone screen in ChatGPT, Codex or Claude."
+        default: return "One shortcut puts your screen into ChatGPT, Codex or Claude."
+        }
+    }
     func why(_ step: OnboardingStep) -> String {
         switch step {
-        case .welcome: return t("按一下快捷键，iPad 屏幕就贴进 ChatGPT、Codex 或 Claude。",
-                                "One shortcut puts your iPad screen into ChatGPT, Codex or Claude.")
+        case .welcome: return t("按一下快捷键，\(DeviceCopy.label) 屏幕就贴进 ChatGPT、Codex 或 Claude。",
+                                welcomeEN)
         case .access: return t("Toss 靠它找到输入框替你粘贴，不会读取你的聊天。", "Toss uses it to paste for you. It never reads your chats.")
         case .menubar: return t("Toss 的状态和设置都在菜单栏的图标里。", "Toss keeps its status and settings in the menu bar.")
         case .cable: return t("第一次配对要用线，之后不插线也能用。", "The first pairing needs a cable. After that, no cable needed.")
-        case .trust: return t("让这台 iPad 允许这台 Mac 连接它。", "This lets your iPad accept this Mac.")
-        case .devmode: return t("截图需要它，只开一次。iPad 会重启一次，数据线别拔。", "Screenshots need it. Your iPad restarts once; keep the cable in.")
+        case .trust: return t("让这台 \(deviceZH) 允许这台 Mac 连接它。", "This lets your \(deviceEN) accept this Mac.")
+        case .devmode: return t("截图需要它，只开一次。\(deviceZH) 会重启一次，数据线别拔。", "Screenshots need it. Your \(deviceShortEN) restarts once; keep the cable in.")
         case .prepare: return t("正在建立无线配对、下载截图组件，可能要几分钟。", "Setting up wireless and screenshots. Can take a few minutes.")
-        case .wifi: return t("拔掉线也能用。Mac 和 iPad 要连同一个 Wi-Fi。", "Works without the cable. Mac and iPad need the same Wi-Fi.")
-        case .tryIt: return t("打开一个聊天按快捷键，截图只进草稿，不会发送。", "Open a chat and press a shortcut. It only goes into the draft.")
-        case .done: return t("以后直接按快捷键，点菜单栏的 Toss 图标看状态。", "Just press a shortcut. Click Toss in the menu bar for status.")
+        case .wifi: return t("拔掉线也能用。Mac 和 \(deviceZH) 要连同一个 Wi-Fi。", "Works without the cable. Mac and \(DeviceCopy.deviceClass ?? "your device") need the same Wi-Fi.")
+        case .tryIt:
+            if DeviceCopy.bothPaired {
+                return t("打开一个聊天：按一下发 iPad，快速按两下发 iPhone。", "Open a chat: press once for iPad, twice quickly for iPhone.")
+            }
+            return t("打开一个聊天按快捷键，截图只进草稿，不会发送。", "Open a chat and press a shortcut. It only goes into the draft.")
+        case .done:
+            if DeviceCopy.bothPaired {
+                return t("按一下发 iPad，快速按两下发 iPhone，状态在菜单栏。", "Once for iPad, twice quickly for iPhone. Status is in the menu bar.")
+            }
+            return t("以后直接按快捷键，点菜单栏的 Toss 图标看状态。", "Just press a shortcut. Click Toss in the menu bar for status.")
         }
     }
 
@@ -260,22 +291,22 @@ struct OnboardingCopy {
     func howto(_ step: OnboardingStep) -> [String] {
         switch step {
         case .welcome: return [t("一根能传数据的 USB 线\n只能充电的线不行", "A USB cable that carries data\nCharge-only cables won't work"),
-                               t("iPad 解锁，放在手边", "Your iPad, unlocked and nearby"),
-                               t("Mac 能上网\n第一次要下载一个 iPad 组件", "Internet on your Mac\nAn iPad component downloads once")]
+                               t("\(deviceZH) 解锁，放在手边", "Your \(deviceEN), unlocked and nearby"),
+                               t("Mac 能上网\n第一次要下载一个截图组件", "Internet on your Mac\nA screenshot component downloads once")]
         case .access: return [t("系统设置已经打开在「辅助功能」\nToss 就在列表里", "System Settings is open at Accessibility\nToss is already in the list"),
                               t("打开 Toss 的开关\n会要密码或指纹", "Turn on the switch for Toss\nTouch ID or your password"),
                               t("打开后 Toss 会自己继续", "Toss continues by itself once it's on")]
         case .menubar: return [t("系统设置已经打开在「菜单栏」\n往下找到「允许在菜单栏中显示」", "System Settings is open at Menu Bar\nScroll to Allow in the Menu Bar"),
                                t("打开 Toss 的开关\n打开后 Toss 会自己继续", "Switch Toss on\nToss continues by itself")]
-        case .cable: return [t("用数据线把 iPad 连到这台 Mac", "Connect the iPad to this Mac with the cable"), t("解锁 iPad", "Unlock the iPad")]
-        case .trust: return [t("iPad 上会弹出「要信任此电脑吗？」", "Your iPad asks \u{201C}Trust This Computer?\u{201D}"),
-                             t("点「信任」，再输入 iPad 密码", "Tap Trust, then enter the iPad passcode")]
+        case .cable: return [t("用数据线把 \(deviceZH) 连到这台 Mac", "Connect the \(deviceEN) to this Mac with the cable"), t("解锁 \(deviceZH)", "Unlock the \(deviceEN)")]
+        case .trust: return [t("\(deviceZH) 上会弹出「要信任此电脑吗？」", "Your \(deviceEN) asks \u{201C}Trust This Computer?\u{201D}"),
+                             t("点「信任」，再输入 \(deviceZH) 密码", "Tap Trust, then enter the \(deviceEN) passcode")]
         case .devmode: return [t("把「设置」从后台划掉，再重新打开\n「设置」重开后才会显示开关", "Swipe Settings away, then open it again\nSettings shows the switch only after a reopen"),
                                t("点「隐私与安全性」，滑到最下面\n点「开发者模式」", "Tap Privacy & Security, scroll to the bottom\nThen tap Developer Mode"),
                                t("打开开关，点「重新启动」", "Switch it on, tap Restart"),
                                t("重启后解锁，在弹窗里点「打开」\n再输入一次锁屏密码", "After the restart, unlock and tap Turn On\nThen enter your passcode once")]
         case .wifi: return [t("macOS 问「Toss 想要查找本地网络上的设备」时，点「允许」", "If macOS asks to find devices on your network, click Allow"),
-                            t("iPad 保持解锁、连着 Wi-Fi", "Keep the iPad unlocked and on Wi-Fi")]
+                            t("\(deviceZH) 保持解锁、连着 Wi-Fi", "Keep the \(deviceEN) unlocked and on Wi-Fi")]
         case .prepare, .tryIt, .done: return []
         }
     }
@@ -285,7 +316,7 @@ struct OnboardingCopy {
         [("ChatGPT / Codex", t("左右两个 Option 一起按", "Left and right Option together"), "⌥"),
          ("Claude", t("左右两个 Shift 一起按", "Left and right Shift together"), "⇧")]
     }
-    var iPadRow: (title: String, note: String) { ("iPad", t("插着线走 USB，拔掉自动换 Wi-Fi", "USB when plugged in, Wi-Fi otherwise")) }
+    var iPadRow: (title: String, note: String) { (DeviceCopy.label, t("插着线走 USB，拔掉自动换 Wi-Fi", "USB when plugged in, Wi-Fi otherwise")) }
     func connected(_ transport: String?) -> String { t("已连接", "Connected") + (transport.map { " · " + $0 } ?? "") }
 
     func primary(_ flow: OnboardingFlow, at now: Double) -> String {
@@ -304,7 +335,7 @@ struct OnboardingCopy {
     func status(_ flow: OnboardingFlow, at now: Double) -> (OnboardingMark, String, String?) {
         let mark = flow.mark(at: now)
         let code = flow.code ?? ""
-        let device = flow.ipados.map { "iPad · iPadOS \($0)" } ?? "iPad"
+        let device = flow.ipados.map { "\(DeviceCopy.label) · \(osEN) \($0)" } ?? DeviceCopy.label
         switch flow.step {
         case .welcome, .done: return (.none, "", nil)
         case .access:
@@ -328,26 +359,28 @@ struct OnboardingCopy {
         if mark == .ok {
             switch flow.step {
             case .cable: return (.ok, t("已找到 \(device) ✓", "Found \(device) ✓"), nil)
-            case .trust: return (.ok, t("iPad 已信任这台 Mac ✓", "The iPad trusts this Mac ✓"), nil)
+            case .trust: return (.ok, t("\(deviceZH) 已信任这台 Mac ✓", "The \(deviceEN) trusts this Mac ✓"), nil)
             case .devmode: return (.ok, t("开发者模式已打开 ✓", "Developer Mode is on ✓"), nil)
-            case .prepare: return (.ok, t("iPad 已准备好 ✓", "Your iPad is ready ✓"), nil)
+            case .prepare: return (.ok, t("\(deviceZH) 已准备好 ✓", "Your \(deviceEN) is ready ✓"), nil)
             default: return (.ok, t("无线已就绪 ✓", "Wireless is ready ✓"),
                              t("现在可以拔掉数据线了，插着线时走 USB。", "You can unplug now. Plugged in, it uses USB."))
             }
         }
         if mark == .fail {
             switch code {
-            case "no_usb_ipad": return (.fail, t("线已经插上，但 Mac 没有认出 iPad？", "Cable plugged in, but the Mac doesn't see the iPad?"),
-                                        t("可能是只能充电的线，换一根，或先解锁 iPad。", "Maybe a charge-only cable. Try another, or unlock the iPad."))
-            case "unsupported_ipados": return (.fail, t("这台 iPad 的系统太旧了。", "This iPad's system is too old."),
-                                               t("需要 iPadOS 17 或更新。", "iPadOS 17 or later is required."))
-            case "trust_needed": return (.fail, t("iPad 上没有点「信任」。", "Trust wasn't tapped on the iPad."),
-                                         t("拔下数据线再插上，iPad 会再问一次。", "Unplug the cable and plug it in again; the iPad asks again."))
+            case "no_usb_ipad": return (.fail, t("线已经插上，但 Mac 没有认出 \(deviceZH)？", "Cable plugged in, but the Mac doesn't see the \(deviceEN)?"),
+                                        t("可能是只能充电的线，换一根，或先解锁 \(deviceZH)。", "Maybe a charge-only cable. Try another, or unlock the \(deviceEN)."))
+            case "unsupported_ipados": return (.fail, t("这台 \(deviceZH) 的系统太旧了。", "This \(deviceEN)'s system is too old."),
+                                               t("需要 \(osZH) 17 或更新。", "\(osEN) 17 or later is required."))
+            case "unsupported_device": return (.fail, t("Toss 不支持这台设备。", "Toss doesn't support this device."),
+                                               t("请连接 iPad 或 iPhone，系统 17 或更新。", "Connect an iPad or iPhone on version 17 or later."))
+            case "trust_needed": return (.fail, t("\(deviceZH) 上没有点「信任」。", "Trust wasn't tapped on the \(deviceEN)."),
+                                         t("拔下数据线再插上，\(deviceZH) 会再问一次。", "Unplug the cable and plug it in again; the \(deviceEN) asks again."))
             case "pairing_failed": return (.fail, t("无线配对没有成功。", "Wireless pairing didn't finish."),
-                                           t("保持 iPad 解锁、数据线连着，再试一次。", "Keep the iPad unlocked and connected, then try again."))
+                                           t("保持 \(deviceZH) 解锁、数据线连着，再试一次。", "Keep the \(deviceEN) unlocked and connected, then try again."))
             case "developer_image_failed": return (.fail, t("截图组件没有装好。", "The screenshot component didn't install."),
-                                                   t("Mac 要能上网，iPad 保持解锁，再试一次。", "Needs internet and an unlocked iPad. Try again."))
-            case "wifi_unreachable": return (.fail, t("在网络上找不到这台 iPad。", "Can't find the iPad on the network."),
+                                                   t("Mac 要能上网，\(deviceZH) 保持解锁，再试一次。", "Needs internet and an unlocked \(deviceEN). Try again."))
+            case "wifi_unreachable": return (.fail, t("在网络上找不到这台 \(deviceZH)。", "Can't find the \(deviceEN) on the network."),
                                              t("两台设备连同一个 Wi-Fi 再试。插着线时 Toss 已经能用。",
                                                "Use the same Wi-Fi on both and try again. It already works plugged in."))
             case "setup_timeout": return (.fail, t("等太久了，设置停下了。", "Setup took too long and stopped."), t("再试一次，之前做过的步骤不用重做。", "Try again; finished steps are kept."))
@@ -357,26 +390,27 @@ struct OnboardingCopy {
             }
         }
         switch code {
-        case "unlock_needed": return (.wait, t("请解锁 iPad…", "Unlock your iPad…"), nil)
+        case "unlock_needed": return (.wait, t("请解锁 \(deviceZH)…", "Unlock your \(deviceEN)…"), nil)
         // The cable came out after the first step: say so instead of a generic wait.
-        case "no_usb_ipad": return (.wait, t("没有连着 iPad，请插上数据线并解锁…", "No iPad connected. Plug in the cable and unlock it…"), nil)
-        case "multiple_usb_ipads": return (.wait, t("连着不止一台 iPad，只保留要用的那台。", "More than one iPad is connected. Keep only the one you want."), nil)
+        case "no_usb_ipad": return (.wait, t("没有连着 \(deviceZH)，请插上数据线并解锁…", "No \(deviceEN) connected. Plug in the cable and unlock it…"), nil)
+        case "multiple_usb_ipads": return (.wait, t("连着不止一台 \(deviceZH)，只保留要用的那台。", "More than one \(deviceEN) is connected. Keep only the one you want."), nil)
+        case "mixed_usb_devices": return (.wait, t("同时连着 iPad 和 iPhone，只保留要用的那台。", "Both an iPad and an iPhone are connected. Keep only the one you want."), nil)
         case "trust_needed":
             let long = flow.trustSince.map { now - $0 >= 30 } ?? false
-            return (.wait, t("正在等你在 iPad 上点「信任」…", "Waiting for you to tap Trust on the iPad…"),
+            return (.wait, t("正在等你在 \(deviceZH) 上点「信任」…", "Waiting for you to tap Trust on the \(deviceEN)…"),
                     long ? t("没看到提示？拔下数据线再插上。", "No prompt? Unplug the cable, plug it back in.") : nil)
-        case "developer_mode_auto": return (.wait, t("Toss 正在打开开发者模式，iPad 会自动重启一次…", "Toss is turning on Developer Mode; your iPad restarts once…"), nil)
-        case "developer_mode_needed": return (.wait, t("正在等你在 iPad 上打开开关…", "Waiting for you to switch it on on your iPad…"),
-                                            t("点完 iPad 会自己重启，重启后会弹出提示。", "Your iPad then restarts and shows a prompt."))
-        case "ipad_restarting": return (.wait, t("iPad 正在重启，数据线别拔…", "Your iPad is restarting; keep the cable in…"),
-                                        t("重启后解锁 iPad，会弹出「打开开发者模式？」。", "After the restart, unlock it; the Turn On Developer Mode prompt appears."))
-        case "developer_mode_confirm": return (.wait, t("在 iPad 的弹窗里点「打开」，输入锁屏密码", "On your iPad, tap Turn On and enter your passcode"),
+        case "developer_mode_auto": return (.wait, t("Toss 正在打开开发者模式，\(deviceZH) 会自动重启一次…", "Toss is turning on Developer Mode; your \(deviceEN) restarts once…"), nil)
+        case "developer_mode_needed": return (.wait, t("正在等你在 \(deviceZH) 上打开开关…", "Waiting for you to switch it on on your \(deviceEN)…"),
+                                            t("点完 \(deviceZH) 会自己重启，重启后会弹出提示。", "Your \(deviceEN) then restarts and shows a prompt."))
+        case "ipad_restarting": return (.wait, t("\(deviceZH) 正在重启，数据线别拔…", "Your \(deviceEN) is restarting; keep the cable in…"),
+                                        t("重启后解锁 \(deviceZH)，会弹出「打开开发者模式？」。", "After the restart, unlock it; the Turn On Developer Mode prompt appears."))
+        case "developer_mode_confirm": return (.wait, t("在 \(deviceZH) 的弹窗里点「打开」，输入锁屏密码", "On your \(deviceEN), tap Turn On and enter your passcode"),
                                                    t("输完 Toss 会自动继续。", "Toss continues by itself."))
         case "pairing_wireless": return (.wait, t("正在建立无线配对…", "Setting up wireless pairing…"), nil)
         case "preparing_image": return (.wait, t("正在下载并安装截图组件…\n第一次要联网，网慢时要几分钟", "Downloading the screenshot component…\nNeeds internet the first time; can take a few minutes"), nil)
         case "wifi_waiting": return (.wait, t("USB 已连接，正在设置无线连接…", "USB is connected; setting up wireless…"),
                                      t("插着线已经能截图，但这一步要等无线好了才算完成。", "USB already works, but this step needs wireless."))
-        default: return (.wait, t("正在等待 iPad…", "Waiting for the iPad…"), nil)
+        default: return (.wait, t("正在等待 \(deviceZH)…", "Waiting for the \(deviceEN)…"), nil)
         }
     }
 }
@@ -429,10 +463,18 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         ])
         window.center()
         render()
+        SettingsStyle.applyUnifiedWindowStyle(in: window)
+    }
+
+    func resetForDeviceSetup() {
+        advanceTimer?.invalidate(); advanceTimer = nil
+        flow = OnboardingFlow()
+        transport = nil
+        shown = nil
+        render()
     }
 
     func show() {
-        if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
         tick?.invalidate()
         // Re-evaluates time-based hints (charge-only cable) once a second.
@@ -452,9 +494,12 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         guard flow.accessibility != granted else { return }
         flow.accessibility = granted; render(); scheduleAdvance()
     }
-    func setupCode(_ code: String, final: Bool, ipados: String?) {
-        flow.receive(code: code, final: final, ipados: ipados, at: now()); render(); scheduleAdvance()
+    func setupCode(_ code: String, final: Bool, ipados: String?,
+                   deviceClass: DeviceClass? = nil, osVersion: String? = nil) {
+        flow.receive(code: code, final: final, ipados: ipados,
+                     deviceClass: deviceClass, osVersion: osVersion, at: now()); render(); scheduleAdvance()
     }
+    func setDeviceClass(_ value: DeviceClass?) { flow.setDeviceClass(value); render() }
     // "USB" or "Wi-Fi" for the done step's iPad row, from the live connection.
     private(set) var transport: String?
     func setTransport(_ label: String?) { guard transport != label else { return }; transport = label; shown = nil; render() }

@@ -1,7 +1,8 @@
 Wireless transport provenance
 
 vendor/remote_pairing_transport.py and vendor/system_bonjour.py are derived from
-an earlier, device-tested local prototype. On 2026-10-15 the companion copies gained a
+the locally developed and previously device-tested project modules under
+work/developer-probe/source-agent. On 2026-10-15 the companion copies gained a
 dual-stack DNS-SD settle optimization and per-request endpoint deduplication;
 they are no longer byte-for-byte copies. These two changes have synthetic test
 coverage but no new real-device timing validation. Authentication, route checks,

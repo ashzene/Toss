@@ -1,0 +1,89 @@
+0.2.0 integration review — source and offline processes only, 2026-10-15.
+
+The native parent now starts capture_service.py with --state-dir, --output-dir,
+and --idle-seconds60, sending request-specific JSONL through anonymous stdin.
+CaptureReceipt and its freshness/file/hash checks are unchanged. The parent
+requires a matching request UUID, bounds lines to16KiB, has an independent
+40-second timeout and invalidates the whole process generation on cancellation,
+protocol error or failed result. Stop/quit also terminate an idle warm child.
+
+Review found and fixed macOS pipe/process hazards before deployment:
+- read(upToCount:4096) withheld a short line until buffer-full/EOF. POSIX read
+  now returns available bytes; a reader owns its fd until EOF, avoiding reuse.
+- write to closed stdin delivered SIGPIPE. F_SETNOSIGPIPE is now set and checked
+  on this pipe, so the write throws and is handled instead of killing the App.
+- Foundation.Process already creates a child-led process group; setsid returns
+  EPERM in a local Swift-to-Python probe. This topology is accepted only after
+  checking child pgid==pid and parent pgid!=child pid. A backend regression test
+  starts a real synthetic child in that exact process-group topology.
+37 real fake-child-process assertions cover the pipe fixes plus reuse, timeout, malformed
+results, failure invalidation, busy rejection and stale-generation cancellation.
+No main App/AX/network/device code was run by that suite.
+
+The redundant pre-focus scan was removed because focus() fully revalidates on
+entry. The second scan is retained after actual activation/async wait and omitted
+only if already foreground with no intervening async gap. All pre-paste checks,
+empty selection, draft/old attachment preservation and no-send behavior remain.
+
+A late cancelled output has a unique UUID and cannot be accepted later, but may
+remain in the private cache after a force kill; 24-hour startup cleanup remains.
+This supersedes the older claim that all late output callbacks delete files.
+
+Historical single-shot interface review follows:
+
+Static review, 2026-10-15. No app execution, AX inspection, real capture or pairing.
+
+Aligned in Sources/TossApp.swift at review time:
+- UUID().uuidString.lowercased() satisfies the canonical UUID requirement.
+- --state-dir/--output-file/--request-id/--timeout 40 match the CLI contract.
+- Main app uses a 45-second capture budget, giving backend cancellation margin.
+- schema_version, request_id, ok, transport, source, width, height, bytes, sha256
+  match the backend's exact snake_case JSON fields.
+- The native app supplies its own output path; no output_file JSON is required.
+- Cache parent is created/chmod700; backend writes0600 and rejects existing paths.
+- PYTHONNOUSERSITE=1, PYTHONDONTWRITEBYTECODE=1 and removed PYTHONPATH/PYTHONHOME
+  are compatible with the backend's relative vendor module loading.
+- Backend SHA256 covers the actual bytes published with atomic no-overwrite link;
+  PIL verifies PNG chunk integrity and validates actual dimensions before publish.
+- Each fresh worker uses DVT takeScreenshot exactly once and authenticates Wi-Fi.
+
+Findings sent to root for main-app correction (source reviewed before fixes):
+1. Main app did not inspect backend monotonic timestamps, so main-thread delay
+   could make an old image receive a new imageLifetime period. Check captured
+   time against current monotonic time on receive and immediately before paste.
+2. Main cleanup sent SIGTERM only, without the planned one-second SIGKILL fallback.
+   Backend normal SIGTERM cleanup <1 second is tested; stuck native dependencies
+   still justify the main-process fallback. Parent-death watchdog stops worker.
+3. Main metadata checks accepted any dimensions >=500 and up to80MiB. Tighten to
+   the backend's exact supported dimensions and40MiB, verify regular file/owner/
+   private permissions, and require a digest of exactly64 lowercase hex chars.
+
+Package completeness at review time:
+- Backend files, minimal support modules, dependency lock, notices and license
+  are present. Vendor core copies match the original verified source hashes.
+- The currently built build/Toss is just a Mach-O executable. It needs
+  app bundle Resources/Backend + Resources/User Guide.txt and Runtime/python.
+  Until that bundle/config is created, direct execution cannot locate backend.
+- External virtualenv dependencies are not bundled; preserve/configure the
+  existing verified environment or follow REBUILD-ENVIRONMENT.txt.
+- No private state, device identifiers, keys, endpoint addresses or screenshots
+  were read while checking the interface.
+
+scripts/test-backend.sh now runs the 26 no-network/no-UI tests using the existing
+venv by default; TOSS_PYTHON can select a rebuilt environment explicitly.
+
+Follow-up review after root's fixes:
+- Sources/CaptureContract.swift now validates exact dimensions,40MiB bound,
+  request/capture monotonic ordering and age, regular owner-matching0600 file,
+  no-follow file open and actual byte SHA256.
+- TossApp calls CaptureReceipt.validate on receive and checks the receipt's
+  captured-time-based expiry immediately before posting the paste event.
+- Cleanup now sends SIGTERM and, if still running after one second, SIGKILL.
+- A late callback for a cancelled UUID removes only that UUID's output file.
+- scripts/test-capture-contract.sh compiles only CaptureContract.swift and the
+  new pure test file. 33 assertions passed. Its synthetic bytes are intentionally
+  not a decodable PNG: this confirms metadata/hash/time validation, not decoding.
+  Actual PNG decoding remains covered by the backend suite.
+- Remaining force-kill cleanup boundary: the backend's hidden .toss-* scratch
+  folder can survive SIGKILL (normal SIGTERM is tested to remove it). It is private;
+  the app should age-purge it or document that limitation explicitly.

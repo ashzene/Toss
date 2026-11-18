@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""First-time iPad setup, started by the app; the user only acts on the iPad.
+"""First-time iPad/iPhone setup, started by the app; the user acts on the device.
 
 `auto` watches USB and drives every step by itself, printing one JSON line per
 state change: {"schema_version":1, "ok":bool, "code":"<fixed code>",
@@ -7,7 +7,7 @@ state change: {"schema_version":1, "ok":bool, "code":"<fixed code>",
 each code as an instruction; nobody has to click "check again".
 
 Steps (USB only until the RemotePairing record exists, then Wi-Fi only):
-  1. exactly one USB-connected iPad on iPadOS 17+ (waits until plugged in)
+  1. exactly one USB-connected iPad/iPhone on iPadOS/iOS 17+ (waits until plugged in)
   2. "Trust This Computer" (lockdown pairing; the user taps Trust on the iPad)
   3. Developer Mode. Without a passcode it is switched on and confirmed
      automatically (the iPad restarts by itself). With a passcode iPadOS only
@@ -33,7 +33,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import capture_once as once  # noqa: E402  (also adds vendor/ to sys.path)
-from ipad_probe import ProbeFailure, fingerprint
+from ipad_probe import ProbeFailure, fingerprint, device_class_from_model, read_device_pin
 
 USBMUX = "/var/run/usbmuxd"
 TRUST_TIMEOUT = 90
@@ -49,10 +49,18 @@ class Emitter:
     """One line per change of (code, fields); the final line is always written."""
     def __init__(self):
         self.last = None
+        self.target_hash = None
 
     def __call__(self, ok: bool, code: str, final: bool = True, **fields):
         safe = {k: v for k, v in fields.items()
                 if k in {"model", "ipados"} and isinstance(v, str) and len(v) < 32}
+        if self.target_hash is not None:
+            safe["setup_device_hash"] = self.target_hash
+        device_class = device_class_from_model(safe.get("model"))
+        if device_class is not None:
+            safe["device_class"] = device_class
+        if "ipados" in safe:
+            safe["os_version"] = safe["ipados"]
         if type(fields.get("devmode_passcode")) is int and fields["devmode_passcode"] in (0, 1):
             safe["devmode_passcode"] = fields["devmode_passcode"]
         error = fields.get("devmode_enable_error")
@@ -95,7 +103,13 @@ def write_private(path: Path, data: bytes):
 
 
 def has_pairing(state: Path) -> bool:
-    return (state / "target.json").is_file() and (state / "strict-remote-pairing.plist").is_file()
+    if not ((state / "target.json").is_file() and (state / "strict-remote-pairing.plist").is_file()):
+        return False
+    try:
+        read_device_pin(state)
+    except ProbeFailure:
+        return False  # Unsupported/corrupt pins are unpaired; never use their transport.
+    return True
 
 
 def developer_image_missing(provider) -> bool:
@@ -105,6 +119,11 @@ def developer_image_missing(provider) -> bool:
 
 
 async def usb_ipads(cache: Path):
+    """USB inventory: (serial, ProductType, OS version, paired, device_class).
+
+    Keep unsupported and unreadable entries so setup can report them without
+    ever pairing one. Network entries are never eligible.
+    """
     from pymobiledevice3 import usbmux
     from pymobiledevice3.lockdown import create_using_usbmux
     found = []
@@ -116,12 +135,25 @@ async def usb_ipads(cache: Path):
                                                pairing_records_cache_folder=cache, usbmux_address=USBMUX)
         except Exception:
             # Present but not answering yet: still booting, or locked since boot.
-            found.append((device.serial, None, None, None))
+            found.append((device.serial, None, None, None, None))
             continue
         async with client:
-            if str(client.product_type).startswith("iPad"):
-                found.append((device.serial, client.product_type, client.product_version, client.paired))
+            found.append((device.serial, client.product_type, client.product_version, client.paired,
+                          device_class_from_model(client.product_type)))
     return found
+
+
+def select_usb_device(devices):
+    """Select one supported device; never guess while another is unreadable."""
+    supported = [entry for entry in devices if entry[4] in ("iPad", "iPhone")]
+    if len({entry[4] for entry in supported}) > 1:
+        return None, "mixed_usb_devices"
+    candidates = [entry for entry in devices if entry[4] in ("iPad", "iPhone") or entry[1] is None]
+    if len(candidates) > 1:
+        return None, "multiple_usb_ipads"
+    if candidates:
+        return candidates[0], None
+    return None, "unsupported_device" if devices else "no_usb_ipad"
 
 
 async def lockdown_for(serial: str, cache: Path):
@@ -226,8 +258,12 @@ async def try_accept_developer_mode(client) -> bool:
 
 async def finish_pairing(state: Path, serial: str, cache: Path, udid: str, model, version) -> str:
     from remote_pairing_transport import bootstrap_usb
+    device_class = device_class_from_model(model)
+    if device_class is None:
+        raise ProbeFailure("unexpected_device_pin")
     write_private(state / "target.json",
-                  json.dumps({"model": model, "device_hash": fingerprint(udid)}).encode())
+                  json.dumps({"model": model, "device_hash": fingerprint(udid),
+                              "device_class": device_class}).encode())
     emit(False, "pairing_wireless", final=False, model=model, ipados=version)
     try:
         async with asyncio.timeout(120):
@@ -239,13 +275,13 @@ async def finish_pairing(state: Path, serial: str, cache: Path, udid: str, model
     return await wifi_prepare_with_retries(state, model=model, ipados=version)
 
 
-async def auto(state: Path) -> str:
+async def auto(state: Path, expected_class=None, expected_hash=None) -> str:
     """Drive the whole first-time setup; returns the final code."""
     state = private_state(state)
     cache = state / "cache"
     use_private_cache(state)
     if has_pairing(state):
-        pin = json.loads((state / "target.json").read_text())
+        pin = read_device_pin(state)
         code = await wifi_prepare_with_retries(state, model=pin.get("model"))
         return emit_final(code == "ready", code, model=pin.get("model"))
 
@@ -262,18 +298,14 @@ async def auto(state: Path) -> str:
     revealer = RevealRepeater(state)
     try:
         while time.monotonic() < deadline:
-            ipads = await usb_ipads(cache)
-            if not ipads:
-                if developer_mode_requested:
+            device, selection_code = select_usb_device(await usb_ipads(cache))
+            if selection_code:
+                if selection_code == "no_usb_ipad" and developer_mode_requested:
                     if usb_absent_since is None:
                         usb_absent_since = time.monotonic()
                     emit(False, "ipad_restarting", final=False, model=model, ipados=version)
                 else:
-                    emit(False, "no_usb_ipad", final=False)
-                await asyncio.sleep(POLL_SECONDS)
-                continue
-            if len(ipads) > 1:
-                emit(False, "multiple_usb_ipads", final=False)
+                    emit(False, selection_code, final=False)
                 await asyncio.sleep(POLL_SECONDS)
                 continue
             if usb_absent_since is not None:
@@ -285,7 +317,9 @@ async def auto(state: Path) -> str:
                 confirm_until = now + DEVELOPER_CONFIRM_SECONDS if seen_restart else None
                 accept_tries = 0
                 usb_absent_since = None
-            serial, model, version, paired = ipads[0]
+            serial, model, version, paired, device_class = device
+            if model is not None and expected_class is not None and (device_class != expected_class or fingerprint(serial) != expected_hash):
+                return emit_final(False, "pairing_failed")
             if model is None:
                 emit(False, "ipad_restarting" if seen_restart else "unlock_needed", final=False)
                 await asyncio.sleep(POLL_SECONDS)
@@ -365,21 +399,22 @@ def emit_final(ok: bool, code: str, **fields) -> str:
     return code
 
 
-async def next_step(state: Path):
+async def next_step(state: Path, expected_class=None, expected_hash=None):
     """Legacy single round for 0.6 app builds."""
     state = private_state(state)
     cache = state / "cache"
     use_private_cache(state)
     if has_pairing(state):
-        pin = json.loads((state / "target.json").read_text())
+        pin = read_device_pin(state)
         code = await wifi_prepare(state)
         return emit_final(code == "ready", code, model=pin.get("model"))
-    ipads = [entry for entry in await usb_ipads(cache) if entry[1] is not None]
-    if not ipads:
-        return emit_final(False, "no_usb_ipad")
-    if len(ipads) > 1:
-        return emit_final(False, "multiple_usb_ipads")
-    serial, model, version, paired = ipads[0]
+    devices = [entry for entry in await usb_ipads(cache) if entry[1] is not None]
+    device, selection_code = select_usb_device(devices)
+    if selection_code:
+        return emit_final(False, selection_code)
+    serial, model, version, paired, device_class = device
+    if expected_class is not None and (device_class != expected_class or fingerprint(serial) != expected_hash):
+        return emit_final(False, "pairing_failed")
     from remote_pairing_transport import supported_ipados
     if not supported_ipados(version):
         return emit_final(False, "unsupported_ipados", model=model, ipados=version)
@@ -412,6 +447,49 @@ async def next_step(state: Path):
     return emit_final(code == "ready", code, model=model, ipados=version)
 
 
+async def auto_devices(root: Path, single_step=False) -> str:
+    """Choose once from USB; adding a class never reuses the other class's state."""
+    from paired_devices import migrate_legacy, device_directory, register_device, private_directory
+    root = private_state(root)
+    targets = migrate_legacy(root)
+    cache = private_state(root) / "cache"
+    use_private_cache(root)
+    deadline = time.monotonic() + AUTO_LIMIT_SECONDS
+    while time.monotonic() < deadline:
+        device, selection_code = select_usb_device(await usb_ipads(cache))
+        if selection_code or device[1] is None:
+            if single_step:
+                return emit_final(False, selection_code or "unlock_needed")
+            emit(False, selection_code or "unlock_needed", final=False)
+            await asyncio.sleep(POLL_SECONDS)
+            continue
+        serial, model, version, _, kind = device
+        expected_hash = fingerprint(serial)
+        if kind in targets and targets[kind]["device_hash"] != expected_hash:
+            # Explicit per-device Forget is required to replace an occupied slot.
+            return emit_final(False, "pairing_failed", model=model, ipados=version)
+        private_directory(root / "devices", create=True)
+        state = private_directory(device_directory(root, kind), create=True)
+        if has_pairing(state):
+            existing = read_device_pin(state)
+            if existing["device_hash"] != expected_hash or existing["device_class"] != kind:
+                return emit_final(False, "pairing_failed", model=model, ipados=version)
+        operation = next_step if single_step else auto
+        # Identify the already selected target to the UI without exposing its UDID.
+        emit.target_hash = expected_hash
+        try:
+            code = await operation(state, expected_class=kind, expected_hash=expected_hash)
+        finally:
+            emit.target_hash = None
+        if has_pairing(state):
+            pin = read_device_pin(state)
+            if pin["device_class"] != kind or pin["device_hash"] != expected_hash:
+                return emit_final(False, "pairing_failed", model=model, ipados=version)
+            register_device(root, kind)
+        return code
+    return emit_final(False, "setup_timeout")
+
+
 def exit_with_parent(poll_seconds=1.0):
     """End this process when Toss goes away, even inside a long pairing step.
 
@@ -434,8 +512,9 @@ def main(argv=None):
     os.umask(0o077)
     exit_with_parent()
     parser = once.QuietParser(description=__doc__)
-    parser.add_argument("action", choices=["auto", "next", "prepare"])
+    parser.add_argument("action", choices=["auto", "next", "prepare", "forget"])
     parser.add_argument("--state-dir", type=Path, required=True)
+    parser.add_argument("--device-class", choices=("iPad", "iPhone"))
     args = parser.parse_args(argv)
     # Library logging must never reach the JSON lines on stdout.
     original = os.dup(1)
@@ -446,18 +525,23 @@ def main(argv=None):
     sys.stdout = os.fdopen(original, "w")
     once.logging.disable(once.logging.CRITICAL)
     try:
-        if args.action == "prepare":
-            state = private_state(args.state_dir)
+        from paired_devices import resolve_state, forget_device
+        if args.action == "forget":
+            forget_device(args.state_dir, args.device_class)
+            emit_final(True, "not_paired")
+        elif args.action == "prepare":
+            state = resolve_state(args.state_dir, args.device_class)
             if not has_pairing(state):
                 emit_final(False, "not_paired")
                 return 1
             use_private_cache(state)
-            code = asyncio.run(wifi_prepare_with_retries(state))
-            emit_final(code == "ready", code)
+            pin = read_device_pin(state)
+            code = asyncio.run(wifi_prepare_with_retries(state, model=pin["model"]))
+            emit_final(code == "ready", code, model=pin["model"])
         elif args.action == "auto":
-            asyncio.run(auto(args.state_dir))
+            asyncio.run(auto_devices(args.state_dir))
         else:
-            asyncio.run(next_step(args.state_dir))
+            asyncio.run(auto_devices(args.state_dir, single_step=True))
         return 0
     except BaseException:
         emit_final(False, "setup_failed")

@@ -23,6 +23,14 @@ import Foundation
         check(!AttachmentSighting.canAscend(role: "AXGroup", frame: nil), "missing geometry cannot bypass card bounds")
         check(!AttachmentSighting.canAscend(role: nil, frame: card), "unknown ancestor rejected")
         check(!AttachmentSighting.canAscend(role: "AXGroup", frame: CGRect(x: 0, y: 0, width: 500, height: 900)), "thread-size ancestor rejected")
+        let tile = CGRect(x: 520, y: 730, width: 183, height: 183)
+        let reflowed = tile.offsetBy(dx: 0, dy: -36)
+        check(AttachmentSighting.frameChanged(from: tile, to: reflowed, followPosition: true),
+              "Chat composer reflow moves the attachment without resizing it")
+        check(!AttachmentSighting.frameChanged(from: tile, to: reflowed, followPosition: false),
+              "legacy growth follows size changes only")
+        check(!AttachmentSighting.frameChanged(from: tile, to: tile.offsetBy(dx: 0, dy: 0.25), followPosition: true),
+              "subpoint jitter does not move the cover")
         // Queued-press release (2026-10-28): wait for the previous tile to stop growing, not a fixed 0.65 s.
         let claudeFinal = CGSize(width: 173, height: 173)
         check(!AttachmentSighting.growthSettled(current: CGSize(width: 159, height: 159), previous: CGSize(width: 159, height: 159),

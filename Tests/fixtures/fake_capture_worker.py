@@ -13,6 +13,7 @@ import threading
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--state-dir", type=Path, required=True)
+    parser.add_argument("--device-class", choices=("iPad", "iPhone"))
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--idle-seconds")
     parser.add_argument("--timings-file")
@@ -26,13 +27,17 @@ def main():
     output_lock = threading.Lock()
     def emit(value):
         value.update(worker_role=args.worker_role, transport="authenticated_" + args.transport)
+        if args.device_class:
+            value["device_class"] = ("iPad" if args.device_class == "iPhone" else "iPhone") if (
+                args.state_dir / "mode").read_text().strip() == "wrong-device-class" else args.device_class
         with output_lock:
             print(json.dumps(value, separators=(",", ":")), flush=True)
     sequence = 0
     def audit(event, **values):
         with (args.state_dir / "audit.jsonl").open("a") as handle:
             handle.write(json.dumps({"event": event, "worker_pid": os.getpid(), "transport": args.transport, "worker_role": args.worker_role, **values}) + "\n")
-    audit("started", preconnect=args.preconnect, idle_seconds=args.idle_seconds, timings_file=args.timings_file)
+    audit("started", preconnect=args.preconnect, idle_seconds=args.idle_seconds, timings_file=args.timings_file,
+          device_class=args.device_class)
     if args.preconnect and (args.state_dir / "mode").read_text().strip() == "prepare-exit":
         audit("preconnect_exiting")
         return 3
@@ -77,6 +82,7 @@ def main():
             # graceful cancellation briefly. The native fallback still kills it.
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
         audit("request", request_id=request.get("request_id"), sequence=sequence, mode=mode, attempt_id=request.get("attempt_id"),
+              device_class=request.get("device_class"),
               deadline=request.get("deadline_monotonic"), press_started=request.get("press_started_monotonic"), limits=request.get("limits_ms"),
               screenshot_deadline=request.get("screenshot_deadline_monotonic"),
               output_file=request.get("output_file"))

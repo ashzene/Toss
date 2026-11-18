@@ -229,6 +229,13 @@ private final class FakeChannel: USBMuxChannel {
         let open = source.components(separatedBy: "@objc private func openOnboarding()")[1]
             .components(separatedBy: "// System Settings")[0]
         check(!open.contains("cancel("), "opening must not cancel pairing")
+        check(open.contains("if !setupWizard.isRunning {"), "running setup must not reset")
+        let failing = source.components(separatedBy: "private func failure(_ error: Error")[1].components(separatedBy: "ToastContent.failure")[0]
+        let afterStatus = failing.components(separatedBy: "setStatus(text, code: code)")[1]
+        check(afterStatus.contains("DeviceCopy.deviceClass = pressDevice"), "failure toast names the device this press took, after setStatus")
+        check(open.range(of: "updateDeviceCopy()")!.lowerBound < open.range(of: "resetForDeviceSetup()")!.lowerBound, "device copy changes before the guide draws")
+        check(offer.contains("if !setupWizard.isRunning {"), "USB arrival must not overwrite running target copy")
+        check(offer.contains("candidateHashes: candidates.map(\\.deviceHash)"), "target check uses all pending hashes")
 
         check(offer.contains("automaticPresented(candidates, visible: onboarding?.isVisible == true)"), "snapshot only when shown")
         check(open.contains("usbSetupPolicy.markPresented()"), "manual entry has no suppression gate")

@@ -6,7 +6,8 @@ Verified locally: Python 3.13.15, OpenSSL 3.0.21,
   hasattr(ssl.SSLContext, "set_psk_client_callback") == True
 The Python version alone is insufficient: this PSK callback must exist.
 Do not use Apple's /usr/bin/python3 or a system interpreter with unknown SSL
-support for this transport. Tested with a Python 3.13 virtual environment built from requirements-tested.txt.
+support for this transport. The current tested environment is the existing
+work/developer-probe/.venv; no new environment has been installed in this task.
 
 From the unpacked source folder Toss, these commands create a
 separate environment. Choose an unused directory if python-3.13-rebuilt exists:

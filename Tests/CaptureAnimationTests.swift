@@ -205,7 +205,7 @@ import Foundation
         }
         check(samples(.drop).allSatisfy { CaptureJelly.lean(at: $0, style: .drop) == 0 }, "vertical never leans")
         check(leanPeak(.both) > 14 && leanPeak(.both) < 16, "combined leans about 15 degrees (\(leanPeak(.both)))")
-        // Extra (14:56, more bounce; 2026-10-25 video: the bulge covered the
+        // Extra (Ashley 14:56 "上下不够duang"; 2026-10-25 video: the bulge covered the
         // neighbouring tile): pinned at the bottom-left, the width grows at most 4 % (below the
         // gap to the next tile), no lean, and the whole bounce is in the height.
         let extraTimes = samples(.extra)

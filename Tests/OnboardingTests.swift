@@ -4,8 +4,25 @@ import CoreText
 @main
 struct OnboardingTests {
     @MainActor static func main() {
+        if !run() { exit(1) }
+    }
+
+    @MainActor private static func run() -> Bool {
         var count = 0
-        func check(_ condition: Bool, _ line: Int = #line) { if !condition { fatalError("line \(line)") }; count += 1 }
+        var failures = 0, widthFailures = 0, widthChecks = 0
+        var failedLines = Set<Int>()
+        func check(_ condition: Bool, _ line: Int = #line) {
+            count += 1
+            if !condition {
+                failures += 1
+                if failedLines.insert(line).inserted { fputs("FAIL OnboardingTests.swift:\(line)\n", stderr) }
+            }
+        }
+        let previousDevice = DeviceCopy.deviceClass, previousLanguage = AppLanguage.override
+        defer { DeviceCopy.deviceClass = previousDevice; AppLanguage.override = previousLanguage }
+        // Keep the existing flow assertions as the iPad compatibility regression.
+        // The copy and width matrix below also exercises nil and iPhone explicitly.
+        DeviceCopy.deviceClass = "iPad"
 
         // Every setup_device.py code shown on its step.
         let stages: [String: OnboardingStep] = [
@@ -30,6 +47,36 @@ struct OnboardingTests {
         }
         stoppable = OnboardingFlow(); stoppable.step = .tryIt
         check(!stoppable.showsCancel(setupRunning: true, at: 0))
+
+        // Class/version are data for later copy; new codes stay on the cable step.
+        var phone = OnboardingFlow(); phone.step = .cable
+        phone.receive(code: "trust_needed", final: false, ipados: "17.7", deviceClass: .iPhone, osVersion: "17.7", at: 0)
+        check(phone.deviceClass == .iPhone && phone.osVersion == "17.7" && phone.ipados == "17.7")
+        phone.receive(code: "preparing_image", final: false, ipados: nil, at: 1)
+        check(phone.deviceClass == .iPhone && phone.osVersion == "17.7")
+        phone.receive(code: "ready", final: true, ipados: nil, at: 2)
+        check(phone.deviceClass == .iPhone && phone.wirelessReady)
+        for code in ["unsupported_device", "mixed_usb_devices"] {
+            check(OnboardingFlow.stage(for: code) == .cable)
+            phone.receive(code: code, final: true, ipados: nil, at: 3)
+            check(phone.setupStage == .cable && phone.mark(at: 3) == .fail && !phone.wirelessReady)
+            check(phone.deviceClass == nil && phone.osVersion == nil && phone.ipados == nil)
+        }
+        phone.receive(code: "mixed_usb_devices", final: false, ipados: nil, at: 4)
+        check(phone.mark(at: 4) == .wait && !phone.advancesBySetup)
+        phone.receive(code: "trust_needed", final: false, ipados: "18.1", deviceClass: .iPhone, at: 5)
+        phone.receive(code: "trust_needed", final: false, ipados: nil, deviceClass: .iPad, at: 6)
+        check(phone.deviceClass == .iPad && phone.ipados == nil && phone.osVersion == nil)
+        phone.setDeviceClass(nil)
+        check(phone.deviceClass == nil)
+        phone.receive(code: "trust_needed", final: false, ipados: "17.7", at: 7)
+        phone.setDeviceClass(nil)
+        check(phone.ipados == nil && phone.osVersion == nil)
+        for code in ["no_usb_ipad", "multiple_usb_ipads", "not_paired"] {
+            phone.receive(code: "trust_needed", final: false, ipados: "17.7", deviceClass: .iPhone, at: 8)
+            phone.receive(code: code, final: false, ipados: nil, at: 9)
+            check(phone.deviceClass == nil && phone.ipados == nil && phone.osVersion == nil)
+        }
 
         // A whole first pairing: each step turns green, then moves on; never backward.
         var flow = OnboardingFlow()
@@ -284,58 +331,155 @@ struct OnboardingTests {
         for file in (try? FileManager.default.contentsOfDirectory(atPath: fontsDir)) ?? [] where file.hasSuffix(".ttf") {
             CTFontManagerRegisterFontsForURL(URL(fileURLWithPath: fontsDir).appendingPathComponent(file) as CFURL, .process, nil)
         }
-        func fits(_ text: String, _ size: CGFloat, _ width: CGFloat) -> Bool {
-            let w = NSAttributedString(string: text, attributes: [.font: SettingsStyle.sans(size)]).size().width
-            if w > width { fputs("too wide (\(Int(w)) > \(Int(width))): \(text)\n", stderr) }
-            return w <= width && !text.contains("\n")
+        var widthContext = "", widthLanguage = ""
+        var reportedWidths = Set<String>()
+        func fits(_ text: String, _ size: CGFloat, _ width: CGFloat, font: NSFont? = nil) -> Bool {
+            widthChecks += 1
+            let actualFont = font ?? SettingsStyle.sans(size)
+            let w = NSAttributedString(string: text, attributes: [.font: actualFont]).size().width
+            let fits = w <= width && !text.contains("\n")
+            if !fits {
+                widthFailures += 1
+                let row: [String: Any] = ["device": DeviceCopy.deviceClass ?? "nil", "language": widthLanguage,
+                    "context": widthContext, "text": text, "font": actualFont.fontName, "size": Double(size),
+                    "measured": Double(w), "limit": Double(width), "excess": Double(max(0, w - width)),
+                    "contains_newline": text.contains("\n")]
+                let json = String(data: try! JSONSerialization.data(withJSONObject: row, options: [.sortedKeys]), encoding: .utf8)!
+                if reportedWidths.insert(json).inserted { print("WIDTH " + json) }
+            }
+            return fits
+        }
+        // Source-literal checks must measure displayed text, not the characters
+        // "\(deviceEN)" in a Swift interpolation. Unknown substitutions fail closed.
+        func displayed(_ literal: String) -> String {
+            var text = literal
+            for (name, value) in [("deviceEN", deviceEN), ("deviceZH", deviceZH), ("osEN", osEN), ("osZH", osZH),
+                                  ("deviceShortEN", deviceShortEN), ("deviceSubjectEN", deviceSubjectEN),
+                                  ("deviceSubjectCapEN", deviceSubjectCapEN),
+                                  ("DeviceCopy.label", DeviceCopy.label)] {
+                text = text.replacingOccurrences(of: "\\(" + name + ")", with: value)
+            }
+            check(!text.contains("\\("))
+            return text.replacingOccurrences(of: "\\n", with: "\n")
+                .replacingOccurrences(of: "\\\"", with: "\"")
         }
         let inner = SettingsStyle.width - 2 * SettingsStyle.margin
-        for copy in allCopies { check(fits(copy.developerModeHint, 12.5, inner)) }
+        for kind in ["iPad", "iPhone"] {
+            DeviceCopy.deviceClass = kind
+            check(zh.developerModeHint.contains(kind))
+            for copy in allCopies { check(fits(copy.developerModeHint, 12.5, inner)) }
+        }
+        DeviceCopy.deviceClass = "iPad"
         check(NSFont(name: "HankenGrotesk-Regular", size: 12) != nil) // measured with the real font
         check(NSAttributedString(string: String(repeating: "宽", count: 30), attributes: [.font: SettingsStyle.sans(12.5)]).size().width > 278)
-        for copy in allCopies {
-            for step in OnboardingStep.allCases { check(fits(copy.why(step), 14, inner)) }
-            for row in copy.shortcutRows { check(fits(row.note, 12.5, inner - 120)) }
-            check(fits(copy.iPadRow.note, 12.5, inner - 160))
-            for step in OnboardingStep.allCases { for item in copy.howto(step) { if let extra = OnboardingCopy.split(item).extra { check(fits(extra, 12.5, inner - 28)) } } }
-            for step in OnboardingStep.allCases { for item in copy.howto(step) { check(fits(OnboardingCopy.split(item).main, OnboardingController.mainSize, inner - 28)) } }
-            for code in Array(stages.keys) + ["cancelled", "setup_timeout", "setup_failed", "setup_unavailable"] {
-                for final in [false, true] {
-                    for step in OnboardingStep.allCases {
-                        var f = OnboardingFlow(); f.step = step; f.accessRequestedAt = 0
-                        f.receive(code: code, final: final, ipados: "18.1", at: 0)
-                        for at in [0.0, 100.0] {
-                            let (_, text, sub) = copy.status(f, at: at)
-                            if let extra = OnboardingCopy.split(text).extra { check(fits(extra, 12.5, inner - 22)) }
-                            check(fits(OnboardingCopy.split(text).main, OnboardingController.statusSize, inner - 22))
-                            if let sub { check(fits(sub, 12.5, inner - 22)) }
+        let deviceCases: [(String?, String, String, String)] = [
+            (nil, "iPad or iPhone", "iPad 或 iPhone", "iPad / iPhone"),
+            ("iPad", "iPad", "iPad", "iPad"), ("iPhone", "iPhone", "iPhone", "iPhone")
+        ]
+        for (device, englishName, chineseName, label) in deviceCases {
+            let savedDevice = DeviceCopy.deviceClass
+            DeviceCopy.deviceClass = device
+            defer { DeviceCopy.deviceClass = savedDevice }
+            check(en.title(.cable) == "Connect Your \(englishName) with a Cable")
+            check(zh.title(.cable) == "用数据线连接 \(chineseName)")
+            check(en.title(.trust) == "Tap Trust on Your \(englishName)")
+            check(zh.title(.trust) == "在 \(chineseName) 上点「信任」")
+            check(en.iPadRow.title == label && zh.iPadRow.title == label)
+            check(en.settingUpStatus(code: "trust_needed") == "Setting up \(englishName)…")
+            check(zh.settingUpStatus(code: "trust_needed") == "正在设置 \(chineseName)…")
+            let welcome: String
+            switch device {
+            case "iPad"?: welcome = "One shortcut puts your iPad screen into ChatGPT, Codex or Claude."
+            case "iPhone"?: welcome = "One shortcut puts your iPhone screen in ChatGPT, Codex or Claude."
+            default: welcome = "One shortcut puts your screen into ChatGPT, Codex or Claude."
+            }
+            check(en.why(.welcome) == welcome)
+            check(zh.why(.welcome) == "按一下快捷键，\(label) 屏幕就贴进 ChatGPT、Codex 或 Claude。")
+            check(en.why(.devmode) == "Screenshots need it. Your \(device ?? "device") restarts once; keep the cable in.")
+            check(zh.why(.devmode) == "截图需要它，只开一次。\(chineseName) 会重启一次，数据线别拔。")
+            check(en.why(.wifi) == "Works without the cable. Mac and \(device ?? "your device") need the same Wi-Fi.")
+            check(zh.why(.wifi) == "拔掉线也能用。Mac 和 \(chineseName) 要连同一个 Wi-Fi。")
+            for copy in allCopies {
+                widthLanguage = copy.language == .chinese ? "zh" : "en"
+                for step in OnboardingStep.allCases {
+                    widthContext = "Onboarding.why.\(step)"
+                    check(fits(copy.why(step), 14, inner))
+                }
+                widthContext = "Onboarding.shortcutRows.note"
+                for row in copy.shortcutRows { check(fits(row.note, 12.5, inner - 120)) }
+                widthContext = "Onboarding.iPadRow.note"
+                check(fits(copy.iPadRow.note, 12.5, inner - 160))
+                for step in OnboardingStep.allCases {
+                    widthContext = "Onboarding.howto.\(step).extra"
+                    for item in copy.howto(step) { if let extra = OnboardingCopy.split(item).extra { check(fits(extra, 12.5, inner - 28)) } }
+                    widthContext = "Onboarding.howto.\(step).main"
+                    for item in copy.howto(step) { check(fits(OnboardingCopy.split(item).main, OnboardingController.mainSize, inner - 28)) }
+                }
+                for code in stages.keys.sorted() + ["mixed_usb_devices", "unsupported_device", "cancelled", "setup_timeout", "setup_failed", "setup_unavailable"] {
+                    for final in [false, true] {
+                        for step in OnboardingStep.allCases {
+                            var f = OnboardingFlow(); f.step = step; f.accessRequestedAt = 0
+                            f.receive(code: code, final: final, ipados: "18.1", at: 0)
+                            for at in [0.0, 100.0] {
+                                let (_, text, sub) = copy.status(f, at: at)
+                                widthContext = "Onboarding.status.\(code).extra"
+                                if let extra = OnboardingCopy.split(text).extra { check(fits(extra, 12.5, inner - 22)) }
+                                widthContext = "Onboarding.status.\(code).main"
+                                check(fits(OnboardingCopy.split(text).main, OnboardingController.statusSize, inner - 22))
+                                widthContext = "Onboarding.status.\(code).sub"
+                                if let sub { check(fits(sub, 12.5, inner - 22)) }
+                            }
                         }
                     }
                 }
             }
-        }
-        // Notes in Settings (278 pt) and the menu-bar panel (300 pt): every message these files can show.
-        if !dir.isEmpty {
-            let pair = try! NSRegularExpression(pattern: #"\bL\("((?:[^"\\]|\\.)*)", "((?:[^"\\]|\\.)*)"\)"#)
-            for (file, width) in [("SetupWizard.swift", 278.0), ("ConnectionStatus.swift", 278.0), ("StartupController.swift", 278.0),
-                                  ("TossError.swift", 300.0), ("StrictTarget.swift", 300.0), ("CaptureWorker.swift", 300.0)] {
-                let source = (try? String(contentsOfFile: dir + "/" + file, encoding: .utf8)) ?? ""
-                for m in pair.matches(in: source, range: NSRange(source.startIndex..., in: source)) {
-                    for i in [1, 2] {
-                        let text = String(source[Range(m.range(at: i), in: source)!])
-                        check(fits(text, 12.5, CGFloat(width)))
+            // Notes in Settings (278 pt) and the menu-bar panel (300 pt): every message these files can show.
+            if !dir.isEmpty {
+                let pair = try! NSRegularExpression(pattern: #"\bL\("((?:[^"\\]|\\.)*)", "((?:[^"\\]|\\.)*)"\)"#)
+                for (file, width) in [("SetupWizard.swift", 278.0), ("ConnectionStatus.swift", 278.0), ("StartupController.swift", 278.0),
+                                      ("TossError.swift", 300.0), ("StrictTarget.swift", 300.0), ("CaptureWorker.swift", 300.0)] {
+                    let source = (try? String(contentsOfFile: dir + "/" + file, encoding: .utf8)) ?? ""
+                    for m in pair.matches(in: source, range: NSRange(source.startIndex..., in: source)) {
+                        for i in [1, 2] {
+                            let text = displayed(String(source[Range(m.range(at: i), in: source)!]))
+                            widthLanguage = i == 1 ? "en" : "zh"
+                            let line = source[..<Range(m.range, in: source)!.lowerBound].filter { $0 == "\n" }.count + 1
+                            widthContext = "Sources/\(file):\(line)"
+                            check(fits(text, 12.5, CGFloat(width)))
+                        }
                     }
                 }
             }
+            // The grey line under each title stays one line wide (468 pt column, 14 pt text).
+            for copy in allCopies {
+                widthLanguage = copy.language == .chinese ? "zh" : "en"
+                for step in OnboardingStep.allCases where step != .done {
+                    let why = copy.why(step)
+                    check(!why.isEmpty && !why.contains("\n"))
+                    widthContext = "Onboarding.why.\(step).legacy-system-font"
+                    check(fits(why, 14, 450, font: NSFont.systemFont(ofSize: 14)))
+                }
+            }
         }
-        // The grey line under each title stays one line wide (468 pt column, 14 pt text).
-        for copy in allCopies {
-            for step in OnboardingStep.allCases where step != .done {
-                let why = copy.why(step)
-                check(!why.isEmpty && !why.contains("\n"))
-                let width = NSAttributedString(string: why, attributes: [.font: NSFont.systemFont(ofSize: 14)]).size().width
-                if width > 450 { fputs("too wide: \(why) \(width)\n", stderr) }
-                check(width <= 450)
+
+        // Both pairing states keep the last two steps correct in both languages.
+        do {
+            let savedBothPaired = DeviceCopy.bothPaired
+            defer { DeviceCopy.bothPaired = savedBothPaired }
+            for bothPaired in [false, true] {
+                DeviceCopy.bothPaired = bothPaired
+                check(zh.why(.tryIt) == (bothPaired ? "打开一个聊天：按一下发 iPad，快速按两下发 iPhone。" : "打开一个聊天按快捷键，截图只进草稿，不会发送。"))
+                check(en.why(.tryIt) == (bothPaired ? "Open a chat: press once for iPad, twice quickly for iPhone." : "Open a chat and press a shortcut. It only goes into the draft."))
+                check(zh.why(.done) == (bothPaired ? "按一下发 iPad，快速按两下发 iPhone，状态在菜单栏。" : "以后直接按快捷键，点菜单栏的 Toss 图标看状态。"))
+                check(en.why(.done) == (bothPaired ? "Once for iPad, twice quickly for iPhone. Status is in the menu bar." : "Just press a shortcut. Click Toss in the menu bar for status."))
+                for copy in allCopies {
+                    widthLanguage = copy.language == .chinese ? "zh" : "en"
+                    for step in [OnboardingStep.tryIt, .done] {
+                        widthContext = "Onboarding.why.\(step).bothPaired=\(bothPaired)"
+                        check(fits(copy.why(step), 14, inner))
+                        check(fits(copy.why(step), 14, 450, font: NSFont.systemFont(ofSize: 14)))
+                    }
+                }
             }
         }
 
@@ -368,7 +512,7 @@ struct OnboardingTests {
         check(alone.autoNext == nil && !alone.showsBack && zh.stepLine(alone) == "菜单栏图标")
         check(zh.status(alone, at: 0).1 == "Toss 已经打开，但图标被刘海挡住了" && zh.primary(alone, at: 0) == "完成")
 
-        // Unpaired launches always show setup, even after an earlier dismissal.
+        // Opens by itself on first run or while unpaired, only until it was closed once.
         check(OnboardingPolicy.opensAutomatically(paired: false, firstRun: false, seen: false))
         check(OnboardingPolicy.opensAutomatically(paired: true, firstRun: true, seen: false))
         check(!OnboardingPolicy.opensAutomatically(paired: true, firstRun: false, seen: false))
@@ -376,12 +520,6 @@ struct OnboardingTests {
         check(!OnboardingPolicy.closeMarksSeen(step: .welcome))
         for step in OnboardingStep.allCases where step != .welcome { check(OnboardingPolicy.closeMarksSeen(step: step)) }
         check(OnboardingPolicy.opensAutomatically(paired: false, firstRun: true, seen: true))
-        for paired in [false,true] { for first in [false,true] { for seen in [false,true] {
-            check(OnboardingPolicy.opensAutomatically(paired: paired, firstRun: first, seen: seen) == (!paired || (first && !seen)))
-        } } }
-        for paired in [false,true] { for visible in [false,true] {
-            check(OnboardingPolicy.opensFromIcon(paired: paired, guideVisible: visible) == (!paired || visible))
-        } }
 
         // Reopening UI attaches to the latest running setup, then stops at its step.
         for code in ["developer_mode_needed", "developer_mode_confirm", "trust_needed", "no_usb_ipad"] {
@@ -405,7 +543,7 @@ struct OnboardingTests {
             check(app.contains("self.onboarding?.tossed()"))
             check(app.contains("if !hasPairing { showOnboarding(); return }"))
             check(app.contains("guard onboarding?.isVisible != true else { return }")) // no auto pairing/permission prompt behind it
-            // Launch, Dock and status-button routing are exercised by EntryRoutingTests.
+            check(app.contains("if openSetupIfNeeded() { return true }"))
             check(app.contains("self.onboarding?.setupCode(\"setup_unavailable\", final: true"))
             check(app.contains("if setupWizard.isRunning, permissionsReady, controller.flow.step"))
             check(app.contains("else if onboarding?.isVisible != true { lastPermissionStep"))
@@ -442,12 +580,18 @@ struct OnboardingTests {
             check(c.window.title == "设置 Toss" && !c.isVisible && !c.window.isReleasedWhenClosed)
             c.jump(to: .tryIt); c.tossed(); check(c.flow.tossed)
             c.jump(to: .access); c.setAccessibility(true); check(c.flow.mark(at: 0) == .ok)
+            c.setDeviceClass(.iPad); c.setTransport("USB")
+            c.resetForDeviceSetup()
+            check(c.flow.step == .welcome && !c.flow.tossed)
+            check(c.flow.deviceClass == nil && c.flow.osVersion == nil)
+            check(c.transport == nil)
             let d = OnboardingController(language: .english); d.jump(to: .access); d.tossed(); check(!d.flow.tossed)
         }
 
         // The delayed footer is one grey line and does not move any of the four steps.
         func views(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(views) }
-
+        for device in ["iPad", "iPhone"] {
+        DeviceCopy.deviceClass = device
         for language in [OnboardingLanguage.chinese, .english] + AppLanguage.allCases.filter({ ![.system, .chinese, .english].contains($0) }).map({ OnboardingLanguage.other($0) }) {
             for appearance in [NSAppearance.Name.aqua, .darkAqua] {
                 let controller = OnboardingController(language: language)
@@ -481,7 +625,8 @@ struct OnboardingTests {
                 controller.windowWillClose(Notification(name: NSWindow.willCloseNotification))
             }
         }
-
+        }
+        DeviceCopy.deviceClass = "iPad"
 
         // Every L("English", "中文") pair in the app has both languages (Settings → Language).
         if !dir.isEmpty, let files = try? FileManager.default.contentsOfDirectory(atPath: dir) {
@@ -518,6 +663,7 @@ struct OnboardingTests {
                 check(!script.isEmpty && !script.contains("tccutil") && script.contains("--unregister-login-item"))
             }
         }
-        print("Onboarding: \(count) pure assertions passed; windows built but never shown; no device or setup process.")
+        print("Onboarding: \(count - failures) passed, \(failures) failed, \(count) total; width \(widthChecks - widthFailures)/\(widthChecks), non-width failures \(failures - widthFailures); \(reportedWidths.count) distinct width records; windows never shown.")
+        return failures == 0
     }
 }

@@ -233,7 +233,7 @@ final class ClipboardTransaction {
         ownedChangeCount = board.changeCount
     }
 
-    // The next keypress never waits for an unconfirmed paste (2026-10-28). It carries
+    // The next keypress never waits for an unconfirmed paste (Ashley, 2026-10-28). It carries
     // the user's original clipboard forward instead of snapshotting the old screenshot, so
     // whichever transaction restores last puts back what the user had copied. A user copy in
     // between ends ownership, and that new copy is snapshotted as usual.

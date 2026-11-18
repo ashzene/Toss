@@ -28,18 +28,18 @@ from typing import Awaitable, Callable
 
 VENDOR = Path(__file__).resolve().parent / "vendor"
 sys.path.insert(0, str(VENDOR))
-from ipad_probe import ProbeFailure
+from ipad_probe import ProbeFailure, read_device_pin
 
 SCHEMA_VERSION = 1
 MAX_BYTES = 40 * 1024 * 1024
 DEFAULT_PNG_MODE = "png8-rle"
 
 
-def screen_dimensions_ok(size) -> bool:
-    """Any iPad screen in either orientation (mini 1488x2266 … Pro 13" 2064x2752).
+def screen_dimensions_ok(size, device_class="iPad") -> bool:
+    """Validate either orientation using the pinned class; never infer it here.
 
-    Short side 1000-2400 px, long side 1400-3000 px, aspect 1.2-1.6. Squares,
-    iPhone-shaped and absurd sizes stay rejected. No resizing ever happens.
+    iPad: unchanged 1000-2400 / 1400-3000 px, aspect 1.2-1.6.
+    iPhone: 700-1400 / 1300-3000 px, aspect 1.70-2.25. No resizing.
     """
     try:
         width, height = size
@@ -48,6 +48,10 @@ def screen_dimensions_ok(size) -> bool:
     if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
         return False
     short, long = min(width, height), max(width, height)
+    if device_class == "iPhone":
+        return 700 <= short <= 1400 and 1300 <= long <= 3000 and 1.70 <= long / short <= 2.25
+    if device_class != "iPad":
+        return False
     return 1000 <= short <= 2400 and 1400 <= long <= 3000 and 1.2 <= long / short <= 1.6
 # Explanations belong in the UI, never in dynamically generated exception text.
 SAFE_REASONS = frozenset({
@@ -86,7 +90,7 @@ def safe_reason(error: BaseException) -> str:
     return "capture_failed"
 
 
-def validate_png(data: bytes) -> dict:
+def validate_png(data: bytes, device_class="iPad") -> dict:
     """Inspect without rotating, resizing, cropping, or transcoding pixels."""
     if not isinstance(data, bytes) or not data:
         raise CaptureFailure("empty_frame")
@@ -99,7 +103,7 @@ def validate_png(data: bytes) -> dict:
         with Image.open(io.BytesIO(data)) as image:
             if image.format != "PNG" or getattr(image, "n_frames", 1) != 1:
                 raise CaptureFailure("invalid_png")
-            if not screen_dimensions_ok(image.size):
+            if not screen_dimensions_ok(image.size, device_class):
                 raise CaptureFailure("unexpected_dimensions")
             image.verify()
         with Image.open(io.BytesIO(data)) as image:
@@ -113,7 +117,7 @@ def validate_png(data: bytes) -> dict:
         raise CaptureFailure("invalid_png") from None
 
 
-def normalize_png(data: bytes) -> bytes:
+def normalize_png(data: bytes, device_class="iPad") -> bytes:
     """Re-encode a 16-bit-per-channel frame as 8-bit; return 8-bit frames as-is.
 
     2026-10-30 (user choice, smaller uploads): prepare_png now defaults to
@@ -132,7 +136,8 @@ def normalize_png(data: bytes) -> bytes:
     try:
         with Image.open(io.BytesIO(data)) as image:
             # Pillow decodes 16-bit RGB(A) PNGs to 8-bit RGB(A) by keeping the high byte.
-            if image.format != "PNG" or image.mode not in ("RGB", "RGBA") or not screen_dimensions_ok(image.size):
+            if (image.format != "PNG" or image.mode not in ("RGB", "RGBA")
+                    or not screen_dimensions_ok(image.size, device_class)):
                 return data
             image.load()
             options = {"compress_level": 3}
@@ -152,7 +157,7 @@ def _near_black(image, limit=3) -> bool:
 
 
 def _check_decoded_pixels(image) -> None:
-    # Speed: look at a 4x box-reduced copy first. Box averaging keeps
+    # Speed (提速副本): look at a 4x box-reduced copy first. Box averaging keeps
     # the mean and can only lower the spread (rounding moves each by <= 0.5, so
     # the pre-check uses a limit of 4 instead of 3). A reduced frame that is
     # clearly not near-black proves the full frame is not either; anything else
@@ -168,7 +173,7 @@ def _check_decoded_pixels(image) -> None:
         raise CaptureFailure("invalid_png")
 
 
-def prepare_png(data: bytes, *, timings=None) -> tuple[bytes, dict]:
+def prepare_png(data: bytes, device_class="iPad", *, timings=None) -> tuple[bytes, dict]:
     """Default: PNG8 RLE. TOSS_CAPTURE_PNG_MODE=original keeps original bytes.
 
     2026-10-30 (user choice, smaller uploads): measured RGB16 frames take
@@ -191,12 +196,12 @@ def prepare_png(data: bytes, *, timings=None) -> tuple[bytes, dict]:
             if len(data) > MAX_BYTES:
                 raise CaptureFailure("frame_too_large")
             from capture_encoding import prepare_png8
-            result = prepare_png8(data, original_prepare=_prepare_png_original,
+            result = prepare_png8(data, original_prepare=lambda frame: _prepare_png_original(frame, device_class),
                                   check_pixels=_check_decoded_pixels,
-                                  dimensions_ok=screen_dimensions_ok,
+                                  dimensions_ok=lambda size: screen_dimensions_ok(size, device_class),
                                   failure=CaptureFailure, timings=measurements)
         else:
-            result = _prepare_png_original(data)
+            result = _prepare_png_original(data, device_class)
         measurements["png_output_bytes"] = len(result[0])
         return result
     finally:
@@ -205,7 +210,7 @@ def prepare_png(data: bytes, *, timings=None) -> tuple[bytes, dict]:
             timings.update(measurements)
 
 
-def _prepare_png_original(data: bytes) -> tuple[bytes, dict]:
+def _prepare_png_original(data: bytes, device_class="iPad") -> tuple[bytes, dict]:
     """Validate a frame for publishing with one decode; publish its bytes as-is.
 
     2026-10-30: this is the original-mode and fallback path. The user chose
@@ -218,7 +223,7 @@ def _prepare_png_original(data: bytes) -> tuple[bytes, dict]:
     """
     if (not isinstance(data, bytes) or len(data) < 33 or not data.startswith(b"\x89PNG\r\n\x1a\n")
             or data[12:16] != b"IHDR" or data[24] != 16):
-        return data, validate_png(data)
+        return data, validate_png(data, device_class)
     if len(data) > MAX_BYTES:
         raise CaptureFailure("frame_too_large")
     from PIL import Image
@@ -226,8 +231,8 @@ def _prepare_png_original(data: bytes) -> tuple[bytes, dict]:
         with Image.open(io.BytesIO(data)) as image:
             if (image.format != "PNG" or getattr(image, "n_frames", 1) != 1
                     or image.mode not in ("RGB", "RGBA")):
-                return data, validate_png(data)
-            if not screen_dimensions_ok(image.size):
+                return data, validate_png(data, device_class)
+            if not screen_dimensions_ok(image.size, device_class):
                 raise CaptureFailure("unexpected_dimensions")
             image.load()
             _check_decoded_pixels(image)
@@ -289,11 +294,12 @@ def private_write_new(path: Path, content: bytes) -> None:
 
 async def _worker_async(state: Path, capture: Callable[..., Awaitable], budget: float) -> dict:
     async with asyncio.timeout(budget):
+        device_class = read_device_pin(state)["device_class"]
         data, capture_start, capture_complete = await capture(state)
         if capture_complete < capture_start or capture_complete - capture_start > 5.0:
             raise CaptureFailure("capture_response_too_old")
         timings = {}
-        data, metadata = prepare_png(data, timings=timings)
+        data, metadata = prepare_png(data, device_class, timings=timings)
         return {"data": data, **metadata, "capture_started_monotonic": capture_start,
                 "capture_completed_monotonic": capture_complete, "timings_ms": timings}
 
@@ -382,6 +388,7 @@ def run_request(state_dir: Path, output_file: Path, request_id: str, timeout: fl
             raise CaptureFailure("output_already_exists")
         check_private_directory(output_file.parent, "output_parent_not_private")
         check_state(state_dir)
+        device_class = read_device_pin(state_dir)["device_class"]
         scratch = Path(tempfile.mkdtemp(prefix=".toss-", dir=output_file.parent))
         # spawn has a fresh process/interpreter: no previously active tunnel/cache.
         process = multiprocessing.get_context("spawn").Process(
@@ -413,7 +420,7 @@ def run_request(state_dir: Path, output_file: Path, request_id: str, timeout: fl
                 or info.st_mode & 0o077 or not 0 < info.st_size <= MAX_BYTES):
             raise CaptureFailure("capture_integrity_failed")
         data = (scratch / "frame.png").read_bytes()
-        verified = validate_png(data)
+        verified = validate_png(data, device_class)
         if any(metadata.get(key) != value for key, value in verified.items()):
             raise CaptureFailure("capture_integrity_failed")
         if time.monotonic() - started >= timeout:
@@ -460,10 +467,14 @@ def main(argv=None) -> int:
     try:
         parser = QuietParser(description=__doc__)
         parser.add_argument("--state-dir", type=Path, required=True)
+        parser.add_argument("--device-class", choices=("iPad", "iPhone"))
         parser.add_argument("--output-file", type=Path, required=True)
         parser.add_argument("--request-id", required=True)
         parser.add_argument("--timeout", type=float, default=45.0)
         args = parser.parse_args(argv)
+        if args.device_class is not None:
+            from paired_devices import resolve_state
+            args.state_dir = resolve_state(args.state_dir, args.device_class)
         # SIGTERM from the native companion follows the same cleanup path as ^C.
         def cancel(_signum, _frame):
             raise KeyboardInterrupt

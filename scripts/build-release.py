@@ -20,7 +20,7 @@ import sys
 import tempfile
 import time
 
-VERSION, BUILD = "1.0.8", "92"
+VERSION, BUILD = "1.0.8", "113"
 DEFAULT_IDENTITY = "Toss Local Signing"
 
 project = Path(__file__).resolve().parent.parent
@@ -30,7 +30,7 @@ parser.add_argument("--runtime", type=Path, default=project.parent / "runtime/py
 parser.add_argument("--identity", default=os.environ.get("TOSS_SIGN_IDENTITY"),
                     help="code-signing identity; default: the stable local one if present, else ad-hoc")
 parser.add_argument("--dmg", action="store_true", help="also create the disk image next to the app")
-parser.add_argument("--zip", action="store_true", help="also create Toss.app.zip next to the app")
+parser.add_argument("--zip", action="store_true", help=f"also create Toss {VERSION} Nightly for iPhone+iPad.app.zip next to the app")
 args = parser.parse_args()
 if args.identity is None:
     found = subprocess.run(["/usr/bin/security", "find-identity", "-p", "codesigning"],
@@ -148,7 +148,7 @@ if args.zip:
     # --sequesterRsrc keeps extended attributes in __MACOSX/ instead of beside the files: without it
     # Finder's Archive Utility and unzip write ._ files next to the bundle's symlinks and the
     # extracted app fails its signature check (2026-10-29).
-    archive = out / "Toss.app.zip"
+    archive = out / f"Toss {VERSION} Nightly for iPhone+iPad.app.zip"
     if archive.exists():
         archive.unlink()
     subprocess.run(["/usr/bin/ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(app), str(archive)], check=True)

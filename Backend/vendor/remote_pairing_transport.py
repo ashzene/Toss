@@ -27,7 +27,7 @@ import ssl
 import stat
 import time
 
-from ipad_probe import ProbeFailure, fingerprint
+from ipad_probe import ProbeFailure, fingerprint, device_class_from_model, read_device_pin
 from wifi_transport import LAN_DEVICE, lan_interfaces
 
 
@@ -40,10 +40,7 @@ def configure(state: Path):
     state = state.resolve()
     if not state.is_dir() or state.stat().st_mode & 0o077:
         raise ProbeFailure("private_existing_state_directory_required")
-    pin = json.loads((state / "target.json").read_text())
-    model = pin.get("model")
-    if not isinstance(model, str) or not model.startswith("iPad") or not isinstance(pin.get("device_hash"), str):
-        raise ProbeFailure("unexpected_device_pin")
+    pin = read_device_pin(state)
     cache = state / "cache"
     cache.mkdir(mode=0o700, exist_ok=True)
     import pymobiledevice3.common as common
@@ -54,7 +51,7 @@ def configure(state: Path):
 
 
 def supported_ipados(version) -> bool:
-    """RemotePairing over Wi-Fi exists from iPadOS 17."""
+    """RemotePairing over Wi-Fi exists from iPadOS 17 and iOS 17."""
     try:
         return int(str(version).split(".")[0]) >= 17
     except ValueError:
@@ -422,7 +419,9 @@ async def bootstrap_usb(state: Path, apply_device_change=False, diagnostics=None
                                      pairing_records_cache_folder=cache, usbmux_address="/var/run/usbmuxd")
     async with client:
         if (not client.paired or fingerprint(client.udid) != pin["device_hash"]
-                or client.product_type != pin["model"] or not supported_ipados(client.product_version)):
+                or client.product_type != pin["model"]
+                or device_class_from_model(client.product_type) != pin["device_class"]
+                or not supported_ipados(client.product_version)):
             raise ProbeFailure("trusted_expected_usb_device_required")
         existing = load_record(state, pin) is not None
         evidence.update(stage="usb_remote_pairing_existing_verify" if existing else "usb_remote_pairing_initial_setup",

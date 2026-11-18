@@ -35,25 +35,36 @@ struct TossConnectionStatus: Equatable {
         return Self(state: state, reason: reason)
     }
 
+    // The worker's lock reading. Nil means this is not a well-formed lock event.
+    static func deviceLock(_ value: [String: Any]) -> Bool? {
+        guard Set(value.keys) == ["schema_version", "event", "locked"],
+              let version = value["schema_version"] as? NSNumber,
+              CFGetTypeID(version) != CFBooleanGetTypeID(), version.intValue == 1,
+              value["event"] as? String == "device_lock",
+              let locked = value["locked"] as? NSNumber,
+              CFGetTypeID(locked) == CFBooleanGetTypeID() else { return nil }
+        return locked.boolValue
+    }
+
     var errorMessage: String? {
         guard state == .failed || state == .disconnected else { return nil }
         switch reason {
         case "unexpected_library_version":
             return L("USB needs a newer Toss. Wi-Fi still works.", "USB 要更新 Toss，Wi-Fi 照常能用。")
         case "usb_ipados_unsupported":
-            return L("USB needs iPadOS 17.4 or later.", "USB 需要 iPadOS 17.4 或更新。")
+            return L("USB needs \(osEN) 17.4 or later.", "USB 需要 \(osZH) 17.4 或更新。")
         case "rsd_device_identity_mismatch":
-            return L("This isn't the paired iPad. Pair it again.", "这不是配对过的 iPad，请重新配对。")
+            return L("This isn't the paired \(deviceEN). Pair it again.", "这不是配对过的 \(deviceZH)，请重新配对。")
         case "network_unavailable": return L("Your Mac is offline.", "Mac 没联网。")
-        case "timeout": return L("Unlock your iPad, use your Mac's network.", "解锁 iPad，和 Mac 连同一个网络。")
+        case "timeout": return L("Unlock your \(deviceShortEN), use your Mac's network.", "解锁 \(deviceZH)，和 Mac 连同一个网络。")
         case "developer_image_unavailable", "service_unavailable":
-            return L("iPad isn't ready. Unlock it and check again.", "iPad 还没准备好，解锁后再检查。")
+            return L("\(deviceSubjectCapEN) isn't ready. Unlock it and check again.", "\(deviceZH) 还没准备好，解锁后再检查。")
         case "private_existing_state_directory_required", "unexpected_device_pin":
             return L("Pairing info missing. Pair again.", "找不到配对信息，请重新配对。")
         case "worker_failed", "capture_integrity_failed":
             return L("The connection stopped. Check again.", "连接停了，再检查一次。")
         case "disconnected":
-            return L("iPad disconnected. Reconnecting…", "iPad 断开了，正在重连…")
+            return L("\(deviceEN) disconnected. Reconnecting…", "\(deviceZH) 断开了，正在重连…")
         case "cancelled": return L("Check cancelled.", "检查已取消。")
         default: return L("Use the same Wi-Fi or connect via USB, then check again.", "两台设备连同一个 Wi-Fi，或用 USB 连接，再检查一次。")
         }
@@ -73,6 +84,37 @@ enum TossTransferPhase: Equatable {
         case "append_confirmed": return .completed
         case "cancelled", "input_interrupted", "hotkey_rejected": return .cancelled
         default: return code.contains("failed") || code.contains("unconfirmed") ? .failed : .idle
+        }
+    }
+}
+
+// Two devices at once (lives here, not in DeviceCopy.swift, because several tests compile DeviceCopy.swift
+// without this file) (Ashley 2026-11-01: an iPad and an iPhone paired together; one press sends the iPad,
+// a quick double press the iPhone). One line per device, the iPad first; the same words as the one-device rows.
+extension DeviceCopy {
+    static func connectionLine(_ name: String, _ status: TossConnectionStatus) -> String {
+        let state: String
+        switch status.state {
+        case .ready: state = L("Connected", "已连接") + (status.transportLabel.map { " · " + $0 } ?? "")
+        case .connecting: state = L("Connecting…", "正在连接…")
+        case .disconnected, .failed: state = L("Not connected", "没连上")
+        case .notChecked: state = L("Not checked yet", "还没检查")
+        }
+        return name + (AppLanguage.isChinese ? "：" : ": ") + state
+    }
+    static func connectionLines(_ rows: [(String, TossConnectionStatus)]) -> String {
+        rows.map { connectionLine($0.0, $0.1) }.joined(separator: "\n")
+    }
+    // "iPad and iPhone" / "iPad 和 iPhone", or the one name.
+    static func names(_ names: [String]) -> String { names.joined(separator: L(" and ", " 和 ")) }
+    // The Settings notes under the two shortcuts.
+    static func shortcutNote(option: Bool, twoDevices: Bool) -> String {
+        // Written out in full (no interpolation) so the source-literal width checks measure the real text.
+        switch (option, twoDevices) {
+        case (true, false): return L("Left and right Option together", "左右两个 Option 一起按")
+        case (false, false): return L("Left and right Shift together", "左右两个 Shift 一起按")
+        case (true, true): return L("Both Option keys · press twice for iPhone", "左右两个 Option 一起按 · 按两下发 iPhone")
+        case (false, true): return L("Both Shift keys · press twice for iPhone", "左右两个 Shift 一起按 · 按两下发 iPhone")
         }
     }
 }

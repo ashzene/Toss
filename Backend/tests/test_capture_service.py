@@ -37,7 +37,8 @@ def private_fixture(base):
     for name in ("target.json", "strict-remote-pairing.plist"):
         fd = os.open(state / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as handle:
-            handle.write("synthetic-placeholder-not-real-pairing")
+            handle.write(json.dumps({"model": "iPad14,3", "device_hash": "synthetic"})
+                         if name == "target.json" else "synthetic-placeholder-not-real-pairing")
     return state, output
 
 
@@ -160,10 +161,10 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.worker.capture = capture
         self.worker.progress_events = emit
         original = service.once.prepare_png
-        def validate(data, *, timings=None):
+        def validate(data, device_class="iPad", *, timings=None):
             self.assertEqual(events[-1]["event"], "capture_completed")
             time.sleep(0.06)  # validation exceeds T, but the full image already arrived
-            return original(data, timings=timings)
+            return original(data, device_class, timings=timings)
         with mock.patch.object(self.worker.success_timings, "threshold", return_value=Threshold(0.05, 10, 0.02)), \
              mock.patch.object(service.once, "prepare_png", side_effect=validate):
             trigger = time.monotonic()
@@ -219,15 +220,164 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_validation_cannot_publish_past_shared_press_deadline(self):
         original = service.once.prepare_png
-        def slow_validation(data, *, timings=None):
+        def slow_validation(data, device_class="iPad", *, timings=None):
             time.sleep(0.2)
-            return original(data, timings=timings)
+            return original(data, device_class, timings=timings)
         with mock.patch.object(service.once, "prepare_png", side_effect=slow_validation):
             result = await self.accept(self.request(attempt_id=str(uuid.uuid4()),
                 deadline_monotonic=time.monotonic() + 0.15))
         self.assertEqual(result["reason"], "timeout")
         self.assertEqual(list(self.output.iterdir()), [])
         self.assertEqual(self.worker.success_timings.load()["wifi"], [])
+
+    async def lock_events(self, *replies):
+        events, calls = [], []
+        reopens = self.lock_reopens = []
+        async def emit(event):
+            events.append(event)
+        class Provider:
+            closing = False
+            async def reopen_lockdown(self):
+                reopens.append(True)
+            async def get_value(self, key=None):
+                calls.append(key)
+                reply = replies[min(len(calls), len(replies)) - 1]
+                if isinstance(reply, Exception):
+                    raise reply
+                if reply == "hang":
+                    await asyncio.sleep(30)
+                return reply
+        self.worker.connection_events = emit
+        self.worker.provider = Provider()
+        for _ in replies:
+            self.worker.lock_checked_at = 0.0
+            await self.worker._report_lock_state()
+        self.worker.provider = None
+        return events, calls
+
+    async def test_lock_state_is_read_through_the_real_capture_session(self):
+        """The worker's provider is a CaptureSession, so the read must pass through it."""
+        keys = []
+        class Device:
+            async def get_value(self, key=None):
+                keys.append(key)
+                return True
+        class Connection:
+            async def __aenter__(self):
+                return Device(), {}
+            async def __aexit__(self, *_args):
+                return False
+        class Channel:
+            def __init__(self, *_args):
+                self.dtx = self
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *_args):
+                return False
+            async def wait_disconnected(self):
+                await asyncio.Event().wait()
+        session = service.CaptureSession(self.state, connection_factory=lambda _: Connection(),
+                                         dvt_factory=Channel, screenshot_factory=Channel, mount=None)
+        events = []
+        async def emit(event):
+            events.append(event)
+        self.worker.connection_events = emit
+        try:
+            with self.assertRaises(service.once.CaptureFailure):
+                await session.get_value(key="PasswordProtected")
+            provider, _ = await session.__aenter__()
+            self.worker.provider = provider
+            await self.worker._report_lock_state()
+        finally:
+            self.worker.provider = None
+            session.watcher.cancel()
+            await session.stack.aclose()
+        self.assertEqual(keys, ["PasswordProtected"])
+        self.assertEqual([e["locked"] for e in events], [True])
+
+    async def test_lock_state_reports_each_change_once_and_takes_no_frame(self):
+        events, calls = await self.lock_events(True, True, False)
+        self.assertEqual([e["locked"] for e in events], [True, False])
+        self.assertEqual(set(calls), {"PasswordProtected"})
+        self.assertEqual(self.captures, 0)
+        self.assertEqual(set(events[0]), {"schema_version", "event", "locked"})
+
+    async def test_failed_lock_read_says_nothing_and_keeps_the_last_reading(self):
+        events, _ = await self.lock_events(True, ConnectionError("gone"), "unexpected")
+        self.assertEqual([e["locked"] for e in events], [True])
+        self.assertIs(self.worker.device_locked, True)
+        self.assertEqual(self.closes, 0)
+
+    async def test_cut_off_lock_read_reopens_and_a_later_unlock_is_seen(self):
+        """Locked, one read times out, then unlocked: the old reading must not stay on a healthy session."""
+        with mock.patch.object(service, "LOCK_READ_TIMEOUT", 0.01):
+            events, calls = await self.lock_events(True, "hang", False)
+        self.assertEqual([e["locked"] for e in events], [True, False])
+        self.assertEqual((len(calls), len(self.lock_reopens)), (3, 1))
+        self.assertIs(self.worker.device_locked, False)
+        self.assertFalse(self.worker.lock_read_broken)
+        self.assertEqual(self.closes, 0)
+
+    async def test_failed_reopen_keeps_trying_without_touching_the_session(self):
+        events, calls = [], []
+        async def emit(event):
+            events.append(event)
+        class Provider:
+            closing = False
+            async def reopen_lockdown(self):
+                raise ConnectionError("not yet")
+            async def get_value(self, key=None):
+                calls.append(key)
+                return True
+        self.worker.connection_events = emit
+        self.worker.provider = Provider()
+        self.worker.lock_read_broken = True
+        self.worker.lock_checked_at = 0.0
+        await self.worker._report_lock_state()
+        self.worker.provider = None
+        self.assertEqual((events, calls), ([], []))
+        self.assertTrue(self.worker.lock_read_broken)
+        self.assertEqual(self.closes, 0)
+
+    async def test_capture_session_reopens_only_the_lockdown_connection(self):
+        class Lockdown:
+            closed = False
+            async def close(self):
+                self.closed = True
+        class Device:
+            udid = "synthetic"
+            def __init__(self):
+                self.lockdown = self.old = Lockdown()
+            async def start_lockdown_service(self, name):
+                self.started = name
+                return "service"
+        device = Device()
+        session = service.CaptureSession(self.state, mount=None)
+        session.device_provider = device
+        async def fresh(service_connection, identifier=None):
+            return (service_connection, identifier)
+        with mock.patch("pymobiledevice3.lockdown.create_using_remote", fresh):
+            await session.reopen_lockdown()
+        self.assertTrue(device.old.closed)
+        self.assertEqual(device.started, "com.apple.mobile.lockdown.remote.trusted")
+        self.assertEqual(device.lockdown, ("service", "synthetic"))
+        session.closing = True
+        with self.assertRaises(service.once.CaptureFailure):
+            await session.reopen_lockdown()
+
+    def test_wifi_waits_longer_than_usb_before_calling_a_stall(self):
+        self.assertEqual(self.worker._default_stall(), service.STALL_LIMIT)
+        self.worker.transport = "usb"
+        self.assertEqual(self.worker._default_stall(), service.USB_STALL_LIMIT)
+        self.assertLess(service.USB_STALL_LIMIT, service.STALL_LIMIT)
+
+    async def test_lock_reading_survives_a_closed_session_and_shortens_the_retry(self):
+        await self.lock_events(True)
+        await self.worker._close_session()
+        self.assertIs(self.worker.device_locked, True)
+        self.assertEqual(self.worker._warm_backoff(6), service.WARM_BACKOFF_LOCKED_MAX)
+        self.worker.device_locked = False
+        self.assertEqual(self.worker._warm_backoff(6), service.WARM_BACKOFF_SECONDS[-1])
 
     async def test_connection_events_observe_preconnect_without_capture(self):
         events = []
@@ -1004,9 +1154,9 @@ class CaptureSessionTests(unittest.IsolatedAsyncioTestCase):
             events.append(value)
         self.worker.progress_events = event
         original = service.once.prepare_png
-        def validate(data, *, timings=None):
+        def validate(data, device_class="iPad", *, timings=None):
             self.assertEqual(events[-1]["event"], "capture_completed")
-            return original(data, timings=timings)
+            return original(data, device_class, timings=timings)
         with mock.patch.object(service.once, "prepare_png", side_effect=validate):
             result = await self.capture_request()
         self.assertTrue(result["ok"], result)
@@ -1263,7 +1413,8 @@ class CaptureSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_flowing_wifi_finishes_after_old_eight_second_cap(self):
         link = self.fake_link()
         async def flowing(_dvt):
-            # Burst arrivals separated by half-second pauses continue beyond 8 s.
+            # Approximate the reported iPhone transfer: bytes arrive in bursts
+            # separated by half-second retransmission pauses, for over 8 seconds.
             for _ in range(18):
                 link.packets.append((time.monotonic(), 440000))
                 await asyncio.sleep(0.5)

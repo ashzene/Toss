@@ -12,6 +12,9 @@ final class SetupWizard {
         let model: String?
         let ipados: String?
         var final = true
+        var deviceClass: DeviceClass?
+        var osVersion: String?
+        var setupDeviceHash: String?
     }
 
     private var process: Process?
@@ -21,6 +24,7 @@ final class SetupWizard {
     var isRunning: Bool { process != nil }
 
     func run(python: String, script: String, action: String, stateDirectory: String,
+             deviceClass: DeviceClass? = nil,
              timeout: TimeInterval = 31 * 60, progress: @escaping (Result) -> Void = { _ in },
              completion: @escaping (Result) -> Void) {
         guard !uninstalling, process == nil else { return }
@@ -30,6 +34,7 @@ final class SetupWizard {
         let output = Pipe()
         child.executableURL = URL(fileURLWithPath: python)
         child.arguments = [script, action, "--state-dir", stateDirectory]
+        if let deviceClass { child.arguments? += ["--device-class", deviceClass.rawValue] }
         var environment = ProcessInfo.processInfo.environment
         environment["PYTHONNOUSERSITE"] = "1"
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -72,7 +77,10 @@ final class SetupWizard {
             }
             child.waitUntilExit()
             var result = last ?? Result(code: "setup_failed", model: nil, ipados: nil)
-            if !result.final { result = Result(code: "setup_failed", model: result.model, ipados: result.ipados) }
+            if !result.final {
+                result = Result(code: "setup_failed", model: result.model, ipados: result.ipados,
+                                deviceClass: result.deviceClass, osVersion: result.osVersion)
+            }
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.generation == token else { return }
                 self.process = nil
@@ -91,7 +99,18 @@ final class SetupWizard {
               code.range(of: "^[a-z_]{1,40}$", options: .regularExpression) != nil else { return nil }
         // Older scripts print a single line without "final".
         return Result(code: code, model: object["model"] as? String, ipados: object["ipados"] as? String,
-                      final: object["final"] as? Bool ?? true)
+                      final: object["final"] as? Bool ?? true, deviceClass: DeviceClass.resolve(object),
+                      osVersion: object["os_version"] as? String ?? object["ipados"] as? String,
+                      setupDeviceHash: object["setup_device_hash"] as? String)
+    }
+
+    // A running setup may be waiting for any USB device, or already own one target.
+    // Do not consume another insertion while showing the first target's progress.
+    nonisolated static func canAttachUSBPrompt(running: Bool, targetHash: String?,
+                                               code: String, candidateHashes: [String]) -> Bool {
+        guard running else { return true }
+        if let targetHash { return candidateHashes.allSatisfy { $0 == targetHash } }
+        return ["no_usb_ipad", "multiple_usb_ipads", "mixed_usb_devices", "unsupported_device", "unlock_needed"].contains(code)
     }
 
     func cancel() {
@@ -128,11 +147,11 @@ final class SetupWizard {
 
     static func title(for code: String) -> String {
         switch code {
-        case "trust_needed": return L("Tap Trust on Your iPad", "在 iPad 上点「信任」")
-        case "developer_mode_needed": return L("Enable Developer Mode on Your iPad", "在 iPad 上打开开发者模式")
-        case "developer_mode_confirm": return L("Confirm Developer Mode on Your iPad", "在 iPad 上确认开发者模式")
-        case "unlock_needed": return L("Unlock Your iPad", "解锁 iPad")
-        default: return L("iPad Pairing", "配对 iPad")
+        case "trust_needed": return L("Tap Trust on Your \(deviceEN)", "在 \(deviceZH) 上点「信任」")
+        case "developer_mode_needed": return L("Enable Developer Mode on Your \(deviceEN)", "在 \(deviceZH) 上打开开发者模式")
+        case "developer_mode_confirm": return L("Confirm Developer Mode on Your \(deviceEN)", "在 \(deviceZH) 上确认开发者模式")
+        case "unlock_needed": return L("Unlock Your \(deviceEN)", "解锁 \(deviceZH)")
+        default: return L("\(deviceEN) Pairing", "配对 \(deviceZH)")
         }
     }
 
@@ -145,29 +164,33 @@ final class SetupWizard {
         case "ready":
             return L("Paired. Works without the cable now.", "已配对，拔掉线也能用了。")
         case "no_usb_ipad":
-            return L("Plug in your iPad and unlock it.", "插上 iPad 并解锁。")
+            return L("Plug in your \(deviceEN) and unlock it.", "插上 \(deviceZH) 并解锁。")
         case "multiple_usb_ipads":
-            return L("Keep only one iPad plugged in.", "只插要配对的那一台 iPad。")
+            return L("Keep only one \(deviceEN) plugged in.", "只插要配对的那一台 \(deviceZH)。")
+        case "mixed_usb_devices":
+            return L("Keep only the iPad or the iPhone plugged in.", "iPad 和 iPhone 只插要配对的那一台。")
+        case "unsupported_device":
+            return L("Connect an iPad or iPhone, version 17 or later.", "请连接 iPad 或 iPhone，系统 17 或更新。")
         case "unlock_needed":
-            return L("Unlock your iPad.", "请解锁 iPad。")
+            return L("Unlock your \(deviceEN).", "请解锁 \(deviceZH)。")
         case "unsupported_ipados":
-            return L("Needs iPadOS 17 or later.", "需要 iPadOS 17 或更新。")
+            return L("Needs \(osEN) 17 or later.", "需要 \(osZH) 17 或更新。")
         case "trust_needed":
-            return L("Tap Trust on your iPad, enter the passcode.", "在 iPad 上点「信任」，输入密码。")
+            return L("Tap Trust on your \(deviceShortEN), enter the passcode.", "在 \(deviceZH) 上点「信任」，输入密码。")
         case "developer_mode_auto":
-            return L("Turning on Developer Mode; iPad restarts.", "正在打开开发者模式，iPad 会重启。")
+            return L("Turning on Developer Mode; \(deviceSubjectEN) restarts.", "正在打开开发者模式，\(deviceZH) 会重启。")
         case "developer_mode_needed":
-            return L("Turn on Developer Mode on your iPad.", "在 iPad 上打开开发者模式。")
+            return L("Turn on Developer Mode on your \(deviceEN).", "在 \(deviceZH) 上打开开发者模式。")
         case "ipad_restarting":
-            return L("iPad is restarting. Keep the cable in.", "iPad 正在重启，数据线别拔。")
+            return L("\(deviceEN) is restarting. Keep the cable in.", "\(deviceZH) 正在重启，数据线别拔。")
         case "developer_mode_confirm":
-            return L("On your iPad, tap Turn On, enter passcode.", "在 iPad 上点「打开」，输入密码。")
+            return L("On your \(deviceShortEN), tap Turn On, enter passcode.", "在 \(deviceZH) 上点「打开」，输入密码。")
         case "pairing_wireless":
             return L("Setting up wireless pairing…", "正在建立无线配对…")
         case "preparing_image":
-            return L("Preparing the iPad… a few minutes.", "正在准备 iPad…可能要几分钟。")
+            return L("Preparing the \(deviceEN)… a few minutes.", "正在准备 \(deviceZH)…可能要几分钟。")
         case "wifi_waiting":
-            return L("Looking for the iPad on your Wi-Fi…", "正在 Wi-Fi 上找 iPad…")
+            return L("Looking for the \(deviceEN) on your Wi-Fi…", "正在 Wi-Fi 上找 \(deviceZH)…")
         case "pairing_failed":
             return L("Wireless pairing failed. Click Pair again.", "无线配对没成功，再点「配对」。")
         case "wifi_unreachable":
@@ -177,7 +200,7 @@ final class SetupWizard {
         case "setup_timeout":
             return L("Took too long. Click Pair to try again.", "等太久了，再点「配对」。")
         case "not_paired":
-            return L("No iPad paired yet. Plug one in.", "还没配对 iPad，插上线就开始。")
+            return L("Nothing paired yet. Plug in an iPad or iPhone.", "还没配对设备，插上 iPad 或 iPhone 就开始。")
         case "setup_unavailable":
             return L("Part of Toss is missing. Reopen Toss.", "Toss 缺了一部分，请重新打开。")
         case "cancelled":

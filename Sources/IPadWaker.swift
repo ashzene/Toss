@@ -35,7 +35,7 @@ struct WakeBurst {
 // Keepalive (2026-10-24, "Toss will be sent to other people"; robustness can't depend on
 // sitting next to the router): while Toss is connected and the Mac is in use, one 1-byte
 // datagram every 0.3 s keeps the iPad's radio out of power save between keypresses.
-// Measured on a 2.4 GHz home link: ping after 2 s idle p50 35.6 / p95 299 ms without,
+// Measured on Ashley's 2.4 GHz link: ping after 2 s idle p50 35.6 / p95 299 ms without,
 // 19.6 / 81 ms with. Cost: 12,000 datagrams (about 0.76 MB on air incl. headers) per active
 // hour, none while idle, asleep or disconnected. Pure policy; the reason is logged.
 enum KeepAlivePolicy {

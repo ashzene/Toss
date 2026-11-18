@@ -29,7 +29,8 @@ struct LogExporterTests {
         }
         let zone = TimeZone(secondsFromGMT: 8 * 3600)!
         let date = ISO8601DateFormatter().date(from: "2026-11-03T10:40:00Z")!
-        let app = LogExporter.AppInfo(url: URL(fileURLWithPath: "/Applications/Toss.app"), version: "1.2.3", build: "45")
+        let app = LogExporter.AppInfo(url: URL(fileURLWithPath: "/Applications/Toss.app"), version: "1.2.3", build: "45",
+            pairedDeviceTypes: ["iPhone", "PRIVATE-DEVICE-NAME", "iPad", "UDID-SECRET", "iPhone"])
         var commands = [(String, [String], TimeInterval)]()
         var systemLogsFail = false
         var zipFails = false
@@ -55,8 +56,8 @@ struct LogExporterTests {
             ("/Users/alice/Documents/x /Users/bob/Library/y", "~/Documents/x ~/Library/y"),
             ("home=/Users/alice", "home=~"),
             ("\"/Users/测试用户/桌面\"", "\"~/桌面\""),
-            ("\"/Users/Alex Smith/Desktop/a\"", "\"~/Desktop/a\""),
-            ("\"/Users/Alex Smith\"", "\"~\""),
+            ("\"/Users/Ashley Smith/Desktop/a\"", "\"~/Desktop/a\""),
+            ("\"/Users/Ashley Smith\"", "\"~\""),
             ("file:///Users/alice/a", "file://~/a"),
             (#"{"path":"\/Users\/alice\/Library\/a"}"#, #"{"path":"~\/Library\/a"}"#),
             (#"{"path":"/Users/\u6d4b\u8bd5/Library/a"}"#, #"{"path":"~/Library/a"}"#),
@@ -85,6 +86,10 @@ struct LogExporterTests {
         for value in ["macOS", "26.0", "Toss version: 1.2.3", "Toss build: 45", "CDHash: 0123456789abcdef", "MacTest1,1", "2026-11-03T18:40:00+08:00", "~/Library/"] {
             check(allText.contains(value), "metadata / sanitized logs: \(value)")
         }
+        check(allText.contains("Paired device types: iPad / iPhone"), "only paired types, stable order, no duplicates")
+        check(!allText.contains("PRIVATE-DEVICE-NAME") && !allText.contains("UDID-SECRET"), "device identity cannot enter info.txt")
+        check(LogExporter.deviceTypes([]) == "unavailable", "missing device metadata")
+        check(LogExporter.deviceTypes(["iPhone"]) == "iPhone", "phone-only pairing")
         check((try fm.attributesOfItem(atPath: archive.path)[.posixPermissions] as? NSNumber)?.intValue == 0o600, "private archive")
         let logCommand = commands.first { $0.0 == "/usr/bin/log" }!
         check(Array(logCommand.1.prefix(6)) == ["show", "--last", "2h", "--style", "compact", "--predicate"], "two-hour compact system logs")

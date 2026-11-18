@@ -63,11 +63,12 @@ class CaptureTests(unittest.TestCase):
         self.base = Path(self.temp.name)
         self.state = self.base / "state"
         self.state.mkdir(mode=0o700)
-        # Deliberately not real secrets or pairing data. The mock never reads them.
+        # Synthetic legacy iPad pin, without real secrets or pairing data.
         for name in ("target.json", "strict-remote-pairing.plist"):
             fd = os.open(self.state / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w") as handle:
-                handle.write("synthetic-placeholder")
+                handle.write(json.dumps({"model": "iPad14,3", "device_hash": "synthetic"})
+                             if name == "target.json" else "synthetic-placeholder")
         self.output = self.base / "new.png"
         self.request_id = str(uuid.uuid4())
 
@@ -212,7 +213,7 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(meta8["bit_depth"], 8)
 
     def test_reduced_black_precheck_matches_full_resolution_rule(self):
-        # Speed: the 4x reduced pre-check must decide exactly like the old
+        # 提速副本: the 4x reduced pre-check must decide exactly like the old
         # full-resolution mean/stddev < 3 rule, including near-threshold frames.
         import random
         from PIL import Image, ImageStat

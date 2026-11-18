@@ -27,8 +27,8 @@ final class UninstallSheet: NSWindowController {
         super.init(window: window)
         window.isOpaque = true
         let content = window.contentView!
-        // A sheet otherwise draws the system sheet material (a lighter, warmer grey in dark mode)
-        // that does not match the window. Paint the Settings window's own background instead.
+        // A sheet otherwise draws the system sheet material (a lighter, warmer grey in dark mode,
+        // Ashley 2026-11-03: 「要和底色一样」). Paint the Settings window's own background instead.
         let paper = UninstallSheetBackground()
         paper.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(paper)
@@ -64,6 +64,7 @@ final class UninstallSheet: NSWindowController {
             buttons.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -36),
             buttons.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -28)
         ])
+        SettingsStyle.applyUnifiedWindowStyle(in: window)
     }
     required init?(coder: NSCoder) { nil }
 

@@ -51,10 +51,11 @@ protocol ChatTarget: AnyObject {
     var latestPasteConsumptionFilename: String? { get }
     func prepareAccessibility() async throws
     func locateLease() throws -> any ChatLease
+    func locateForCaptureLease(shouldContinue: (pid_t) -> Bool) async throws -> any ChatLease
     func revalidateLease(_ lease: any ChatLease, requireFocused: Bool) throws
     func focusLease(_ lease: any ChatLease) async throws
     func verifyAppendLease(_ lease: any ChatLease, expectedFilename: String) throws -> AppendReadback
-    // Queued press, its chat switched away (back to where it was). Raise the lease's own window
+    // Queued press, its chat switched away (Ashley: 「还是放回原来那里」). Raise the lease's own window
     // (the app is already in front), or press that exact chat's sidebar item / link once. Neither
     // pastes nor decides anything: the caller locates again and compares with the lease.
     func raiseLeaseWindow(_ lease: any ChatLease) async throws
@@ -63,6 +64,9 @@ protocol ChatTarget: AnyObject {
 
 extension StrictTarget: ChatTarget {
     func locateLease() throws -> any ChatLease { try locate() }
+    func locateForCaptureLease(shouldContinue: (pid_t) -> Bool) async throws -> any ChatLease {
+        try await locateForCapture(shouldContinue: shouldContinue)
+    }
     func revalidateLease(_ lease: any ChatLease, requireFocused: Bool) throws {
         guard let lease = lease as? TargetLease else { throw TargetFailure.targetChanged }
         try revalidate(lease, requireFocused: requireFocused)
@@ -87,6 +91,7 @@ extension StrictTarget: ChatTarget {
 
 extension ClaudeTarget: ChatTarget {
     func locateLease() throws -> any ChatLease { try locate() }
+    func locateForCaptureLease(shouldContinue: (pid_t) -> Bool) async throws -> any ChatLease { try locate() }
     func revalidateLease(_ lease: any ChatLease, requireFocused: Bool) throws {
         guard let lease = lease as? ClaudeLease else { throw TargetFailure.targetChanged }
         try revalidate(lease, requireFocused: requireFocused)

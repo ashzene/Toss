@@ -1,22 +1,12 @@
 <p align="center">
-  <img src="docs/images/banner-dark.png" alt="Toss. Press two keys. Your iPad right in the chat." width="792">
+  <img src="docs/images/banner-dark.png" alt="Toss. Press two keys. Your iPad right in the chat." width="880">
 </p>
 
-Toss is a Mac menu-bar app that drops a screenshot of your iPad into the ChatGPT, Codex or Claude chat you have open. It only adds the picture to your draft; you still press Send.
-
-### Press two keys. Your iPad right in the chat.
+Toss is a Mac menu-bar app that drops a screenshot of your iPhone or iPad into the ChatGPT, Codex or Claude chat you have open. It only adds the picture to your draft; you still press Send.
 
 <p align="center">
-  <img src="docs/images/demo-shortcut-dark.gif" alt="Left and right Option add the iPad screenshot to ChatGPT; left and right Shift add it to Claude." width="792">
+  <img src="docs/images/demo-shortcut-dark.gif" alt="Left and right Option together add the iPad screenshot to the open ChatGPT draft; left and right Shift together do the same in Claude." width="792">
 </p>
-
-### Works wherever the chat window is
-
-The chat does not have to be in front. Press the shortcut while you are reading a past paper or anything else, and Toss brings the right window forward, attaches the screenshot and leaves you in the chat.
-
-### Wired or wireless, your call
-
-The same two keys work either way. Plug the iPad in and Toss uses the cable; unplug it and Toss goes back to Wi‑Fi on its own. The menu-bar icon shows which one is in use.
 
 ## Shortcuts
 
@@ -25,24 +15,26 @@ The same two keys work either way. Plug the iPad in and Toss uses the cable; unp
 | Left <kbd>⌥ Option</kbd> + right <kbd>⌥ Option</kbd> | ChatGPT / Codex |
 | Left <kbd>⇧ Shift</kbd> + right <kbd>⇧ Shift</kbd> | Claude |
 
-Toss brings the right chat window forward first, then captures and attaches. Works over USB or Wi‑Fi, whichever is connected.
+Works over USB or Wi‑Fi, whichever is connected. With both devices paired, press once for iPad or twice quickly for iPhone.
 
-Since 1.0.4, you can also add an iPad screenshot to ChatGPT’s Dot. Open Dot and press both Option keys together; the screenshot stays in the draft until you send it.
+## Works wherever the chat window is
 
-## See where the screenshot went
+Toss brings the right window forward first, then captures and attaches.
 
-Since 1.0.8, the Toss menu shows the last screenshot’s destination, file size, elapsed time and actual USB or Wi-Fi route, for example **Claude · 3.2 MB · 1.4 s · Wi-Fi**. It shows **Success** after confirming the attachment in the draft. Otherwise it shows **Not successful** with a short explanation; if confirmation is missing, check the draft before trying again. A clipboard-only result says **Clipboard**.
+<p align="center">
+  <img src="docs/images/demo-any-window-dark.gif" alt="Both Option keys go down, ChatGPT comes to the front and the iPad screenshot lands in its input box. Then both Shift keys go down, Claude comes to the front and a new screenshot lands in its input box." width="792">
+</p>
 
 ## Get started
 
-1. Download the latest [release](https://github.com/ashzene/Toss/releases/latest), open the disk image, and double-click **Toss Installer**. In its window, drag Toss into Applications; Toss installs and opens its setup guide automatically.
-2. Connect your iPad with a USB data cable the first time, tap **Trust** and turn on **Developer Mode**. Toss guides you through it.
+1. Open the iPhone+iPad disk image and double-click **Toss Installer**. Drag Toss into Applications in its window; setup opens automatically.
+2. Connect your iPhone or iPad with a USB data cable the first time, tap **Trust** and turn on **Developer Mode**. Toss guides you through it.
 3. After that, pairing is done. Toss reconnects by itself.
 
-Until an iPad is paired, opening Toss from the Dock or clicking its menu-bar icon brings the setup guide back, even if you closed it earlier.
+Until at least one iPhone or iPad is paired, opening Toss from the Dock or clicking its menu-bar icon reopens the setup guide.
 
-Needs an Apple silicon Mac with macOS 14+, and an iPad with iPadOS 17+ (17.4+ for USB).
+Needs an Apple silicon Mac with macOS 14+, and an iPhone or iPad with iOS or iPadOS 17+ (17.4+ for USB).
 
 ## License
 
-[MIT](LICENSE), except the capture service in [`Backend/`](Backend), which builds on [pymobiledevice3](https://github.com/doronz88/pymobiledevice3) and is [GPL-3.0](Backend/LICENSE).
+[MIT](LICENSE)

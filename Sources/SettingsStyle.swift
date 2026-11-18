@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 import CoreText
 import QuartzCore
 
@@ -20,6 +21,7 @@ enum SettingsStyle {
     // also the app icon's glyph (Assets/Toss.icon/icon.json); never pure white.
     static let raised = rgb(0xFAF9F5)
     static let background = dynamic(paper, rgb(0x0D0D0C))
+    static let settingsBackground = dynamic(paper, rgb(0x060606))
     static let ink = dynamic(rgb(0x141413), raised)
     static let muted = dynamic(rgb(0x65645F), rgb(0xA3A19A))
     // Hairline one step darker than on the old paper, so it keeps the same contrast (1.2:1).
@@ -35,6 +37,13 @@ enum SettingsStyle {
     static let margin: CGFloat = 36
     static let top: CGFloat = 44
     static let bottom: CGFloat = 28
+
+    // Native glass belongs to the controls; the window uses a solid background.
+    static func applyUnifiedWindowStyle(in window: NSWindow, backgroundColor: NSColor = background) {
+        window.backgroundColor = backgroundColor
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+    }
 
     // Source Serif 4 and Hanken Grotesk (SIL OFL) ship in Resources/Fonts.
     // If they are missing the window falls back to New York and SF.
@@ -114,9 +123,10 @@ enum SettingsStyle {
 // Pill button from the website: ghost (thin outline), filled (ink), or quiet (underlined text).
 final class SettingsPill: NSButton {
     enum Kind { case ghost, filled, quiet }
-    var kind: Kind = .ghost { didSet { needsDisplay = true } }
+    var kind: Kind = .ghost { didSet { needsDisplay = true; updateGlass() } }
     private var compact = false
-    override var title: String { didSet { invalidateIntrinsicContentSize(); needsDisplay = true } }
+    private var stylingTitle = false
+    override var title: String { didSet { invalidateIntrinsicContentSize(); needsDisplay = true; updateGlassTitle() } }
 
     convenience init(_ title: String, kind: Kind = .ghost, compact: Bool = true, target: AnyObject?, action: Selector?) {
         self.init(frame: .zero)
@@ -127,10 +137,46 @@ final class SettingsPill: NSButton {
         self.action = action
         isBordered = false
         setButtonType(.momentaryPushIn)
+        updateGlass()
         setContentHuggingPriority(.required, for: .horizontal)
         setContentCompressionResistancePriority(.required, for: .horizontal)
     }
-    override var wantsUpdateLayer: Bool { false }
+    // Native glass is layer-rendered; NSButton's default can remain false in a
+    // subclass and would draw only the title, without its glass bezel.
+    override var wantsUpdateLayer: Bool { usesNativeGlass }
+    override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsets() }
+    private var usesNativeGlass: Bool {
+        if #available(macOS 26.0, *) { return kind != .quiet }
+        return false
+    }
+    private func updateGlass() {
+        guard #available(macOS 26.0, *) else { return }
+        isBordered = usesNativeGlass
+        wantsLayer = usesNativeGlass
+        guard usesNativeGlass else { return }
+        bezelStyle = .glass
+        borderShape = .capsule
+        controlSize = compact ? .small : .regular
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            bezelColor = (kind == .filled ? SettingsStyle.ink : SettingsStyle.background).usingColorSpace(.sRGB)
+        }
+        tintProminence = kind == .filled ? .primary : .secondary
+        font = textFont
+        updateGlassTitle()
+    }
+    private func updateGlassTitle() {
+        guard usesNativeGlass, !stylingTitle else { return }
+        stylingTitle = true
+        defer { stylingTitle = false }
+        // Resolve colors here so AppKit's cached glass label also updates when
+        // this window changes appearance without changing the system theme.
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let color = kind == .filled ? SettingsStyle.background : SettingsStyle.ink
+            attributedTitle = NSAttributedString(string: title, attributes: [
+                .font: textFont, .foregroundColor: color.usingColorSpace(.sRGB) ?? color
+            ])
+        }
+    }
     override var focusRingMaskBounds: NSRect { bounds }
     override func drawFocusRingMask() {
         NSBezierPath(roundedRect: bounds, xRadius: bounds.height / 2, yRadius: bounds.height / 2).fill()
@@ -141,15 +187,22 @@ final class SettingsPill: NSButton {
         if kind == .quiet { return NSSize(width: ceil(size.width) + 2, height: 26) }
         return NSSize(width: ceil(size.width) + (compact ? 26 : 32), height: compact ? 27 : 32)
     }
-    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+        updateGlass()
+    }
     override func draw(_ dirtyRect: NSRect) {
+        if usesNativeGlass {
+            super.draw(dirtyRect)
+            return
+        }
         NSGraphicsContext.saveGraphicsState()
         defer { NSGraphicsContext.restoreGraphicsState() }
         NSGraphicsContext.current?.cgContext.setAlpha(!isEnabled ? 0.4 : (isHighlighted ? 0.6 : 1))
         let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
         let pill = NSBezierPath(roundedRect: rect, xRadius: rect.height / 2, yRadius: rect.height / 2)
         var color = SettingsStyle.ink
-        var attributes: [NSAttributedString.Key: Any] = [.font: textFont]
         switch kind {
         case .filled:
             SettingsStyle.ink.setFill()
@@ -161,60 +214,276 @@ final class SettingsPill: NSButton {
             pill.stroke()
         case .quiet:
             color = SettingsStyle.muted
+        }
+        drawTitle(in: bounds, color: color)
+    }
+    fileprivate func drawTitle(in rect: NSRect, color: NSColor? = nil) {
+        var attributes: [NSAttributedString.Key: Any] = [.font: textFont]
+        if kind == .quiet {
             attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
             attributes[.underlineColor] = SettingsStyle.line
         }
+        let color = color ?? (kind == .filled ? SettingsStyle.background : kind == .quiet ? SettingsStyle.muted : SettingsStyle.ink)
         attributes[.foregroundColor] = color
         let size = (title as NSString).size(withAttributes: attributes)
-        (title as NSString).draw(at: NSPoint(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2),
+        (title as NSString).draw(at: NSPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2),
                                  withAttributes: attributes)
     }
 }
 
-// Ink switch (no accent color), used for Launch at Login. Mixed = waiting for approval.
-final class SettingsSwitch: NSButton {
-    convenience init(target: AnyObject?, action: Selector?) {
-        self.init(frame: .zero)
-        setButtonType(.pushOnPushOff)
-        isBordered = false
-        title = ""
-        allowsMixedState = true
-        self.target = target
-        self.action = action
-        setContentHuggingPriority(.required, for: .horizontal)
+// The system Toggle owns the transparent lens and all input handling.
+// Toss's original small ink switch covers it only while it is at rest.
+@MainActor
+private final class SettingsSwitchModel: ObservableObject {
+    @Published var isOn = false
+    @Published var pendingApproval = false
+    @Published var isEnabled = true
+    @Published var label = ""
+    @Published var interacting = false
+    private var interactionGeneration = 0
+    func beginInteraction() {
+        interactionGeneration += 1
+        interacting = true
     }
-    override var wantsUpdateLayer: Bool { false }
-    override var intrinsicContentSize: NSSize { NSSize(width: 34, height: 20) }
-    override var focusRingMaskBounds: NSRect { bounds }
-    override func drawFocusRingMask() {
-        NSBezierPath(roundedRect: NSRect(x: 0, y: (bounds.height - 20) / 2, width: 34, height: 20), xRadius: 10, yRadius: 10).fill()
+    func endInteraction() {
+        interactionGeneration += 1
+        let generation = interactionGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
+            guard let self, self.interactionGeneration == generation else { return }
+            self.interacting = false
+        }
     }
-    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
-    override func draw(_ dirtyRect: NSRect) {
-        NSGraphicsContext.saveGraphicsState()
-        defer { NSGraphicsContext.restoreGraphicsState() }
-        NSGraphicsContext.current?.cgContext.setAlpha(isEnabled ? 1 : 0.5)
-        let track = NSRect(x: 0, y: (bounds.height - 20) / 2, width: 34, height: 20)
-        (state == .on ? SettingsStyle.ink : state == .mixed ? SettingsStyle.muted : SettingsStyle.line).setFill()
-        NSBezierPath(roundedRect: track, xRadius: 10, yRadius: 10).fill()
-        (state == .off ? SettingsStyle.knobOff : SettingsStyle.background).setFill()
-        let x = state == .off ? track.minX + 2 : track.maxX - 18
-        NSBezierPath(ovalIn: NSRect(x: x, y: track.minY + 2, width: 16, height: 16)).fill()
+    func cancelInteraction() {
+        interactionGeneration += 1
+        interacting = false
+    }
+    var onChange: ((Bool) -> Void)?
+
+    func setFromUser(_ value: Bool) {
+        guard isEnabled, value != isOn else { return }
+        isOn = value
+        onChange?(value)
     }
 }
 
-// Keycap like the website's <kbd>: 1 pt edge, 2 pt along the bottom.
-final class SettingsKeycap: NSView {
+private struct RestingSettingsSwitch: NSViewRepresentable {
+    var isOn: Bool
+    var pendingApproval: Bool
+    var isEnabled: Bool
+    func makeNSView(context: Context) -> InkSwitchDrawing { InkSwitchDrawing() }
+    func updateNSView(_ view: InkSwitchDrawing, context: Context) {
+        view.isOn = isOn
+        view.pendingApproval = pendingApproval
+        view.enabled = isEnabled
+        view.needsDisplay = true
+    }
+}
+private final class InkSwitchDrawing: NSView {
+    var isOn = false
+    var pendingApproval = false
+    var enabled = true
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func draw(_ dirtyRect: NSRect) {
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        (window?.backgroundColor ?? SettingsStyle.background).setFill()
+        bounds.fill()
+        NSGraphicsContext.current?.cgContext.setAlpha(enabled ? 1 : 0.5)
+        let track = NSRect(x: (bounds.width - 34) / 2, y: (bounds.height - 20) / 2, width: 34, height: 20)
+        (isOn ? (pendingApproval ? SettingsStyle.muted : SettingsStyle.ink) : SettingsStyle.line).setFill()
+        NSBezierPath(roundedRect: track, xRadius: 10, yRadius: 10).fill()
+        (isOn ? SettingsStyle.background : SettingsStyle.knobOff).setFill()
+        NSBezierPath(ovalIn: NSRect(x: track.minX + (isOn ? 16 : 2), y: track.minY + 2, width: 16, height: 16)).fill()
+    }
+}
+private struct NativeSettingsSwitch: View {
+    @ObservedObject var model: SettingsSwitchModel
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var nativeSize = CGSize(width: 54, height: 24)
+    var body: some View {
+        ZStack {
+            Toggle(model.label, isOn: Binding(get: { model.isOn }, set: { model.setFromUser($0) }))
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .tint(colorScheme == .dark ? .white : .black)
+                .fixedSize()
+                .onGeometryChange(for: CGSize.self) { $0.size } action: { nativeSize = $0 }
+                .scaleEffect(x: 34 / max(1, nativeSize.width), y: 20 / max(1, nativeSize.height))
+                .frame(width: 34, height: 20)
+            RestingSettingsSwitch(isOn: model.isOn, pendingApproval: model.pendingApproval, isEnabled: model.isEnabled)
+                .frame(width: 58, height: 44)
+                .opacity(model.interacting ? 0 : 1)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
+        .frame(width: 34, height: 20)
+        .disabled(!model.isEnabled)
+        .accessibilityLabel(model.label)
+        .padding(12)
+    }
+}
+
+// Bridge the native SwiftUI control to Toss's existing AppKit target/actions.
+final class SettingsSwitch: NSControl {
+    private let model = SettingsSwitchModel()
+    private var hosting: NSHostingView<NativeSettingsSwitch>!
+    private var inputMonitor: Any?
+    private var releaseTimer: Timer?
+
+    deinit {
+        releaseTimer?.invalidate()
+        if let inputMonitor { NSEvent.removeMonitor(inputMonitor) }
+    }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        releaseTimer?.invalidate()
+        releaseTimer = nil
+        model.cancelInteraction()
+        if let inputMonitor { NSEvent.removeMonitor(inputMonitor); self.inputMonitor = nil }
+        guard window != nil else { return }
+        // Observe presses inside this control. Event delivery and dragging remain
+        // entirely with the system Toggle underneath the hit-transparent cover.
+        inputMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { [weak self] event in
+            guard let self else { return event }
+            if event.type == .leftMouseDown, self.isEnabled, !self.isHiddenOrHasHiddenAncestor,
+               event.window === self.window, self.bounds.contains(self.convert(event.locationInWindow, from: nil)) {
+                self.beginNativeInteraction()
+            } else if event.type == .leftMouseUp, self.model.interacting {
+                self.finishNativeInteraction()
+            }
+            return event
+        }
+    }
+    private func beginNativeInteraction() {
+        model.beginInteraction()
+        releaseTimer?.invalidate()
+        // Native controls can consume mouseUp in their own tracking loop, bypassing
+        // local event monitors. Observe release only for the duration of this press.
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] timer in
+            MainActor.assumeIsolated {
+                guard let self else { timer.invalidate(); return }
+                if NSEvent.pressedMouseButtons & 1 == 0 { self.finishNativeInteraction() }
+            }
+        }
+        releaseTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+        RunLoop.main.add(timer, forMode: .eventTracking)
+    }
+    private func finishNativeInteraction() {
+        releaseTimer?.invalidate()
+        releaseTimer = nil
+        model.endInteraction()
+    }
+    var state: NSControl.StateValue = .off {
+        didSet {
+            model.pendingApproval = state == .mixed
+            let value = state != .off
+            if model.isOn != value { model.isOn = value }
+        }
+    }
+    override var isEnabled: Bool {
+        didSet {
+            model.isEnabled = isEnabled
+            if !isEnabled {
+                releaseTimer?.invalidate()
+                releaseTimer = nil
+                model.cancelInteraction()
+            }
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        hosting = NSHostingView(rootView: NativeSettingsSwitch(model: model))
+        clipsToBounds = false
+        hosting.clipsToBounds = true
+        hosting.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(hosting)
+        NSLayoutConstraint.activate([
+            hosting.leadingAnchor.constraint(equalTo: leadingAnchor, constant: -12),
+            hosting.trailingAnchor.constraint(equalTo: trailingAnchor, constant: 12),
+            hosting.topAnchor.constraint(equalTo: topAnchor, constant: -12),
+            hosting.bottomAnchor.constraint(equalTo: bottomAnchor, constant: 12)
+        ])
+        setAccessibilityElement(false) // Expose the system switch once, via its hosting view.
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+        model.onChange = { [weak self] value in
+            guard let self else { return }
+            self.state = value ? .on : .off
+            self.sendAction(self.action, to: self.target)
+        }
+    }
+    required init?(coder: NSCoder) { nil }
+    convenience init(target: AnyObject?, action: Selector?) {
+        self.init(frame: .zero)
+        self.target = target
+        self.action = action
+    }
+    override var intrinsicContentSize: NSSize { NSSize(width: 34, height: 20) }
+    override func accessibilityChildren() -> [Any]? {
+        hosting.map { [$0] } ?? [] // NSControl otherwise treats this wrapper as a leaf.
+    }
+    override func setAccessibilityLabel(_ label: String?) {
+        super.setAccessibilityLabel(label)
+        model.label = label ?? ""
+    }
+    override func performClick(_ sender: Any?) {
+        model.setFromUser(!model.isOn)
+    }
+}
+
+// A native glass keycap with feedback only. It never synthesizes a key event,
+// invokes a shortcut, or sends an action through the responder chain.
+final class SettingsKeycap: NSButton {
     private let symbol: String
     init(_ symbol: String) {
         self.symbol = symbol
         super.init(frame: .zero)
+        title = symbol
+        setButtonType(.momentaryPushIn)
+        target = self
+        action = #selector(pressed(_:))
+        keyEquivalent = ""
+        setAccessibilityLabel(symbol == "⌥" ? "Option" : "Shift")
+        updateGlass()
         setContentHuggingPriority(.required, for: .horizontal)
     }
     required init?(coder: NSCoder) { return nil }
+    @objc private func pressed(_ sender: NSButton) { /* Visual feedback only. */ }
+    private var usesNativeGlass: Bool {
+        if #available(macOS 26.0, *) { return true }
+        return false
+    }
+    override var wantsUpdateLayer: Bool { usesNativeGlass }
+    override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsets() }
     override var intrinsicContentSize: NSSize { NSSize(width: 28, height: 26) }
-    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
+    private func updateGlass() {
+        isBordered = usesNativeGlass
+        wantsLayer = usesNativeGlass
+        guard #available(macOS 26.0, *) else { return }
+        bezelStyle = .glass
+        borderShape = .roundedRectangle
+        controlSize = .small
+        tintProminence = .secondary
+        font = .systemFont(ofSize: 13, weight: .medium)
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            bezelColor = SettingsStyle.key.usingColorSpace(.sRGB)
+            attributedTitle = NSAttributedString(string: symbol, attributes: [
+                .font: font!, .foregroundColor: SettingsStyle.ink.usingColorSpace(.sRGB)!
+            ])
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+        updateGlass()
+    }
     override func draw(_ dirtyRect: NSRect) {
+        if usesNativeGlass { super.draw(dirtyRect); return }
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        NSGraphicsContext.current?.cgContext.setAlpha(isHighlighted ? 0.65 : 1)
         SettingsStyle.keyEdge.setFill()
         NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
         let face = NSRect(x: 1, y: isFlipped ? 1 : 2, width: bounds.width - 2, height: bounds.height - 3)

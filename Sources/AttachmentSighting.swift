@@ -1,7 +1,7 @@
 import ApplicationServices
 import Foundation
 
-// Early sighting of the new attachment (2026-10-25: start the jelly the moment the
+// Early sighting of the new attachment (2026-10-25, Ashley: start the jelly the moment the
 // picture is seen, not after the full confirmation; the real tile otherwise shows for 2-4
 // frames first). Visual only: the paste is still confirmed by the target's full readback,
 // and the sound and ✓ toast wait for that. Reads only a bounded subtree around the composer,
@@ -38,6 +38,11 @@ enum AttachmentSighting {
             abs(previous.width - current.width) <= tolerance && abs(previous.height - current.height) <= tolerance
     }
 
+    static func frameChanged(from current: CGRect, to next: CGRect, followPosition: Bool) -> Bool {
+        if followPosition { return !stable(current, next) }
+        return next.width > current.width + 0.5 || next.height > current.height + 0.5
+    }
+
     // The next slot in the attachment row, predicted before the paste from the tiles already
     // there: one tile width plus the measured gap to the right of the last tile. Only when at
     // least two tiles share the last row (so size and gap are measured, not assumed) and the
@@ -54,8 +59,8 @@ enum AttachmentSighting {
     }
 
     // What one app's last confirmed tiles looked like, so the first and second picture also get
-    // a predicted slot (2026-10-25: the real tile was painted before AX showed it, and it
-    // showed under the copy). Learned from Toss's own confirmed pastes, per app; only used while
+    // a predicted slot (2026-10-25: the real tile was painted before AX showed it, and Ashley
+    // saw it under the copy). Learned from Toss's own confirmed pastes, per app; only used while
     // the composer has the same width as when it was learned. Geometry only, no content.
     struct SlotMemory: Codable, Equatable {
         var width: CGFloat, height: CGFloat
@@ -267,6 +272,16 @@ enum AttachmentSighting {
         guard AXValueGetValue(p as! AXValue, .cgPoint, &point), AXValueGetValue(s as! AXValue, .cgSize, &size) else { return nil }
         return CGRect(origin: point, size: size)
     }
+
+    fileprivate static func confirmedCardFrame(_ card: AXUIElement) -> CGRect? {
+        AXUIElementSetMessagingTimeout(card, 0.006)
+        var hidden: CFTypeRef?
+        _ = AXUIElementCopyAttributeValue(card, "AXHidden" as CFString, &hidden)
+        guard hidden as? Bool != true, let rect = frame(card),
+              rect.minX.isFinite, rect.minY.isFinite,
+              (40...600).contains(rect.width), (40...600).contains(rect.height) else { return nil }
+        return rect
+    }
 }
 
 // Probes on its own queue until it sees the tile, the window ends, or it is cancelled.
@@ -303,26 +318,42 @@ final class AttachmentSighter: @unchecked Sendable {
 
     func cancel() { queue.async { [self] in generation += 1 } }
 
-    // After the confirmation: re-read the tile every `interval` for `duration` and report each
-    // larger frame (the copy grows with it), then the frame it settled at and when (seconds).
+    // After confirmation, follow a retained Chat card through reflow. For
+    // other composers, keep the existing size-only probe around the editor.
+    // Report the final observed frame and when it last moved or grew.
     // `settled` fires once, as soon as AttachmentSighting.growthSettled holds (see expectedFinal).
     func follow(composer: AXUIElement, filename: String, from first: CGRect, duration: Double = 0.6,
-                interval: Double = 0.03, expectedFinal: CGSize? = nil,
-                grew: @escaping @Sendable (CGRect) -> Void,
+                interval: Double = 0.03, expectedFinal: CGSize? = nil, trackingCard: AXUIElement? = nil,
+                updated: @escaping @Sendable (CGRect) -> Void,
                 settled: @escaping @Sendable () -> Void = {},
+                lost: @escaping @Sendable () -> Void = {},
                 done: @escaping @Sendable (CGRect, Double) -> Void) {
         queue.async { [self] in
             generation += 1
             let token = generation, started = ProcessInfo.processInfo.systemUptime
             var current = first, settledAt = 0.0
-            var lastRead: CGSize?, reportedSettled = false
+            var lastRead: CGSize?, reportedSettled = false, missedReads = 0
             func tick() {
                 guard token == generation else { return }
                 let elapsed = ProcessInfo.processInfo.systemUptime - started
-                let read = AttachmentSighting.probe(composer: composer, filename: filename)
-                if let rect = read, rect.width > current.width + 0.5 || rect.height > current.height + 0.5 {
-                    current = rect; settledAt = elapsed
-                    grew(rect)
+                let read: CGRect?
+                if let trackingCard {
+                    read = AttachmentSighting.confirmedCardFrame(trackingCard)
+                    missedReads = read == nil ? missedReads + 1 : 0
+                    if missedReads == 2 {
+                        lost()
+                        if !reportedSettled { settled() }
+                        done(current, settledAt)
+                        return
+                    }
+                } else {
+                    read = AttachmentSighting.probe(composer: composer, filename: filename)
+                }
+                if let rect = read {
+                    let changed = AttachmentSighting.frameChanged(from: current, to: rect, followPosition: trackingCard != nil)
+                    if changed { current = rect; settledAt = elapsed }
+                    // A Chat landing can finish sampling its background after the first update.
+                    if changed || trackingCard != nil { updated(rect) }
                 }
                 if !reportedSettled, let rect = read,
                    AttachmentSighting.growthSettled(current: rect.size, previous: lastRead, expectedFinal: expectedFinal) {

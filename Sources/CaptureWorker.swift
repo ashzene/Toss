@@ -23,18 +23,6 @@ enum CaptureProgressPolicy {
 // retains no screenshot for reuse. All results still pass CaptureReceipt before
 // any target focus or paste. Cancelling invalidates the whole process generation.
 @MainActor
-// USB data dropped while the device still has power: the cable is in, so say so. At most every ten minutes.
-struct USBDropNotice {
-    static let quietSeconds = 600.0
-    private var lastShown: Double?
-    mutating func shouldShow(externalConnected: Bool?, usbBack: Bool, at now: Double) -> Bool {
-        guard externalConnected == true, !usbBack else { return false }
-        if let lastShown, now - lastShown < Self.quietSeconds { return false }
-        lastShown = now
-        return true
-    }
-}
-
 final class CaptureWorkerProcess {
     // The bundled runtime must not pick up anything from the launching environment.
     static var backendEnvironment: [String: String] {
@@ -69,6 +57,7 @@ final class CaptureWorkerProcess {
         let script: String
         let stateDirectory: String
         let outputDirectory: String
+        var deviceClass: String? = nil
     }
     private struct Pending {
         let id: String
@@ -78,6 +67,7 @@ final class CaptureWorkerProcess {
     let role: CaptureWorkerRole
     init(role: CaptureWorkerRole) { self.role = role }
     var onUSBPresence: ((Bool) -> Void)?
+    var onDeviceLock: ((Bool) -> Void)?
     var onAttemptFailure: ((String, String, String, [String: Any]) -> Void)?
     var onProgress: ((String, String?, String, String, [String: Any]) -> Void)?
     var onScreenshotStarted: ((String, String?, [String: Any]) -> Void)?
@@ -150,6 +140,7 @@ final class CaptureWorkerProcess {
         }
         var payload: [String: Any] = ["action": "capture", "request_id": requestID,
             "output_file": file.path, "timeout": timeout, "limits_ms": limits ?? Self.progressLimits()]
+        if let kind = configuration.deviceClass { payload["device_class"] = kind }
         if let attemptID, let deadline {
             payload["attempt_id"] = attemptID
             payload["deadline_monotonic"] = deadline
@@ -208,7 +199,12 @@ final class CaptureWorkerProcess {
         process.arguments = [config.script, "--state-dir", config.stateDirectory,
             "--output-dir", config.outputDirectory, "--idle-seconds", "1800",
             "--timings-file", FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/Toss/screenshot-success-times.json").path]
+                .appendingPathComponent("Library/Application Support/Toss/" +
+                    (config.deviceClass == "iPhone" ? "screenshot-success-times-iPhone.json" : "screenshot-success-times.json")).path]
+        if let kind = config.deviceClass {
+            guard ["iPad", "iPhone"].contains(kind) else { throw CaptureWorkerError.unavailable }
+            process.arguments? += ["--device-class", kind]
+        }
         // Keep an authenticated connection ready and re-establish it whenever
         // the iPad drops it (sleep, restart, network change), mounting the
         // developer image again after a restart. Never requests a frame.
@@ -273,6 +269,9 @@ final class CaptureWorkerProcess {
             failCurrent(reason: "capture_integrity_failed")
             return
         }
+        if let kind = configuration?.deviceClass, value["device_class"] as? String != kind {
+            failCurrent(reason: "capture_integrity_failed"); return
+        }
         guard value["worker_role"] as? String == role.rawValue,
               value["transport"] as? String == "authenticated_" + role.transport else {
             failCurrent(reason: "capture_integrity_failed"); return
@@ -280,6 +279,14 @@ final class CaptureWorkerProcess {
         var eventValue = value
         eventValue.removeValue(forKey: "worker_role")
         eventValue.removeValue(forKey: "transport")
+        eventValue.removeValue(forKey: "device_class")
+        if value["event"] as? String == "device_lock" {
+            guard let locked = TossConnectionStatus.deviceLock(eventValue) else {
+                failCurrent(reason: "capture_integrity_failed"); return
+            }
+            onDeviceLock?(locked)
+            return
+        }
         if value["event"] as? String == "usb_presence" {
             guard role == .wifiPrimary, Self.schemaOne(value),
                   Set(eventValue.keys) == ["schema_version", "event", "present"],
@@ -479,6 +486,9 @@ final class CaptureWorker {
     private var usbPresent = false
     var usbConnected: Bool { usbPresent }
     var onUSBLost: (() -> Void)?
+    // Latest reading from either route. Kept while disconnected: nil only until the first reading.
+    private(set) var deviceLocked: Bool?
+    var onDeviceLockChange: (() -> Void)?
     private var usbFatalReason: String?
     private var usbRetry: DispatchWorkItem?
     private var wifiRetry: DispatchWorkItem?
@@ -536,6 +546,11 @@ final class CaptureWorker {
         process.onUSBPresence = { [weak self, weak process] present in
             guard let self, let process, self.workers[.wifiPrimary] === process else { return }
             self.usbPresence(present)
+        }
+        process.onDeviceLock = { [weak self, weak process] locked in
+            guard let self, let process, self.workers[role] === process, self.deviceLocked != locked else { return }
+            self.deviceLocked = locked
+            self.onDeviceLockChange?()
         }
         process.onAttemptFailure = { [weak self, weak process] id, attempt, reason, receipt in
             guard let self, let process, self.workers[role] === process,

@@ -15,10 +15,10 @@ def install(folder, *, check_only=False):
     executable = Path("Contents/MacOS/Toss")
     runtime = Path("Contents/Resources/Runtime/python/bin/python3")
     if not (app_source / executable).is_file() or not (app_source / runtime).is_file():
-        raise RuntimeError("The install source is incomplete. Keep Toss.app and its bundled runtime.")
+        raise RuntimeError("安装源不完整；请保留 Toss.app 及其内置运行环境")
     subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app_source)], check=True)
     if check_only:
-        print("Install source checked. Nothing installed, no pairing data read, no app started.")
+        print("安装源检查通过；未安装、未读取配对内容、未启动任何应用。")
         return
 
     apps = Path.home() / "Applications"
@@ -27,7 +27,7 @@ def install(folder, *, check_only=False):
     if destination.exists():
         current = destination / executable
         if not current.is_file() or hashlib.sha256(current.read_bytes()).digest() != hashlib.sha256((app_source / executable).read_bytes()).digest():
-            raise RuntimeError("A different version is installed. Quit Toss and move the existing app to the Trash, then run the installer again.")
+            raise RuntimeError("已有不同版本。请先退出 Toss 并将已有 App 移到废纸篓，再运行安装")
     else:
         temporary = apps / (".toss-install-" + uuid.uuid4().hex + ".app")
         try:
@@ -37,8 +37,8 @@ def install(folder, *, check_only=False):
             if temporary.exists():
                 shutil.rmtree(temporary)
     subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(destination)], check=True)
-    print("Installed. Open ~/Applications/Toss.app yourself and grant the permissions.")
-    print("No pairing data was imported, nothing was started and no login item was registered. The runtime is inside the app.")
+    print("安装完成。请自己打开 ~/Applications/Toss.app 并授权。")
+    print("未导入配对数据、未自动启动、未注册登录项；运行环境包含在 App 内。")
 
 
 def main():
@@ -46,7 +46,7 @@ def main():
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     if os.geteuid() == 0:
-        raise RuntimeError("Run this as the logged-in user, not with sudo.")
+        raise RuntimeError("请用当前登录用户运行，不要 sudo")
     os.umask(0o077)
     install(Path(__file__).resolve().parent, check_only=args.check)
 
@@ -56,7 +56,7 @@ if __name__ == "__main__":
         main()
     except Exception as error:
         if isinstance(error, RuntimeError):
-            print("Install did not finish: " + str(error), file=sys.stderr)
+            print("安装未完成：" + str(error), file=sys.stderr)
         else:
-            print("Install did not finish: a local file or signature check failed. Nothing was started.", file=sys.stderr)
+            print("安装未完成：本地文件或签名检查失败；未启动工具。", file=sys.stderr)
         sys.exit(1)

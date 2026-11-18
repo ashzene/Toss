@@ -25,12 +25,18 @@ struct LogExportUITests {
         for chinese in [false, true] {
             AppLanguage.override = chinese
             for dark in [false, true] {
-                for paired in [false, true] {
+                for deviceCount in [0, 1, 2] {
+                    let paired = deviceCount > 0
                     let panel = TossStatusPanel()
                     panel.loadViewIfNeeded()
                     panel.view.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
-                    panel.update(.init(connection: .init(state: .ready, reason: "ready"), phase: .idle,
-                                       paired: paired, enabled: true))
+                    var presentation = TossStatusPresentation(connection: .init(state: .ready, reason: "ready"), phase: .idle,
+                                       paired: paired, enabled: true)
+                    if deviceCount == 2 {
+                        presentation.deviceConnections = [("iPad", .init(state: .ready, reason: "ready", transport: "usb")),
+                                                          ("iPhone", .init(state: .ready, reason: "ready", transport: "wifi"))]
+                    }
+                    panel.update(presentation)
                     panel.view.frame.size = panel.preferredContentSize
                     panel.view.layoutSubtreeIfNeeded()
                     let buttons = descendants(panel.view).compactMap { $0 as? SettingsPill }
@@ -54,7 +60,7 @@ struct LogExportUITests {
                     check(!export.isEnabled && clicked == 1 && diagnostics.isEnabled, "only export disabled while busy")
                     panel.exportingLogs = false
                     check(export.isEnabled, "export can retry")
-                    let name = "menu-\(chinese ? "zh" : "en")-\(dark ? "dark" : "light")-\(paired ? "paired" : "unpaired")"
+                    let name = "menu-\(chinese ? "zh" : "en")-\(dark ? "dark" : "light")-\(deviceCount)-devices"
                     try render(panel.view, name: name)
                     print("\(name): \(Int(panel.view.bounds.width)) × \(Int(panel.view.bounds.height))")
                 }

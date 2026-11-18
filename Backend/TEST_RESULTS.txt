@@ -1,0 +1,72 @@
+Ethernet / any LAN interface — 2026-10-20
+117/117 full synthetic backend tests passed (scripts/test-backend.sh, bundled Python 3.13).
+New: interface selection (Wi-Fi first, active enN with private IPv4; toss, Thunderbolt
+members, virtual adapters, iPad USB ports excluded), multi-interface DNS-SD browse with
+per-record interface scoping, socket route returning the interface actually used,
+endpoint hint keyed by that interface, and a simulated Ethernet-only discovery/hint flow.
+No network, device or real pairing was used. A real Ethernet-connected Mac is unverified.
+
+Persistent service addition — 2026-10-15
+54/54 full synthetic backend tests passed in7.196s.
+Counts: capture_once16; capture_service21; remote_pairing8; system_bonjour9.
+No network, device, application UI, AX, clipboard, or real pairing was used.
+New service tests prove fresh RPC per UUID despite reused connection, idle expiry,
+error/session invalidation, busy/duplicate rejection, output integrity, log
+redaction, cancellation, EOF, parent death and descendant cleanup. A real synthetic
+child launched as process-group leader covers Foundation.Process's setsid EPERM
+topology. Actual warm Wi-Fi performance remains unverified.
+
+Earlier results follow:
+
+2026-10-15 (Asia/Shanghai)
+Python: existing project Python 3.13 virtual environment, pinned dependencies.
+Command: python -m unittest discover -s Backend/tests -v
+Result: 26 tests, all passed. Final run: 1.983 seconds test-suite elapsed.
+
+New wrapper tests: 16
+- New successful request ID, monotonic times, full PNG dimensions, SHA256, mode0600.
+- Portrait1668x2388 and landscape2388x1668, exact pixels without transformation.
+- Existing image and dangling symlink rejected without reading/replacing content.
+- Black/malformed/empty/truncated frames fail, no output published.
+- Exception bodies and invalid request IDs do not leak supplied secret sentinels.
+- Frames predating the request are rejected.
+- Timeout cancels capture and removes the private scratch directory.
+- Insecure output folder/state metadata are rejected.
+- SIGTERM during a synthetic hanging capture stops worker in less than one second,
+  leaves no published output/scratch, and reports cancelled.
+- SIGKILL of the synthetic supervisor is detected by worker parent-death watchdog;
+  worker exits within one second and no output is published.
+
+Reused protocol tests against the vendored modules: 10
+- Valid mutual pair proof, wrong signature/identity/replay/ciphertext/M4 rejection.
+- No remote unlock request, no Wi-Fi automatic pairing.
+- Mocked DNS-SD scoped callbacks, address layout, TXT parsing, filtering and cleanup.
+
+No real device or network capture was executed. No ChatGPT/Codex UI automation,
+clipboard interaction or real target app test was performed by this component.
+Existing pairing records and user images were not read by these tests.
+
+Initial exact-copy source SHA256 (historical; later performance edits below):
+vendor/remote_pairing_transport.py
+297b33ef69ed373210cdfcb90ed8e9e5c506c098daa5c88ea7579b11c10f28a9
+vendor/system_bonjour.py
+f17113a7ea6f039f2e462d72bad87ed213af00473eed965180153d3072043c85
+
+2026-10-15 follow-up: performance changes, work source only
+Result: 33 tests passed, 2.519 seconds suite elapsed. No live network/device/UI.
+Added seven synthetic tests for completed-batch dual-stack fast settle, original
+single-family/unfiltered timing, timeout validation, same-service requirement,
+duplicate endpoint skipping, equivalent IPv6 forms and unchanged interface/order.
+
+Synthetic wait benchmark, three trials each:
+Original350ms rule: 350.266,351.154,351.183ms; median351.154ms.
+New50ms dual-stack rule: 51.165,51.143,50.481ms; median51.143ms.
+Only discovery waiting is simulated. No complete real-device capture or native
+attachment latency claim follows from this benchmark. Actual improvement depends
+on address families and callback timing. No deployment or running service change.
+
+Current modified companion module SHA256:
+vendor/remote_pairing_transport.py
+9dd239c435823f22c35a70d68790e5fa2f2ada4476a84bd29b31137b1d8e6300
+vendor/system_bonjour.py
+f133f7c757a0b429424773648f342dd214a986b312d0c72ae42150f8c8fd9753

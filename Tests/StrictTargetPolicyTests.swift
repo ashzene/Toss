@@ -4,9 +4,115 @@ import ApplicationServices
 // Pure policy/value tests only: no StrictTarget instance, AX application query,
 // window query, pasteboard, activation, keyboard event or live target access.
 @main
+@MainActor
 struct StrictTargetPolicyTests {
     static var assertions = 0
-    static func main() throws {
+    static func testFocusRecovery() async throws {
+        expect(ComposerLabelPolicy.usesChatLayout(["询问 ChatGPT"]))
+        expect(!ComposerLabelPolicy.usesChatLayout(["使用 ChatGPT Work"]))
+        expect(!ComposerLabelPolicy.usesChatLayout(["Ask ChatGPT", "Work with ChatGPT"]))
+        typealias Snapshot = ComposerFocusRecovery.Snapshot<Int>
+        let draft = DraftSnapshot(text: "keep this draft", attachmentMarkers: ["Remove old.png": 1])
+        func snapshot(pid: Int32 = 1, window: Int = 10, webArea: Int = 20, composer: Int = 30,
+                      title: String? = "original", draft value: DraftSnapshot? = nil) -> Snapshot {
+            Snapshot(pid: pid, window: window, webArea: webArea, composer: composer,
+                     documentTitle: title, draft: value ?? draft)
+        }
+        let original = snapshot()
+        try original.validate(snapshot())
+        try original.validate(snapshot(draft: .init(text: "\nkeep this draft\n", attachmentMarkers: draft.attachmentMarkers)))
+        for changed in [snapshot(pid: 2), snapshot(window: 11), snapshot(webArea: 21),
+                        snapshot(composer: 31), snapshot(title: "another"), snapshot(title: nil)] {
+            do { try original.validate(changed); preconditionFailure("Changed editor must refuse") }
+            catch TargetFailure.targetChanged { expect(true) }
+        }
+        for changed in [snapshot(draft: .init(text: "edited", attachmentMarkers: draft.attachmentMarkers)),
+                        snapshot(draft: .init(text: draft.text, attachmentMarkers: [:]))] {
+            do { try original.validate(changed); preconditionFailure("Changed draft must refuse") }
+            catch TargetFailure.draftChanged { expect(true) }
+        }
+        // The actual sidebar policy has no identity until focus publishes aria-current.
+        var nodes = [SidebarIdentityNode(key: 0, parent: nil, role: "AXWindow"),
+                     SidebarIdentityNode(key: 1, parent: 0, role: "AXWebArea"),
+                     SidebarIdentityNode(key: 2, parent: 1, role: "AXTextArea"),
+                     SidebarIdentityNode(key: 3, parent: 1, role: "AXList"),
+                     SidebarIdentityNode(key: 4, parent: 3, role: "AXButton", labels: ["original"],
+                         classes: ["sidebar-item", SidebarIdentityPolicy.threadClass])]
+        func identity() -> SidebarIdentityAnalysis<Int> {
+            SidebarIdentityPolicy.analyze(nodes: nodes, webArea: 1, composer: 2, documentRoutes: [])
+        }
+        expect(identity().failure == .currentThreadUnavailable && identity().identity == nil)
+        var focuses = 0, reads = 0
+        let result: ConversationIdentity<Int> = try await ComposerFocusRecovery.recover(from: .currentThreadUnavailable,
+            prepare: { original }, focus: { _ in focuses += 1 }, read: { before in
+                reads += 1
+                try before.validate(snapshot())
+                if reads == 3 { nodes[4].current = "page" }
+                return identity().identity
+            }, pause: {})
+        expect(focuses == 1 && reads == 3 && result == identity().identity)
+        expect(draft.text == "keep this draft" && draft.attachmentMarkers == ["Remove old.png": 1])
+        // Focus itself is never accepted as conversation evidence.
+        focuses = 0; reads = 0
+        do {
+            let _: Int = try await ComposerFocusRecovery.recover(from: .currentThreadUnavailable,
+                prepare: { original }, focus: { _ in focuses += 1 }, read: { _ in reads += 1; return nil }, pause: {})
+            preconditionFailure("Still missing chat must refuse")
+        } catch TargetFailure.currentThreadUnavailable { expect(focuses == 1 && reads == 6) }
+        // Conflicts, modals and ambiguous editors never become a recovery request.
+        for failure in [TargetFailure.currentThreadsAmbiguous, .conversationConflict, .modalPresent,
+                        .composersAmbiguous, .selectedText, .threadListUnavailable, .denied] {
+            var prepared = false
+            do {
+                let _: Int = try await ComposerFocusRecovery.recover(from: failure,
+                    prepare: { prepared = true; return original }, focus: { _ in preconditionFailure("Unsafe focus") },
+                    read: { _ in 1 }, pause: {})
+                preconditionFailure("Wrong error recovered")
+            } catch let error as TargetFailure { expect(error == failure && !prepared) }
+        }
+        for failure in [TargetFailure.modalPresent, .selectedText, .targetChanged, .selectionUnavailable] {
+            var focused = false
+            do {
+                let _: Int = try await ComposerFocusRecovery.recover(from: .currentThreadUnavailable,
+                    prepare: { () throws -> Snapshot in throw failure }, focus: { _ in focused = true },
+                    read: { _ in 1 }, pause: {})
+                preconditionFailure("Unsafe candidate accepted")
+            } catch let error as TargetFailure { expect(error == failure && !focused) }
+        }
+        // Navigation or a draft edit during the asynchronous focus stops before a lease exists.
+        for changed in [snapshot(window: 99), snapshot(composer: 99),
+                        snapshot(draft: .init(text: "user typed", attachmentMarkers: draft.attachmentMarkers))] {
+            do {
+                let _: Int = try await ComposerFocusRecovery.recover(from: .currentThreadUnavailable,
+                    prepare: { original }, focus: { _ in }, read: { before in try before.validate(changed); return 1 }, pause: {})
+                preconditionFailure("Changed target accepted")
+            } catch let error as TargetFailure { expect(error == .targetChanged || error == .draftChanged) }
+        }
+        reads = 0
+        do {
+            let _: Int = try await ComposerFocusRecovery.recover(from: .currentThreadUnavailable,
+                prepare: { original }, focus: { _ in throw TargetFailure.focusFailed },
+                read: { _ in reads += 1; return 1 }, pause: {})
+            preconditionFailure("Failed focus accepted")
+        } catch TargetFailure.focusFailed { expect(reads == 0) }
+        do {
+            let _: Int = try await ComposerFocusRecovery.recover(from: .currentThreadUnavailable,
+                prepare: { original }, focus: { _ in }, read: { _ in reads += 1; return 1 },
+                pause: { throw CancellationError() })
+            preconditionFailure("Cancelled focus accepted")
+        } catch is CancellationError { expect(reads == 0) }
+        var prepared = false
+        let cancelled = Task { @MainActor in
+            let _: Int = try await ComposerFocusRecovery.recover(from: .currentThreadUnavailable,
+                prepare: { prepared = true; return original }, focus: { _ in }, read: { _ in 1 }, pause: {})
+        }
+        cancelled.cancel()
+        do { try await cancelled.value; preconditionFailure("Cancelled task ran") }
+        catch is CancellationError { expect(!prepared) }
+    }
+
+    static func main() async throws {
+        try await testFocusRecovery()
         // ChatGPT's Dot page: its composer is only labelled "Message" and its row is not a thread row.
         do {
             typealias Row = SidebarIdentityNode<Int>
@@ -394,6 +500,19 @@ struct StrictTargetPolicyTests {
             expect(proof.button == 104 && proof.list == 103 && proof.webArea == 101 && proof.kind == .threadRows)
         } else { preconditionFailure("Unnamed unified thread list must use a retained sidebar proof") }
         expect(check(fixture()).identity == base.identity)
+
+        // ChatGPT 26.1111 exposes a new class on the thread row. The active
+        // navigation control also says "page" but cannot identify a chat.
+        var currentLayout = fixture()
+        for index in [4, 5] {
+            currentLayout[index].classes = [
+                "sidebar-item", "data-[app-action-sidebar-thread-selected=true]:bg-secondary-ghost-hover"
+            ]
+        }
+        currentLayout.append(Node(key: 106, parent: 1, role: "AXButton", current: "page"))
+        expect(check(currentLayout).identity == base.identity)
+        currentLayout[4].current = nil
+        expect(check(currentLayout).failure == .currentThreadUnavailable)
 
         // Identical visible titles must not equate different selected objects.
         var nodes = fixture(); nodes[4].current = nil; nodes[5].current = "page"

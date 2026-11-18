@@ -36,15 +36,18 @@ async def read_power(state: Path) -> bool | None:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state-dir", type=Path, required=True)
+    parser.add_argument("--device-class", choices=("iPad", "iPhone"), required=True)
     args = parser.parse_args(argv)
     # Nothing may keep this one-shot helper alive after the app quits, even a call that ignores cancellation.
     watchdog = threading.Timer(TIMEOUT_SECONDS + 3, os._exit, args=(0,))
     watchdog.daemon = True
     watchdog.start()
     try:
+        from paired_devices import resolve_state
+
         async def bounded():
             async with asyncio.timeout(TIMEOUT_SECONDS):
-                return await read_power(args.state_dir)
+                return await read_power(resolve_state(args.state_dir, args.device_class))
         connected = asyncio.run(bounded())
     except Exception:
         connected = None  # Wi-Fi unreachable or locked: say nothing rather than guess.
