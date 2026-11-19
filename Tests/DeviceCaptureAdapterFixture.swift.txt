@@ -31,6 +31,7 @@ enum iPadWaker { static func poke() {} }
 struct CaptureRecord {
     let startedAt: Date; let target: String
     var deviceClass: String?; var queued: String?
+    var triggerSource: String?
 }
 @MainActor final class FakeTarget {
     var lease = Lease(name: "initial")

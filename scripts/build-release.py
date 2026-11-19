@@ -20,7 +20,7 @@ import sys
 import tempfile
 import time
 
-VERSION, BUILD = "1.0.8", "113"
+VERSION, BUILD = "1.0.8", "122"
 DEFAULT_IDENTITY = "Toss Local Signing"
 
 project = Path(__file__).resolve().parent.parent
@@ -65,7 +65,7 @@ info = {"CFBundleIdentifier": "io.github.ashzene.toss", "CFBundleName": "Toss",
     "LSUIElement": True, "LSMinimumSystemVersion": "14.0", "NSHighResolutionCapable": True,
     "LSArchitecturePriority": ["arm64"],
     "CFBundleDevelopmentRegion": "en", "CFBundleLocalizations": ["en"],
-    "NSLocalNetworkUsageDescription": "Connect to your paired iPad and request a screenshot over your local network when you press a shortcut.",
+    "NSLocalNetworkUsageDescription": "Connect to your paired devices and take a screenshot when you trigger Toss.",
     "NSBonjourServices": ["_remotepairing._tcp"]}
 # App icon: Assets/Toss.icon (Icon Composer) compiles to Assets.car so macOS 26 draws the light,
 # dark, clear and tinted variants itself; Toss.icns from Toss.iconset covers older systems.
@@ -82,6 +82,7 @@ with tempfile.TemporaryDirectory() as partial:
 subprocess.run(["/usr/bin/iconutil", "-c", "icns", str(project / "Assets/Toss.iconset"),
                 "-o", str(resources / "Toss.icns")], check=True)
 (app / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
+shutil.copyfile(project / "Assets/Toss iPhone.shortcut", resources / "Toss iPhone.shortcut")
 ignore = shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store", "tests")
 shutil.copytree(project / "Backend", resources / "Backend", ignore=ignore)
 # ditto keeps the runtime's symlinks and precompiled bytecode intact.

@@ -33,6 +33,13 @@ Capture into the current chat
 • Release the keys after pressing. Keep your iPhone or iPad unlocked.
 Toss brings the target app forward and adds one new screenshot to its current chat. It preserves the existing draft and attachments. Review the attachment and send the message yourself. It never sends automatically or retries a paste that may already have happened.
 
+Trigger Toss from iPhone
+1. Pair the iPhone in Toss on the Mac. As soon as pairing succeeds, Toss opens the Apple Shortcuts setup form and fills it in. Click Add Shortcut once. Toss checks the connection so Shortcuts can show its permission prompt immediately. If prompted, click Allow, then wait for iCloud to sync to your iPhone.
+2. On iPhone, open Settings → Accessibility → Touch → Back Tap. Choose Toss iPhone under Double Tap or Triple Tap. Turn off Show Banner on the Back Tap screen to keep its notice out of screenshots. On an iPhone with an Action button, you can also select Toss iPhone in Settings → Action Button → Shortcut.
+3. If Shortcuts does not sync, open Toss Settings → More → iPhone Shortcut → Send to iPhone and select your phone. Open the received file, paste the configuration Toss copied when Shortcuts asks, and add it.
+
+Keep the iPhone unlocked, connect both devices to the same local network, and leave Toss shortcuts enabled and the chosen chat app open on the Mac. The shortcut captures the paired iPhone and adds the screenshot to the current draft. Change the destination or turn off the phone trigger in Toss Settings → More → iPhone Shortcut.
+
 Menu bar status
 Click the Toss icon to see iPad connection status and screenshot progress. The icon is the ⌥ symbol with a solid up arrow. While a screenshot is uploading, only the arrow moves up and down, blue when sending to Codex and orange when sending to Claude; the ⌥ stays still. When processing ends, the arrow stops and returns to its normal colour.
 
@@ -54,7 +61,7 @@ The target chat, composer, and draft must be verifiable. Unsupported layouts, am
 The menu panel and English UI were checked on this Mac. This update does not establish a fresh end-to-end iPad capture test; wireless capture must be verified with a reachable iPad. Network changes, long idle periods, and other device models may need additional testing.
 
 Privacy and files
-Toss requests one screenshot per shortcut; it does not continuously record the iPad screen. It uses authenticated pairing and local communication. Pairing files are stored in ~/Library/Application Support/Toss/DeviceState and should not be shared. Screenshot caches are in ~/Library/Caches/Toss. Do not share these folders in diagnostics.
+Toss requests one screenshot per shortcut; it does not continuously record the iPad screen. It uses authenticated pairing and local communication. With iPhone Shortcut enabled, the Mac accepts a local trigger authorized by the setup code. The screenshot uses the existing paired connection. Pairing files are stored in ~/Library/Application Support/Toss/DeviceState and should not be shared. Screenshot caches are in ~/Library/Caches/Toss. Do not share these folders in diagnostics.
 
 Uninstall
 Open Toss → Settings → Uninstall Toss… and confirm Uninstall. Toss stops its capture and pairing processes, attempts to unregister its login item, removes its local pairing files, settings and screenshot cache, then moves itself to the Trash and quits. If it cannot move itself, Finder selects the app and asks you to drag Toss to the Trash. The Accessibility permission is kept so a reinstall works at once; you can remove it in System Settings → Privacy & Security → Accessibility. Trust and Developer Mode settings on your iPad are unchanged.

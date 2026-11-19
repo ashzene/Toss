@@ -82,8 +82,9 @@ struct UninstallUITests {
         let defaults = RenderDefaults()
         TossDelegate.clearOnboardingPreferences(in: defaults)
         check(defaults.removed == [OnboardingPolicy.seenKey, OnboardingPolicy.wirelessKey, OnboardingPolicy.resumeAccessKey,
-                                  OnboardingPolicy.autoRelaunchKey, USBSetupDismissals.key, AppLanguage.key, TossDelegate.reopenSettingsKey] &&
-              defaults.synchronized, "CLI and UI share complete owned onboarding/language cleanup")
+                                  OnboardingPolicy.autoRelaunchKey, USBSetupDismissals.key, AppLanguage.key,
+                                  TossDelegate.reopenSettingsKey, IPhoneShortcutSettings.key] &&
+              defaults.synchronized, "CLI and UI also clear the iPhone shortcut configuration")
         let fm = FileManager.default
         for url in try fm.contentsOfDirectory(at: URL(fileURLWithPath: "Assets/Fonts"), includingPropertiesForKeys: nil)
             where url.pathExtension == "ttf" {

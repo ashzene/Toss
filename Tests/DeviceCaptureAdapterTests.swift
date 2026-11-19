@@ -318,6 +318,37 @@ struct DeviceCaptureAdapterTests {
         }
         do {
             let f = fixture()
+            let now = ProcessInfo.processInfo.systemUptime
+            check(f.admitCapture(.shifts, at: now, deviceClass: .iPhone, source: .iPhoneShortcut),
+                  "the iPhone shortcut is admitted when both devices are paired")
+            check(f.transaction?.deviceClass == .iPhone && f.transaction?.kind == .claude,
+                  "the iPhone shortcut backs a Claude draft even when iPad is the keyboard default")
+            f.retargetPipelineCapture(at: now, to: .iPad)
+            f.captureWorkers[.iPhone]!.finish(reason: "black_frame_rejected")
+            try await settle()
+            check(f.captureWorkers[.iPad]!.starts.isEmpty && f.deliveries.isEmpty,
+                  "a failed iPhone shortcut never takes a screenshot of the iPad")
+        }
+        do {
+            let f = fixture()
+            let now = ProcessInfo.processInfo.systemUptime
+            f.admitCapture(.options, at: now, deviceClass: .iPhone, source: .iPhoneShortcut)
+            f.selectCapture(.options, at: now + 0.1)
+            f.selectCapture(.options, at: now + 0.2)
+            check(f.capturePipeline.press(at: now)?.deviceClass == .iPhone &&
+                  f.capturePipeline.press(at: now + 0.1)?.deviceClass == .iPhone &&
+                  f.captureWorkers[.iPad]!.starts.count == 1,
+                  "a keyboard double press selects its own device without changing the iPhone shortcut")
+            f.captureWorkers[.iPhone]!.finish()
+            f.captureWorkers[.iPad]!.finish()
+            f.captureWorkers[.iPhone]!.finish()
+            f.handle(f.core.observe(ModifierSnapshot(), at: ProcessInfo.processInfo.systemUptime, allowNewCapture: false))
+            try await settle()
+            check(f.deliveries.count == 2 && f.deliveries.allSatisfy { $0.0 == .iPhone },
+                  "the shortcut and the laptop double press each deliver one iPhone screenshot")
+        }
+        do {
+            let f = fixture()
             f.selectCapture(.options, at: ProcessInfo.processInfo.systemUptime)
             f.uninstalling = true
             f.enabled = false

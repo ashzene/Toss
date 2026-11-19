@@ -23,6 +23,7 @@ struct CaptureHistoryTests {
         }
 
         var record = CaptureRecord(startedAt: Date(timeIntervalSince1970: 1_761_100_000), target: "chatgpt")
+        record.triggerSource = "iphone_shortcut"
         record.reach("locating_target", ms: 2)
         record.reach("append_confirmed", ms: 1310)
         record.takeImage(from: ["bytes": 11_470_282, "width": 2388, "height": 1668, "bit_depth": 16,
@@ -35,7 +36,8 @@ struct CaptureHistoryTests {
         check(line.last == 0x0A && line.filter { $0 == 0x0A }.count == 1)
         let object = try JSONSerialization.jsonObject(with: line) as! [String: Any]
         check(Set(object.keys) == ["time", "target", "outcome", "failure", "backend", "stages", "image",
-                                   "timings_ms", "connection_reused"])
+                                   "timings_ms", "connection_reused", "trigger_source"])
+        check(object["trigger_source"] as? String == "iphone_shortcut")
         check(object["time"] as? String == "2025-10-22T02:26:40.000Z")
         check(object["outcome"] as? String == "append_confirmed")
         check((object["image"] as? [String: Int]) == ["bytes": 11_470_282, "width": 2388, "height": 1668, "bit_depth": 16])

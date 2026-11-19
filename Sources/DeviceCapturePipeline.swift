@@ -3,12 +3,20 @@ import Foundation
 // Each device owns a serial transfer lane and a four-image capacity. Only the
 // final UI transaction is shared: macOS focus/clipboard cannot paste twice at once.
 struct DeviceCapturePipeline {
+    enum Source: String {
+        case macKeyboard = "mac_keyboard"
+        case iPhoneShortcut = "iphone_shortcut"
+    }
+
     struct Press: Equatable {
         let id: UInt64
         let chord: HotkeyChord
         let at: Double
         let queued: Bool
         let deviceClass: DeviceClass
+        let source: Source
+
+        var allowsDeviceFallback: Bool { source == .macKeyboard }
     }
     private var nextID: UInt64 = 1
     private(set) var waiting: [Press] = []
@@ -22,11 +30,11 @@ struct DeviceCapturePipeline {
         (waiting + Array(running.values) + ready + [delivering].compactMap { $0 }).first { $0.at == at }
     }
     mutating func admit(_ chord: HotkeyChord, at: Double, deviceClass: DeviceClass,
-                        queued: Bool? = nil) -> Press? {
+                        queued: Bool? = nil, source: Source = .macKeyboard) -> Press? {
         let pending = waiting.filter { $0.deviceClass == deviceClass }
         let count = pending.count + ready.filter { $0.deviceClass == deviceClass }.count + (running[deviceClass] == nil ? 0 : 1)
         guard at.isFinite, pending.count < 3, count < 4 else { return nil }
-        let press = Press(id: nextID, chord: chord, at: at, queued: queued ?? isBusy, deviceClass: deviceClass)
+        let press = Press(id: nextID, chord: chord, at: at, queued: queued ?? isBusy, deviceClass: deviceClass, source: source)
         nextID += 1
         waiting.append(press)
         return press
