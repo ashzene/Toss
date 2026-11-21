@@ -29,11 +29,12 @@ struct OnboardingTests {
             "no_usb_ipad": .cable, "multiple_usb_ipads": .cable, "unlock_needed": .cable, "unsupported_ipados": .cable,
             "trust_needed": .trust, "developer_mode_auto": .devmode, "developer_mode_needed": .devmode,
             "ipad_restarting": .devmode, "developer_mode_confirm": .devmode, "pairing_wireless": .prepare,
-            "preparing_image": .prepare, "pairing_failed": .prepare, "developer_image_failed": .prepare,
+            "downloading_image": .prepare, "preparing_image": .prepare, "pairing_failed": .prepare,
+            "developer_image_failed": .prepare, "developer_image_download_failed": .prepare,
             "wifi_waiting": .wifi, "wifi_unreachable": .wifi, "ready": .wifi]
         for (code, step) in stages { check(OnboardingFlow.stage(for: code) == step) }
         for code in ["cancelled", "setup_timeout", "setup_failed", "setup_unavailable"] { check(OnboardingFlow.stage(for: code) == nil) }
-        check(OnboardingFlow().counted == 8 && OnboardingStep.done.rawValue == 9)
+        check(OnboardingFlow().counted == 8 && OnboardingStep.done.rawValue == 10)
 
         // Every waiting pairing step can be stopped; a finished or failed one has its own buttons.
         var stoppable = OnboardingFlow()
@@ -106,6 +107,16 @@ struct OnboardingTests {
         flow.advance(); check(flow.step == .wifi && flow.mark(at: 70) == .wait && !flow.canContinue(at: 70))
         check(!flow.advancesBySetup)
         let zh = OnboardingCopy(language: .chinese), en = OnboardingCopy(language: .english)
+        var image = OnboardingFlow(); image.step = .prepare
+        image.receive(code: "downloading_image", final: false, ipados: nil, at: 71)
+        check(image.downloadPercent == nil && zh.status(image, at: 71).1 == "正在下载截图组件…")
+        image.receive(code: "downloading_image", final: false, ipados: nil, downloadPercent: 37, at: 72)
+        check(image.downloadPercent == 37 && image.showsCancel(setupRunning: true, at: 72))
+        image.receive(code: "preparing_image", final: false, ipados: nil, at: 73)
+        check(image.downloadPercent == nil && en.status(image, at: 73).1 == "Installing the screenshot component…")
+        image.receive(code: "developer_image_download_failed", final: true, ipados: nil, at: 74)
+        check(image.showsPrimary(at: 74) && !image.showsCancel(setupRunning: false, at: 74))
+        check(zh.status(image, at: 74).1 == "截图组件下载失败。" && zh.primary(image, at: 74) == "再试一次")
         if CommandLine.arguments.count > 1 {
             Translations.directory = URL(fileURLWithPath: CommandLine.arguments[1]).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Assets/Localization")
         }
@@ -254,7 +265,41 @@ struct OnboardingTests {
         auto.receive(code: "ready", final: true, ipados: nil, at: 0)
         check(auto.autoNext == .tryIt && !auto.showsPrimary(at: 0))
         auto.advance(); check(auto.step == .tryIt && auto.autoNext == nil && auto.skippable)
+        check(auto.previousStep == .wifi && auto.number == 8 && auto.counted == 8)
         auto.tossed = true; check(auto.autoNext == .done); auto.advance(); check(auto.step == .done && auto.showsPrimary(at: 0))
+
+        // iPhone Back Tap is an optional step after wireless pairing. Verify or skip it without
+        // losing Try It or advancing beyond the user's choice.
+        var backTap = OnboardingFlow()
+        backTap.step = .wifi
+        backTap.includesIPhoneBackTap = true
+        backTap.receive(code: "ready", final: false, ipados: nil, deviceClass: .iPhone, at: 0)
+        backTap.advance()
+        check(backTap.step == .wifi && backTap.counted == 9)
+        backTap.receive(code: "ready", final: true, ipados: nil, deviceClass: .iPhone, at: 1)
+        check(backTap.autoNext == .iPhoneBackTap)
+        backTap.advance()
+        check(backTap.step == .iPhoneBackTap && backTap.previousStep == .wifi)
+        check(backTap.number == 8 && backTap.skippable && backTap.showsPrimary(at: 1))
+        check(!backTap.canContinue(at: 1) && backTap.autoNext == nil)
+        check(en.primary(backTap, at: 1) == "Set Up on iPhone…")
+        var backAtWireless = backTap
+        backAtWireless.step = backAtWireless.previousStep
+        check(backAtWireless.step == .wifi && backAtWireless.autoNext == .iPhoneBackTap)
+
+        var skippedBackTap = backTap
+        skippedBackTap.skip()
+        check(skippedBackTap.step == .tryIt && skippedBackTap.previousStep == .iPhoneBackTap)
+        check(!skippedBackTap.iPhoneShortcutPaired && skippedBackTap.number == 9 && skippedBackTap.skippable)
+        skippedBackTap.skip()
+        check(skippedBackTap.step == .done)
+
+        backTap.iPhoneShortcutPaired = true
+        check(backTap.canContinue(at: 2) && backTap.showsPrimary(at: 2) && backTap.autoNext == nil)
+        check(en.primary(backTap, at: 2) == "Selected · Continue" && backTap.skippable)
+        backTap.advance()
+        check(backTap.step == .iPhoneBackTap && backTap.counted == 9)
+
         // Arriving on the cable step: start pairing unless it already ran to "ready" or is running.
         var start = OnboardingFlow(); start.step = .cable
         check(start.needsSetupStart)
@@ -596,6 +641,49 @@ struct OnboardingTests {
 
         // The delayed footer is one grey line and does not move any of the four steps.
         func views(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(views) }
+
+        // Back Tap is an inline, optional step with one offer per visit.
+        do {
+            let controller = OnboardingController(language: .english)
+            let pairingCode = NSTextField(labelWithString: "Toss Tap inline offer")
+            controller.setIncludesIPhoneBackTap(true)
+            var setupRequests = 0
+            var skips = 0
+            var leaves = 0
+            controller.onSetUpIPhoneBackTap = { [weak controller] in
+                setupRequests += 1
+                controller?.setIPhonePairingContent(pairingCode)
+            }
+            controller.onSkipIPhoneBackTap = { skips += 1 }
+            controller.onLeaveIPhoneBackTap = { leaves += 1 }
+            func button(_ title: String) -> NSButton? {
+                views(controller.window.contentView!).compactMap { $0 as? NSButton }.first { $0.title == title }
+            }
+            func press(_ title: String) -> Bool {
+                guard let button = button(title), !button.isHidden, button.isEnabled, let action = button.action else { return false }
+                return NSApplication.shared.sendAction(action, to: button.target, from: button)
+            }
+            controller.jump(to: .iPhoneBackTap)
+            controller.render()
+            check(setupRequests == 1 && pairingCode.window === controller.window)
+            check(controller.window.childWindows?.isEmpty != false && button("Set Up on iPhone…") == nil)
+            check(press(controller.copy.skip))
+            check(controller.flow.step == .tryIt && skips == 1 && setupRequests == 1 && leaves == 1)
+            check(pairingCode.window == nil)
+            controller.markIPhoneShortcutPaired()
+            check(!controller.flow.iPhoneShortcutPaired)
+
+            controller.jump(to: .iPhoneBackTap)
+            check(controller.flow.step == .iPhoneBackTap && setupRequests == 2 && !controller.flow.iPhoneShortcutPaired)
+            controller.markIPhoneShortcutPaired(shortcutName: "Toss Tap A1B2C3D4")
+            controller.setIPhonePairingContent(pairingCode)
+            controller.markIPhoneShortcutPaired()
+            check(controller.flow.step == .iPhoneBackTap && controller.flow.iPhoneShortcutPaired && pairingCode.window == nil)
+            let labels = views(controller.window.contentView!).compactMap { ($0 as? NSTextField)?.stringValue }
+            check(labels.contains("Toss Tap A1B2C3D4") && labels.contains { $0.contains("Back Tap → Double Tap") })
+            check(button(controller.copy.skip) != nil && press("Selected · Continue"))
+            check(controller.flow.step == .tryIt && skips == 1 && setupRequests == 2 && leaves == 2)
+        }
 
         // The Try It window gives instructions only while a shortcut can actually run.
         do {

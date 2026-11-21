@@ -229,7 +229,7 @@ class SetupTests(PrivateState, unittest.IsolatedAsyncioTestCase):
                          {"model": "iPhone17,3", "device_hash": self.device_hash, "device_class": "iPhone"})
         self.assertEqual((self.state / "target.json").stat().st_mode & 0o777, 0o600)
         bootstrap.assert_awaited_once_with(self.state, apply_device_change=True)
-        mount.assert_awaited_once_with(self.serial, self.state / "cache")
+        mount.assert_awaited_once_with(self.serial, self.state / "cache", model="iPhone17,3", ipados="18.7")
         for line in output.getvalue().splitlines():
             self.assertEqual(json.loads(line)["device_class"], "iPhone")
 
@@ -269,6 +269,36 @@ class SetupTests(PrivateState, unittest.IsolatedAsyncioTestCase):
                     await setup.mount_over_usb(self.serial, self.state / "cache")
                 personalized.assert_awaited_once_with(client)
                 legacy.assert_not_awaited()
+
+    async def test_ddi_download_reports_bytes_before_returning_to_install(self):
+        from developer_disk_image.repo import DeveloperDiskImageRepository
+        from pymobiledevice3.services import mobile_image_mounter as images
+
+        async def fake_mount(_):
+            DeveloperDiskImageRepository.create().get_personalized_disk_image()
+
+        def fake_download(url, headers, progress=None):
+            if url.endswith("/Image.dmg"):
+                self.assertEqual(headers["Accept-Encoding"], "identity")
+                for percent in (0, 37, 100):
+                    progress(percent)
+            else:
+                self.assertIsNone(progress)
+            return b"component"
+
+        original = DeveloperDiskImageRepository._get_blob
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), patch.object(setup, "emit", setup.Emitter()), \
+             patch.object(images, "auto_mount", side_effect=fake_mount), \
+             patch("developer_image_download.download_blob", side_effect=fake_download):
+            await setup.mount_image(FakeLockdown(), model="iPhone17,3", ipados="18.7")
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual([(event["code"], event.get("download_percent")) for event in events], [
+            ("downloading_image", None), ("downloading_image", 0), ("downloading_image", 37),
+            ("downloading_image", 100), ("preparing_image", None),
+        ])
+        self.assertTrue(all(not event["final"] and event["device_class"] == "iPhone" for event in events))
+        self.assertIs(DeveloperDiskImageRepository._get_blob, original)
 
 
 class PinTests(PrivateState, unittest.TestCase):

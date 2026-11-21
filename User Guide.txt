@@ -1,4 +1,4 @@
-Toss 1.0.8 — User Guide
+Toss — User Guide
 
 One app, one installation
 The menu bar icon, connection panel, screenshot service, and runtime are all included in Toss.app. No separate menu bar component is needed. The icon appears whenever Toss is running; closing Settings keeps it running.
@@ -34,11 +34,12 @@ Capture into the current chat
 Toss brings the target app forward and adds one new screenshot to its current chat. It preserves the existing draft and attachments. Review the attachment and send the message yourself. It never sends automatically or retries a paste that may already have happened.
 
 Trigger Toss from iPhone
-1. Pair the iPhone in Toss on the Mac. Toss fills in the Apple Shortcuts setup form. Click Add Shortcut and allow access if asked. This check runs on the Mac. If Shortcuts sync is on, the configured shortcut can then appear on iPhone.
-2. On iPhone, open Settings → Accessibility → Touch → Back Tap. Choose Toss iPhone under Double Tap or Triple Tap. Turn off Show Banner on the Back Tap screen to keep its notice out of screenshots. On an iPhone with an Action button, you can also select Toss iPhone in Settings → Action Button → Shortcut.
-3. If Toss iPhone is missing on your phone, or to update an older Toss Tap, open Toss Settings → More → iPhone Shortcut → Pair on iPhone on your Mac. Click Copy pairing configuration to use Universal Clipboard. Without Universal Clipboard, click AirDrop pairing text, send it to your own iPhone, open Toss Pairing.txt in Files and copy the entire line.
-4. Click Send via AirDrop in the same Mac window to send the Toss Tap shortcut to the iPhone. Paste the configuration when Shortcuts asks during setup, then tap Add Shortcut. Choose Replace if Toss Tap is already installed. You can now delete the pairing text file if you received one.
-5. Use the iPhone Camera to scan the verification code in the Mac window. Tap the prompt to run Toss Tap and choose Always Allow if Shortcuts asks to connect to your Mac. The window closes when the Mac verifies the phone. On iPhone, choose the new Toss Tap in Settings → Accessibility → Touch → Back Tap → Double Tap. Open the page you want to capture and double-tap the back of the phone.
+1. In Set Up Toss, use a USB data cable to pair your iPhone, then finish setting up the wireless connection. The optional iPhone Back Tap step shows how to add and pair the shortcut. You can click Skip to continue to Try It or set up Back Tap later in Toss Settings → More → iPhone Shortcut → Set Up on iPhone.
+2. Unlock your iPhone, click Send via AirDrop… on your Mac, and choose your iPhone. Accept the transfer if asked, then tap Add Shortcut on your iPhone. Each setup shows a distinct name such as Toss Tap 7B3F96C1.
+3. Connect both devices to the same Wi-Fi, then scan the pairing QR code with the iPhone's Camera. Tap the prompt to open the shortcut with the name shown in Toss. If asked to connect, choose Always Allow on iPhone or Allow on Mac. Pairing checks the connection without taking a screenshot.
+4. On iPhone, open Settings → Accessibility → Touch → Back Tap → Double Tap and select the exact shortcut name shown in Toss. Tap Back to apply. You can also assign it to Triple Tap or, on supported iPhones, to Settings → Action Button → Shortcut. Turn off Show Banner on the Back Tap screen to keep its notice out of screenshots. Open the page you want to capture on the iPhone and the destination chat on your Mac, then double-tap the back of the phone to check that a screenshot appears in the draft.
+
+If your Mac and iPhone use the same Apple Account and Shortcuts iCloud sync is on, you can choose Add on Mac in Toss Settings → More → iPhone Shortcut. Select Toss iPhone in Back Tap once it syncs to your iPhone.
 
 Keep the iPhone unlocked, connect both devices to the same local network, and leave Toss shortcuts enabled and the chosen chat app open on the Mac. The shortcut captures the paired iPhone and adds the screenshot to the current draft. Change the destination or turn off the phone trigger in Toss Settings → More → iPhone Shortcut.
 

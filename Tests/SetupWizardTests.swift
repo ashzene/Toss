@@ -15,6 +15,13 @@ struct SetupWizardTests {
         check(legacy?.final == true, "legacy single line is final")
         check(progress?.deviceClass == .iPad, "legacy setup infers ProductType")
         check(legacy?.deviceClass == nil, "absent identity remains unknown")
+        for (value, expected): (String, Int?) in [("0", 0), ("37", 37), ("100", 100),
+                                                 ("101", nil), ("true", nil), ("null", nil)] {
+            let data = Data(#"{"schema_version":1,"code":"downloading_image","final":false,"download_percent":\#(value)}"#.utf8)
+            check(SetupWizard.parse(data)?.downloadPercent == expected, "download progress field: \(value)")
+        }
+        let installing = SetupWizard.parse(Data(#"{"schema_version":1,"code":"preparing_image","final":false,"download_percent":90}"#.utf8))
+        check(installing?.downloadPercent == nil, "installation has no download percentage")
         let phone = SetupWizard.parse(Data(#"{"schema_version":1,"code":"ready","device_class":"iPhone","model":"iPhone14,6","ipados":"17.7","os_version":"17.7"}"#.utf8))
         check(phone?.deviceClass == .iPhone && phone?.osVersion == "17.7" && phone?.ipados == "17.7", "new fields and unchanged legacy version")
         let oldPhone = SetupWizard.parse(Data(#"{"schema_version":1,"code":"wifi_waiting","model":"iPhone14,6","ipados":"18.1","final":false}"#.utf8))
@@ -49,7 +56,8 @@ struct SetupWizardTests {
         check(SetupWizard.needsIPadAction("trust_needed") && SetupWizard.needsIPadAction("developer_mode_needed"), "iPad prompts")
         check(!SetupWizard.needsIPadAction("ready") && !SetupWizard.needsIPadAction("no_usb_ipad"), "no prompt")
         for code in ["ready", "no_usb_ipad", "trust_needed", "developer_mode_auto", "developer_mode_needed",
-                     "ipad_restarting", "developer_mode_confirm", "wifi_waiting", "preparing_image"] {
+                     "ipad_restarting", "developer_mode_confirm", "wifi_waiting", "downloading_image",
+                     "preparing_image", "developer_image_download_failed"] {
             check(!SetupWizard.message(for: .init(code: code, model: nil, ipados: nil)).hasPrefix("Pairing failed."), "message for \(code)")
         }
 
@@ -80,7 +88,9 @@ struct SetupWizardTests {
                 ("developer_mode_needed", "Turn on Developer Mode on your \(en).", "在 \(zh) 上打开开发者模式。"),
                 ("ipad_restarting", "\(en) is restarting. Keep the cable in.", "\(zh) 正在重启，数据线别拔。"),
                 ("developer_mode_confirm", "On your \(shortName), tap Turn On, enter passcode.", "在 \(zh) 上点「打开」，输入密码。"),
-                ("preparing_image", "Preparing the \(en)… a few minutes.", "正在准备 \(zh)…可能要几分钟。"),
+                ("downloading_image", "Downloading the screenshot component…", "正在下载截图组件…"),
+                ("preparing_image", "Installing the screenshot component…", "正在安装截图组件…"),
+                ("developer_image_download_failed", "The screenshot component couldn't download. Check your internet connection and try again.", "截图组件下载失败。 请检查网络连接，然后重试。"),
                 ("wifi_waiting", "Looking for the \(en) on your Wi-Fi…", "正在 Wi-Fi 上找 \(zh)…"),
                 ("not_paired", "Nothing paired yet. Plug in an iPad or iPhone.", "还没配对设备，插上 iPad 或 iPhone 就开始。")
             ]
@@ -106,15 +116,19 @@ struct SetupWizardTests {
         echo 'library noise that is not json'
         echo '{"schema_version":1,"ok":false,"code":"trust_needed","final":false}'
         sleep 0.2
+        echo '{"schema_version":1,"ok":false,"code":"downloading_image","final":false,"download_percent":64}'
+        echo '{"schema_version":1,"ok":false,"code":"preparing_image","final":false}'
         echo '{"schema_version":1,"ok":true,"code":"ready","final":true,"model":"iPad14,3"}'
         """.write(to: script, atomically: true, encoding: .utf8)
         let wizard = SetupWizard()
-        var seen: [String] = []
+        var seen: [SetupWizard.Result] = []
         let result: SetupWizard.Result = await withCheckedContinuation { continuation in
             wizard.run(python: "/bin/sh", script: script.path, action: "auto", stateDirectory: directory.path,
-                       progress: { seen.append($0.code) }, completion: { continuation.resume(returning: $0) })
+                       progress: { seen.append($0) }, completion: { continuation.resume(returning: $0) })
         }
-        check(seen == ["no_usb_ipad", "trust_needed"], "progress delivered in order before exit: \(seen)")
+        check(seen.map(\.code) == ["no_usb_ipad", "trust_needed", "downloading_image", "preparing_image"],
+              "progress delivered in order before exit: \(seen)")
+        check(seen[2].downloadPercent == 64 && seen[3].downloadPercent == nil, "streaming download hands off to installation")
         check(result.code == "ready" && result.final && result.model == "iPad14,3", "final result")
         check(!wizard.isRunning, "finished")
 

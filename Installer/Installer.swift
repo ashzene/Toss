@@ -57,7 +57,12 @@ import AppKit
     }
     func applicationDidFinishLaunching(_ notification:Notification) {
         window=NSWindow(contentRect:NSRect(x:0,y:0,width:720,height:440),styleMask:[.titled,.closable,.miniaturizable],backing:.buffered,defer:false)
-        window.title="Toss " + (Bundle.main.object(forInfoDictionaryKey:"CFBundleShortVersionString") as? String ?? "");window.isReleasedWhenClosed=false
+        let bundle = Bundle.main
+        let releaseTag = bundle.object(forInfoDictionaryKey: "TossReleaseTag") as? String
+        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        let versionLabel = releaseTag ?? build.map { "Build \($0)" }
+        window.title = versionLabel.map { "Toss \($0)" } ?? "Toss"
+        window.isReleasedWhenClosed = false
         window.backgroundColor=NSColor(srgbRed:0.98,green:0.976,blue:0.961,alpha:1)
         window.isMovableByWindowBackground=true
         let root=window.contentView!

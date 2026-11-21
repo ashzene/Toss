@@ -14,10 +14,15 @@ struct IPhoneShortcutSettings: Codable, Equatable {
     let secret: String
     let destination: String
     private let disabled: Bool?
-    private var automaticImportPending: Bool?
+    private var phoneSetupPending: Bool?
+
+    private enum CodingKeys: String, CodingKey {
+        case deviceHash, secret, destination, disabled
+        case phoneSetupPending = "automaticImportPending"
+    }
 
     var isEnabled: Bool { disabled != true }
-    var needsAutomaticImport: Bool { isEnabled && automaticImportPending == true }
+    var needsPhoneSetup: Bool { isEnabled && phoneSetupPending == true }
 
     static func load(from defaults: UserDefaults = .standard) -> Self? {
         guard let data = defaults.data(forKey: key),
@@ -27,23 +32,23 @@ struct IPhoneShortcutSettings: Codable, Equatable {
     }
 
     init(deviceHash: String, destination: String, previous: Self?, disabled: Bool = false,
-         automaticImport: Bool = false) {
+         pendingPhoneSetup: Bool = false) {
         self.deviceHash = deviceHash
         self.destination = destination
         self.disabled = disabled ? true : nil
         let reusable = previous.flatMap { !disabled && $0.isEnabled && $0.deviceHash == deviceHash ? $0 : nil }
         self.secret = reusable?.secret
             ?? (UUID().uuidString + UUID().uuidString).replacingOccurrences(of: "-", with: "").lowercased()
-        automaticImportPending = !disabled && (automaticImport || reusable?.needsAutomaticImport == true) ? true : nil
+        phoneSetupPending = !disabled && (pendingPhoneSetup || reusable?.needsPhoneSetup == true) ? true : nil
     }
 
     func save(to defaults: UserDefaults = .standard) throws {
         defaults.set(try JSONEncoder().encode(self), forKey: Self.key)
     }
 
-    static func markImportPrepared(secret: String, in defaults: UserDefaults = .standard) throws {
-        guard var settings = load(from: defaults), settings.secret == secret, settings.needsAutomaticImport else { return }
-        settings.automaticImportPending = nil
+    static func markPhoneVerified(secret: String, in defaults: UserDefaults = .standard) throws {
+        guard var settings = load(from: defaults), settings.secret == secret, settings.needsPhoneSetup else { return }
+        settings.phoneSetupPending = nil
         try settings.save(to: defaults)
     }
 }
@@ -331,6 +336,27 @@ final class IPhoneShortcutImport {
     }
 }
 
+struct IPhoneShortcutEnrollment {
+    let address: String
+    let secret: String
+    // Shortcuts uses the incoming file's basename and resolves the run URL by name.
+    let shortcutName = "Toss Tap " + UUID().uuidString.prefix(8)
+    var filename: String { shortcutName + ".shortcut" }
+
+    var link: String? {
+        let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+        guard let name = shortcutName.addingPercentEncoding(withAllowedCharacters: unreserved),
+              let input = ("/setup/" + address + "|" + secret).addingPercentEncoding(withAllowedCharacters: unreserved) else { return nil }
+        var components = URLComponents()
+        components.scheme = "shortcuts"
+        components.host = "run-shortcut"
+        components.percentEncodedQueryItems = [URLQueryItem(name: "name", value: name),
+                                               URLQueryItem(name: "input", value: "text"),
+                                               URLQueryItem(name: "text", value: input)]
+        return components.url?.absoluteString
+    }
+}
+
 struct IPhoneShortcutHandshake {
     static let port: UInt16 = 54963
     static let challengePath = "/toss/iphone/challenge"
@@ -417,7 +443,7 @@ final class IPhoneShortcutReceiver {
     private var trigger: (() -> Admission)?
     private var onLocalAuthorization: (() -> Void)?
     private var onProofMismatch: (() -> Void)?
-    private var onRemoteVerified: (() -> Void)?
+    private var onRemoteVerified: ((IPhoneShortcutHandshake.Purpose) -> Void)?
     private static let headerEnd = Data([13, 10, 13, 10])
     private static let headerLimit = 4_096
 
@@ -427,7 +453,8 @@ final class IPhoneShortcutReceiver {
 
     func start(secret: String, onFailure: @escaping () -> Void, onLocalAuthorization: @escaping () -> Void = {},
                onProofMismatch: @escaping () -> Void = {},
-               onRemoteVerified: @escaping () -> Void = {}, trigger: @escaping () -> Admission) throws {
+               onRemoteVerified: @escaping (IPhoneShortcutHandshake.Purpose) -> Void = { _ in },
+               trigger: @escaping () -> Admission) throws {
         let reuseListener = self.secret == secret && listener != nil
         if !reuseListener { stop() }
         self.trigger = trigger
@@ -574,7 +601,7 @@ final class IPhoneShortcutReceiver {
             }
             if remote {
                 iPhoneShortcutLog.notice("Remote shortcut verified with the current pairing.")
-                onRemoteVerified?()
+                onRemoteVerified?(purpose)
             }
             if purpose == .pairingComplete {
                 respond(id, status: "200 OK", body: "TOSS_SETUP_COMPLETE")
@@ -596,9 +623,10 @@ final class IPhoneShortcutReceiver {
     private func respond(_ id: UUID, status: String, body: String = "") {
         guard let connection = connections[id] else { return }
         iPhoneShortcutLog.notice("Phone trigger reply: \(status, privacy: .public)")
-        let response = "HTTP/1.1 \(status)\r\nContent-Type: text/plain; charset=utf-8\r\n"
-            + "Cache-Control: no-store\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
-        connection.send(content: Data(response.utf8), completion: .contentProcessed { [weak self] _ in
+        let headers = "HTTP/1.1 \(status)\r\nContent-Type: text/plain; charset=utf-8\r\n"
+            + "Cache-Control: no-store\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n"
+        let response = Data((headers + body).utf8)
+        connection.send(content: response, completion: .contentProcessed { [weak self] _ in
             Task { @MainActor in self?.close(id) }
         })
     }

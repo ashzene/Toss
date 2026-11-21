@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 import Darwin
 
 // Runs Backend/setup_device.py. In "auto" mode the script drives every pairing
@@ -15,6 +16,7 @@ final class SetupWizard {
         var deviceClass: DeviceClass?
         var osVersion: String?
         var setupDeviceHash: String?
+        var downloadPercent: Int?
     }
 
     private var process: Process?
@@ -98,10 +100,20 @@ final class SetupWizard {
               object["schema_version"] as? Int == 1, let code = object["code"] as? String,
               code.range(of: "^[a-z_]{1,40}$", options: .regularExpression) != nil else { return nil }
         // Older scripts print a single line without "final".
+        let final = object["final"] as? Bool ?? true
+        let downloadPercent: Int?
+        if code == "downloading_image", !final,
+           let number = object["download_percent"] as? NSNumber,
+           CFGetTypeID(number) != CFBooleanGetTypeID(),
+           let percent = number as? Int, (0...100).contains(percent) {
+            downloadPercent = percent
+        } else {
+            downloadPercent = nil
+        }
         return Result(code: code, model: object["model"] as? String, ipados: object["ipados"] as? String,
-                      final: object["final"] as? Bool ?? true, deviceClass: DeviceClass.resolve(object),
+                      final: final, deviceClass: DeviceClass.resolve(object),
                       osVersion: object["os_version"] as? String ?? object["ipados"] as? String,
-                      setupDeviceHash: object["setup_device_hash"] as? String)
+                      setupDeviceHash: object["setup_device_hash"] as? String, downloadPercent: downloadPercent)
     }
 
     // A running setup may be waiting for any USB device, or already own one target.
@@ -187,14 +199,21 @@ final class SetupWizard {
             return L("On your \(deviceShortEN), tap Turn On, enter passcode.", "在 \(deviceZH) 上点「打开」，输入密码。")
         case "pairing_wireless":
             return L("Setting up wireless pairing…", "正在建立无线配对…")
+        case "downloading_image":
+            let message = L("Downloading the screenshot component…", "正在下载截图组件…")
+            guard let percent = result.downloadPercent else { return message }
+            return message + " " + (Double(percent) / 100).formatted(.percent)
         case "preparing_image":
-            return L("Preparing the \(deviceEN)… a few minutes.", "正在准备 \(deviceZH)…可能要几分钟。")
+            return L("Installing the screenshot component…", "正在安装截图组件…")
         case "wifi_waiting":
             return L("Looking for the \(deviceEN) on your Wi-Fi…", "正在 Wi-Fi 上找 \(deviceZH)…")
         case "pairing_failed":
             return L("Wireless pairing failed. Click Pair again.", "无线配对没成功，再点「配对」。")
         case "wifi_unreachable":
             return L("Paired, but not on your Wi-Fi yet.", "已配对，但 Wi-Fi 上还找不到。")
+        case "developer_image_download_failed":
+            return L("The screenshot component couldn't download.", "截图组件下载失败。") + " " +
+                L("Check your internet connection and try again.", "请检查网络连接，然后重试。")
         case "developer_image_failed":
             return L("Not ready for screenshots. Toss will retry.", "还不能截图，Toss 会自动重试。")
         case "setup_timeout":

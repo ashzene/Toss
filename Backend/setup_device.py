@@ -33,6 +33,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import capture_once as once  # noqa: E402  (also adds vendor/ to sys.path)
+from developer_image_download import ImageDownloadError, report_image_download
 from ipad_probe import ProbeFailure, fingerprint, device_class_from_model, read_device_pin
 
 USBMUX = "/var/run/usbmuxd"
@@ -43,6 +44,7 @@ RESTART_MIN_ABSENCE_SECONDS = 15
 DEVELOPER_CONFIRM_SECONDS = 90
 WIFI_ATTEMPTS = 6
 DEVELOPER_SERVICE = "com.apple.instruments.dtservicehub"
+IMAGE_MOUNT_TIMEOUT = 240
 
 
 class Emitter:
@@ -61,6 +63,9 @@ class Emitter:
             safe["device_class"] = device_class
         if "ipados" in safe:
             safe["os_version"] = safe["ipados"]
+        percent = fields.get("download_percent")
+        if code == "downloading_image" and type(percent) is int and 0 <= percent <= 100:
+            safe["download_percent"] = percent
         if type(fields.get("devmode_passcode")) is int and fields["devmode_passcode"] in (0, 1):
             safe["devmode_passcode"] = fields["devmode_passcode"]
         error = fields.get("devmode_enable_error")
@@ -162,26 +167,40 @@ async def lockdown_for(serial: str, cache: Path):
                                      pairing_records_cache_folder=cache, usbmux_address=USBMUX)
 
 
-async def mount_over_usb(serial: str, cache: Path):
-    """Best effort while the cable is still in: faster and independent of Wi-Fi."""
+async def mount_image(provider, model=None, ipados=None):
     from pymobiledevice3.services.mobile_image_mounter import auto_mount
+
+    def report(percent):
+        emit(False, "downloading_image", final=False, model=model, ipados=ipados, download_percent=percent)
+
+    def finish_download():
+        # The synchronous download has its own deadline. Allow the full mount
+        # window even if a slow download took longer than that.
+        mount_timeout.reschedule(asyncio.get_running_loop().time() + IMAGE_MOUNT_TIMEOUT)
+        emit(False, "preparing_image", final=False, model=model, ipados=ipados)
+
+    async with asyncio.timeout(IMAGE_MOUNT_TIMEOUT) as mount_timeout:
+        with report_image_download(report, finish_download):
+            await auto_mount(provider)
+
+
+async def mount_over_usb(serial: str, cache: Path, model=None, ipados=None):
+    """Best effort while the cable is still in: faster and independent of Wi-Fi."""
     try:
         client = await lockdown_for(serial, cache)
     except Exception:
         return
     async with client:
         try:
-            async with asyncio.timeout(240):
-                await auto_mount(client)
+            await mount_image(client, model=model, ipados=ipados)
         except Exception:
             pass  # Already mounted, needs a tunnel (iPadOS 27+), or offline: Wi-Fi retries below.
 
 
-async def wifi_prepare(state: Path) -> str:
+async def wifi_prepare(state: Path, model=None, ipados=None) -> str:
     """Return "ready" or a fixed failure code. Mounts the image if it is missing."""
     from remote_pairing_transport import open_remote_wifi_rsd
     from pymobiledevice3.exceptions import AlreadyMountedError
-    from pymobiledevice3.services.mobile_image_mounter import auto_mount
     from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
     from pymobiledevice3.services.dvt.instruments.screenshot import Screenshot
     for attempt in range(2):
@@ -198,10 +217,11 @@ async def wifi_prepare(state: Path) -> str:
                 # Mounting may download Apple's image once (cached afterwards)
                 # and asks Apple to personalize it for this boot of the iPad.
                 try:
-                    async with asyncio.timeout(240):
-                        await auto_mount(rsd)
+                    await mount_image(rsd, model=model, ipados=ipados)
                 except AlreadyMountedError:
                     pass
+                except ImageDownloadError:
+                    return "developer_image_download_failed"
                 except BaseException:
                     return "developer_image_failed"
                 continue  # Reconnect: only a new handshake lists the new services.
@@ -225,8 +245,8 @@ async def wifi_prepare_with_retries(state: Path, model=None, ipados=None) -> str
     """Wi-Fi may need a moment: the first run asks for Local Network access."""
     code = "wifi_unreachable"
     for attempt in range(WIFI_ATTEMPTS):
-        code = await wifi_prepare(state)
-        if code == "ready":
+        code = await wifi_prepare(state, model=model, ipados=ipados)
+        if code in ("ready", "developer_image_download_failed"):
             return code
         emit(False, "wifi_waiting" if code == "wifi_unreachable" else code, final=False,
              model=model, ipados=ipados)
@@ -271,7 +291,7 @@ async def finish_pairing(state: Path, serial: str, cache: Path, udid: str, model
     except BaseException:
         return "pairing_failed"
     emit(False, "preparing_image", final=False, model=model, ipados=version)
-    await mount_over_usb(serial, cache)
+    await mount_over_usb(serial, cache, model=model, ipados=version)
     return await wifi_prepare_with_retries(state, model=model, ipados=version)
 
 

@@ -4,6 +4,7 @@ ObjC.import("Foundation");
 $.NSBundle.bundleWithPath("/System/Library/PrivateFrameworks/ActionKit.framework").load;
 
 const registry = $.NSClassFromString("WFActionRegistry").sharedRegistry;
+// A controller can deliver a final callback after the next fixture has started.
 let observed;
 
 ObjC.registerSubclass({
@@ -13,13 +14,14 @@ ObjC.registerSubclass({
         "workflowController:actionDidRequestWorkflowExit:": {
             types: ["void", ["id", "id"]],
             implementation(controller, action) {
-                observed.requestedExit = true;
+                if (observed.controller.isEqual(controller)) observed.requestedExit = true;
                 controller.stop;
             },
         },
         "workflowController:didRunAction:error:": {
             types: ["void", ["id", "id", "id"]],
             implementation(controller, action, error) {
+                if (!observed.controller.isEqual(controller)) return;
                 if (!error.isNil()) observed.error = error;
                 observed.visited.push(action.UUID.js);
                 const output = action.output;
@@ -36,6 +38,7 @@ ObjC.registerSubclass({
         "workflowController:didFinishRunningWithError:cancelled:": {
             types: ["void", ["id", "id", "bool"]],
             implementation(controller, error, cancelled) {
+                if (!observed.controller.isEqual(controller)) return;
                 if (!error.isNil()) observed.error = error;
                 observed.done = true;
             },
@@ -71,7 +74,7 @@ function execute(definitions, input) {
     const delegate = $.TossShortcutFixtureDelegate.new;
     const collection = $.NSClassFromString("WFContentCollection").new;
     if (input) collection.addObject($(input));
-    observed = { done: false, outputs: {}, visited: [] };
+    observed = { controller, done: false, outputs: {}, visited: [] };
     controller.setDelegate(delegate);
     controller.setInput(collection);
     controller.setWorkflow(workflow);
@@ -100,8 +103,7 @@ function fixtureText(text, uuid) {
     };
 }
 
-function testTemplate(path) {
-    const template = ObjC.deepUnwrap($.NSDictionary.dictionaryWithContentsOfFile(path));
+function testTemplate(template) {
     const actions = template.WFWorkflowActions;
     const parameters = def => def.WFWorkflowActionParameters;
     const uuid = def => parameters(def).UUID;
@@ -191,8 +193,109 @@ function testTemplate(path) {
     return cases.length;
 }
 
+function testQRTemplate(template) {
+    const actions = template.WFWorkflowActions;
+    const parameters = def => def.WFWorkflowActionParameters;
+    const operation = def => def.WFWorkflowActionIdentifier.split("actions.")[1];
+    const uuid = def => parameters(def).UUID;
+    const readActions = actions.filter(def => operation(def) === "documentpicker.open");
+    const requests = actions.filter(def => operation(def) === "downloadurl");
+    const saveActions = actions.filter(def => operation(def) === "documentpicker.save");
+    check(saveActions.length === 1, "Only enrollment saves its configuration");
+    const saveAction = saveActions[0];
+    const settingsActions = actions.filter(def => operation(def) === "openurl");
+    check(settingsActions.length === 1 && !actionFrom(settingsActions[0]).parameterStateForKey("WFInput").isNil(),
+          "The phone template needs one native Open URLs action");
+    const openSettings = settingsActions[0];
+    const doubleTapURL = "prefs:root=ACCESSIBILITY&path=TOUCH_REACHABILITY_TITLE/BackTap/DoubleTap";
+    check(Number(deserialize(template).validImportQuestions.count) === 0, "QR setup must not ask for import answers");
+    check(template.WFWorkflowTypes.length === 0, "Back Tap should not request onscreen content");
+    check(readActions.length === 2 && requests.length === 4, "Expected shared request and setup-only confirmation");
+    check(parameters(saveAction).WFAskWhereToSave === false && parameters(saveAction).WFSaveFileOverwrite === true,
+          "Setup must use a fixed storage location");
+    const pairingFile = parameters(saveAction).WFFileDestinationPath;
+    check(pairingFile && !pairingFile.includes("/") && pairingFile !== "." &&
+          parameters(saveAction).WFFolder.fileLocation.WFFileLocationType === "Documents" &&
+          readActions.every(def => parameters(def).WFGetFilePath === pairingFile &&
+                                   parameters(def).WFFile.fileLocation.WFFileLocationType === "Documents"),
+          "Read the same device-local file directly at enrollment and capture");
+    check(requests.every((def, index) => index % 2 === 0
+          ? !parameters(def).WFHTTPMethod
+          : parameters(def).WFHTTPMethod === "POST"), "Each challenge uses GET and each proof uses POST");
+    const addr = "http://fixture.local:54963";
+    const config = addr + "|" + "d".repeat(64);
+    const setup = "/setup/" + config;
+    const nonce = "01234567-1234-1234-1234-123456789abc";
+    const proof = "3ffab7d54142e501c80fb86b87215c71b930faa0bdfcab8011737bed96a62867";
+    const challenge = addr + "/toss/iphone/challenge";
+    const post = addr + "/toss/iphone/capture/" + nonce + "/" + proof;
+    const pair = [challenge + "/pair", post];
+    const complete = [challenge + "/pair/complete", post];
+    const cases = [
+        { name: "background", config, urls: [challenge, post], reads: 1 },
+        { name: "background missing", urls: [], reads: 1, alerts: 1 },
+        { name: "pairing", input: setup, reply: "TOSS_PAIRED", reopened: config,
+          urls: [...pair, ...complete], reads: 1, saves: 1, settings: true },
+        { name: "pairing rejected", input: setup, reply: "TOSS_PAIRING_REQUIRED", urls: pair, alerts: 1 },
+        { name: "could not save", input: setup, reply: "TOSS_PAIRED", urls: pair, reads: 1, saves: 1, alerts: 1 },
+        { name: "wrong stored content", input: setup, reply: "TOSS_PAIRED", reopened: addr + "|" + "c".repeat(64),
+          urls: pair, reads: 1, saves: 1, alerts: 1 },
+        { name: "confirmation rejected", input: setup, reply: "TOSS_PAIRED", reopened: config,
+          final: "TOSS_PAIRING_REQUIRED", urls: [...pair, ...complete], reads: 1, saves: 1, alerts: 1 },
+        { name: "unexpected input", input: "https://outside.test", urls: [] },
+        { name: "external host", input: setup.replace(".local", ".example"), urls: [] },
+        { name: "trailing data", input: setup + "\n", urls: [] },
+    ];
+    for (const test of cases) {
+        const rewritten = [];
+        const urlIDs = [];
+        for (const def of actions) {
+            if (operation(def) === "downloadurl") {
+                const id = $.NSUUID.UUID.UUIDString.js;
+                urlIDs.push(id);
+                rewritten.push(fixtureText(parameters(def).WFURL, id));
+                const position = requests.indexOf(def);
+                const response = [nonce, test.reply || "", nonce, test.final || "TOSS_SETUP_COMPLETE"][position];
+                rewritten.push(fixtureText(response, uuid(def)));
+            } else if (operation(def) === "documentpicker.open") {
+                const value = def === readActions[0] ? test.config : test.reopened;
+                rewritten.push(fixtureText(value || "", uuid(def)));
+            } else if (operation(def) === "documentpicker.save") {
+                const content = {WFSerializationType: "WFTextTokenString",
+                                 Value: {string: "\ufffc", attachmentsByRange: {"{0, 1}": parameters(def).WFInput.Value}}};
+                rewritten.push(fixtureText(content, uuid(def)));
+            } else if (operation(def) === "alert") {
+                rewritten.push(fixtureText(parameters(def).WFAlertActionMessage, uuid(def)));
+            } else if (def === openSettings) {
+                const link = {WFSerializationType: "WFTextTokenString",
+                              Value: {string: "\ufffc", attachmentsByRange: {"{0, 1}": parameters(def).WFInput.Value}}};
+                rewritten.push(fixtureText(link, uuid(def)));
+            } else {
+                rewritten.push(def);
+            }
+        }
+        const outputs = execute(rewritten, test.input);
+        const visited = def => observed.visited.includes(uuid(def));
+        const urls = urlIDs.filter(id => observed.visited.includes(id)).map(id => outputs[id].text);
+        check(JSON.stringify(urls) === JSON.stringify(test.urls), test.name + ": unexpected requests " + JSON.stringify(urls));
+        check(readActions.filter(visited).length === (test.reads || 0), test.name + ": unexpected storage read");
+        check(visited(saveAction) === Boolean(test.saves), test.name + ": unexpected storage write");
+        if (test.saves) check(outputs[uuid(saveAction)].text === config, test.name + ": saved incorrect data");
+        check(visited(openSettings) === Boolean(test.settings), test.name + ": unexpected Settings launch");
+        if (test.settings) check(outputs[uuid(openSettings)].text === doubleTapURL, "Wrong Settings destination");
+        const alerts = actions.filter(def => operation(def) === "alert").filter(visited);
+        check(alerts.length === (test.alerts || 0), test.name + ": wrong error prompt");
+    }
+    return cases.length;
+}
+
 function run(argv) {
     check(argv.length > 0, "Pass one or more unsigned templates");
-    const total = argv.reduce((count, path) => count + testTemplate(path), 0);
-    return "Apple Shortcuts recognized the text setup and passed " + total + " offline workflow cases.";
+    const total = argv.reduce((count, path) => {
+        const template = ObjC.deepUnwrap($.NSDictionary.dictionaryWithContentsOfFile(path));
+        check(template && Array.isArray(template.WFWorkflowActions), "Could not load shortcut fixture: " + path);
+        const hasImportQuestion = (template.WFWorkflowImportQuestions?.length ?? 0) > 0;
+        return count + (hasImportQuestion ? testTemplate(template) : testQRTemplate(template));
+    }, 0);
+    return "Apple Shortcuts passed " + total + " offline workflow cases.";
 }

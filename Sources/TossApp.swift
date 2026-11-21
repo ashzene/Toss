@@ -85,8 +85,9 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private var iPhoneShortcutSessionSecret: String?
     private var iPhoneShortcutMismatchShown = false
     private var iPhoneShortcutVerified = false
-    private var offeredIPhoneShortcutHashes: Set<String> = []
+    private var onboardingIPhoneShortcutDraft: IPhoneShortcutSettings?
     private var lastSetupCode = "not_run"
+    private var setupDownloadPercent: Int?
     private var setupDeviceHash: String?
     private var setupPrompt: NSAlert?
     private var setupAutoStarted = false
@@ -435,7 +436,6 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             NSApp.activate(ignoringOtherApps: true); onboarding.window.makeKeyAndOrderFront(nil)
         } else if settingsWindow?.isVisible == true { NSApp.activate(ignoringOtherApps: true); settingsWindow?.makeKeyAndOrderFront(nil) }
         autoEnableIfFirstRun()
-        offerIPhoneShortcutIfNeeded()
     }
     private var lastPermissionStep = "none"
     private var askedPermissionThisLaunch = false
@@ -1103,7 +1103,11 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showAbout() {
-        NSApp.orderFrontStandardAboutPanel(nil)
+        let bundle = Bundle.main
+        let releaseTag = bundle.object(forInfoDictionaryKey: "TossReleaseTag") as? String
+        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        let label = releaseTag ?? build.map { "Build \($0)" } ?? ""
+        NSApp.orderFrontStandardAboutPanel(options: [.applicationVersion: label, .version: ""])
         NSApp.activate()
     }
 
@@ -1207,7 +1211,6 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         refreshIPhoneShortcut()
         startUSBSetupObserver()
         presentInitialInterface(afterInstall: CommandLine.arguments.contains("--show-setup"))
-        offerIPhoneShortcutIfNeeded()
     }
 
     private func presentInitialInterface(afterInstall: Bool) {
@@ -1215,7 +1218,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             showOnboarding()
             if hasPairing && permissionsReady {
                 onboarding?.setTransport(currentConnection.state == .ready ? currentConnection.transportLabel : nil)
-                onboarding?.jump(to: .done)
+                if let onboarding { onboarding.jump(to: onboarding.flow.includesIPhoneBackTap ? .iPhoneBackTap : .done) }
             }
             restoreIfPossible()
             return
@@ -1610,6 +1613,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         setupStatus?.stringValue = L("Checking your \(deviceEN)…", "正在检查 \(deviceZH)…")
         setupDeviceHash = nil
         lastSetupCode = "not_run"
+        setupDownloadPercent = nil
         setupWizard.run(python: config.python, script: script, action: action, stateDirectory: config.state_dir,
                         progress: { [weak self] result in self?.setupProgress(result) },
                         completion: { [weak self] result in self?.setupFinished(result) })
@@ -1619,6 +1623,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private func setupProgress(_ result: SetupWizard.Result) {
         guard !uninstalling else { return }
         lastSetupCode = result.code
+        setupDownloadPercent = result.downloadPercent
         setupDeviceHash = result.setupDeviceHash
         // Name the device in this result before any text below is generated.
         if ["no_usb_ipad", "multiple_usb_ipads", "mixed_usb_devices", "unsupported_device"].contains(result.code) {
@@ -1641,7 +1646,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         } else { trustWaitStarted = nil }
         updateSetupPrompt(SetupWizard.needsIPadAction(result.code) ? result : nil)
         onboarding?.setupCode(result.code, final: false, ipados: result.ipados,
-                              deviceClass: result.deviceClass, osVersion: result.osVersion)
+                              deviceClass: result.deviceClass, osVersion: result.osVersion,
+                              downloadPercent: result.downloadPercent)
         refreshMenuStatus()
     }
 
@@ -1650,6 +1656,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         ignoreKeyboardEventsThrough = ProcessInfo.processInfo.systemUptime
         _ = core.observe(KeyMonitor.modifiers(), at: ignoreKeyboardEventsThrough, allowNewCapture: false)
         lastSetupCode = result.code
+        setupDownloadPercent = nil
         setupDeviceHash = nil
         setupDeviceClass = result.deviceClass   // the device just seen, or nil
         // Read committed target.json, including USB-only pairing; progress is not proof of pairing.
@@ -1661,6 +1668,9 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         updateSetupPrompt(nil)
         if result.code == "ready" { UserDefaults.standard.set(true, forKey: OnboardingPolicy.wirelessKey) }
         if result.code == "wifi_unreachable" { UserDefaults.standard.set(false, forKey: OnboardingPolicy.wirelessKey) }
+        if onboarding?.flow.step.isSetup == true {
+            onboarding?.setIncludesIPhoneBackTap(onboardingIPhoneBackTapHash != nil)
+        }
         onboarding?.setupCode(result.code, final: true, ipados: result.ipados,
                               deviceClass: result.deviceClass ?? pairedDeviceClass, osVersion: result.osVersion)
         setupDeviceClass = nil
@@ -1678,7 +1688,6 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             lastPermissionStep = "accessibility"
             requestMissingPermissions()
         }
-        offerIPhoneShortcutIfNeeded()
     }
 
     // Steps only the user can do on the iPad appear as a prompt on the settings
@@ -1833,6 +1842,9 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         prepareInterface()
         NSApp.setActivationPolicy(.regular)
         let controller = onboarding ?? makeOnboarding()
+        if controller.flow.step.rawValue < OnboardingStep.iPhoneBackTap.rawValue {
+            controller.setIncludesIPhoneBackTap(onboardingIPhoneBackTapHash != nil)
+        }
         controller.setAccessibility(permissionsReady)
         controller.setTryItReadiness(tryItReadiness)
         // Back from "Reopen Toss": continue on the Accessibility step.
@@ -1843,7 +1855,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         // A pairing already running shows on its step, but never skips the Accessibility step.
         if setupWizard.isRunning, permissionsReady, controller.flow.step.rawValue < OnboardingStep.cable.rawValue {
             controller.jump(to: .cable)
-            controller.setupCode(lastSetupCode, final: false, ipados: nil, deviceClass: setupDeviceClass)
+            controller.setupCode(lastSetupCode, final: false, ipados: nil, deviceClass: setupDeviceClass,
+                                 downloadPercent: setupDownloadPercent)
         }
         updateSetupPrompt(nil)
         controller.show()
@@ -1881,8 +1894,16 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             UserDefaults.standard.synchronize()
             self?.relaunch()
         }
-        controller.onFinish = { [weak self] in
-            DispatchQueue.main.async { self?.offerIPhoneShortcutIfNeeded() }
+        controller.onSetUpIPhoneBackTap = { [weak self, weak controller] in
+            guard let self, let controller else { return }
+            self.setUpOnboardingIPhoneBackTap(in: controller)
+        }
+        controller.onSkipIPhoneBackTap = { [weak self] in
+            guard let hash = self?.pairedUSBSetupHashes()[DeviceClass.iPhone.rawValue] else { return }
+            UserDefaults.standard.set(hash, forKey: OnboardingPolicy.skippedIPhoneBackTapKey)
+        }
+        controller.onLeaveIPhoneBackTap = { [weak self, weak controller] in
+            if let window = controller?.window { self?.endOnboardingIPhoneBackTap(in: window) }
         }
         // Closing it any way (done, cable only, or early) never cancels a running pairing and never
         // reopens it at the next launch; "Set Up iPad…" under More opens it again.
@@ -1895,6 +1916,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
                 UserDefaults.standard.set(true, forKey: OnboardingPolicy.seenKey)
             }
             self.onboarding = nil
+            if let window = controller?.window { self.endOnboardingIPhoneBackTap(in: window) }
             self.guideAwaitsDevice = false
             self.updateDeviceCopy()
             if self.hasPairing && self.permissionsReady { self.autoEnableIfFirstRun() }
@@ -1961,7 +1983,9 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
                 self.iPhoneShortcutReceiver.stop()
                 self.iPhoneShortcutImport.cancel()
                 self.setIPhoneShortcutSession(nil)
-                if let forgottenHash { self.offeredIPhoneShortcutHashes.remove(forgottenHash) }
+                if let forgottenHash, UserDefaults.standard.string(forKey: OnboardingPolicy.skippedIPhoneBackTapKey) == forgottenHash {
+                    UserDefaults.standard.removeObject(forKey: OnboardingPolicy.skippedIPhoneBackTapKey)
+                }
             }
             let rest = Array(kinds.dropFirst())
             if result.code == "not_paired", !rest.isEmpty {
@@ -2990,7 +3014,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
 
     @discardableResult
     private func refreshIPhoneShortcut(reportFailure: Bool = false) -> Bool {
-        guard !sleeping, !terminating, !uninstalling, let settings = IPhoneShortcutSettings.load(),
+        guard !sleeping, !terminating, !uninstalling,
+              let settings = onboardingIPhoneShortcutDraft ?? IPhoneShortcutSettings.load(),
               settings.isEnabled, pairedUSBSetupHashes()[DeviceClass.iPhone.rawValue] == settings.deviceHash else {
             iPhoneShortcutReceiver.stop()
             iPhoneShortcutImport.cancel()
@@ -2999,23 +3024,47 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         }
         setIPhoneShortcutSession(settings.secret)
         let showFailure = { [weak self] in
-            guard reportFailure else { return }
-            self?.showAlert(L("iPhone Shortcut Unavailable", "iPhone 快捷指令暂不可用"),
-                            L("Toss could not start receiving requests. Reopen Toss and try again.", "Toss 无法接收请求。请重新打开 Toss 再试。"))
+            guard let self else { return }
+            let message = L("Toss could not start receiving requests. Reopen Toss and try again.", "Toss 无法接收请求。请重新打开 Toss 再试。")
+            if self.onboardingIPhoneShortcutDraft?.secret == settings.secret, let controller = self.onboarding {
+                self.endOnboardingIPhoneBackTap(in: controller.window)
+                controller.setIPhonePairingError(message)
+            } else if reportFailure {
+                self.showAlert(L("iPhone Shortcut Unavailable", "iPhone 快捷指令暂不可用"), message)
+            }
         }
         do {
-            try iPhoneShortcutReceiver.start(secret: settings.secret, onFailure: showFailure, onLocalAuthorization: {
-                try? IPhoneShortcutSettings.markImportPrepared(secret: settings.secret)
-            }, onProofMismatch: { [weak self] in
-                self?.suggestIPhonePairing(secret: settings.secret)
-            }, onRemoteVerified: { [weak self] in
+            try iPhoneShortcutReceiver.start(secret: settings.secret, onFailure: showFailure, onProofMismatch: { [weak self] in
+                guard let self, self.onboardingIPhoneShortcutDraft == nil else { return }
+                self.suggestIPhonePairing(secret: settings.secret)
+            }, onRemoteVerified: { [weak self] purpose in
                 guard let self, self.iPhoneShortcutSessionSecret == settings.secret else { return }
+                let shortcutName = self.iPhonePairingPanel.shortcutName
+                // An older shortcut can still send a capture while a new one is being added.
+                guard shortcutName == nil || purpose == .pairingComplete else { return }
+                if let draft = self.onboardingIPhoneShortcutDraft, draft.secret == settings.secret {
+                    guard purpose == .pairingComplete, self.onboarding?.flow.step == .iPhoneBackTap,
+                          self.pairedUSBSetupHashes()[DeviceClass.iPhone.rawValue] == draft.deviceHash else { return }
+                    do {
+                        try draft.save()
+                        try IPhoneShortcutSettings.markPhoneVerified(secret: draft.secret)
+                    } catch {
+                        self.onboarding?.setIPhonePairingError(L("Could not save the iPhone shortcut settings.", "无法保存 iPhone 快捷指令设置。"))
+                        return
+                    }
+                    self.onboardingIPhoneShortcutDraft = nil
+                }
                 if !self.iPhoneShortcutVerified {
-                    try? IPhoneShortcutSettings.markImportPrepared(secret: settings.secret)
+                    try? IPhoneShortcutSettings.markPhoneVerified(secret: settings.secret)
                     self.iPhoneShortcutVerified = true
                     self.iPhoneShortcutSetupButton?.isHidden = true
                 }
-                self.hideIPhonePairingPanel()
+                if let onboarding = self.onboarding, onboarding.flow.step == .iPhoneBackTap {
+                    onboarding.markIPhoneShortcutPaired(shortcutName: shortcutName)
+                    self.iPhonePairingPanel.dismiss(from: onboarding.window)
+                } else {
+                    self.iPhonePairingPanel.showVerified()
+                }
             }) { [weak self] in
                 self?.receiveIPhoneShortcut(secret: settings.secret) ?? .unavailable("")
             }
@@ -3028,13 +3077,20 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
 
     private func setIPhoneShortcutSession(_ secret: String?) {
         guard secret != iPhoneShortcutSessionSecret else { return }
-        hideIPhonePairingPanel()
+        // Starting the receiver for the visible offer must leave its controls in place.
+        if secret == nil || secret != onboardingIPhoneShortcutDraft?.secret { iPhonePairingPanel.dismiss() }
         iPhoneShortcutSessionSecret = secret
         iPhoneShortcutMismatchShown = false
         iPhoneShortcutVerified = false
     }
 
-    @objc private func hideIPhonePairingPanel() { iPhonePairingPanel.dismiss() }
+    @objc private func hideIPhonePairingPanel() {
+        if let window = onboarding?.window, onboardingIPhoneShortcutDraft != nil {
+            endOnboardingIPhoneBackTap(in: window)
+        } else {
+            iPhonePairingPanel.dismiss()
+        }
+    }
 
     private var canShowIPhonePairing: Bool {
         guard !screensAsleep, !sleeping, !terminating, !uninstalling,
@@ -3074,76 +3130,173 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             ? .accepted : .unavailable(L("Toss is busy. Try again in a moment.", "Toss 正忙，请稍后再试。"))
     }
 
-    private enum IPhoneShortcutAction: Int { case addAgain = 1100, pairOnPhone }
+    private enum IPhoneShortcutAction: Int { case addOnMac = 1100, setupOnPhone, save, turnOff, cancel }
 
-    private func offerIPhoneShortcutIfNeeded() {
-        // The guide can still be open on Try It after pairing has completed.
-        guard permissionsReady, !uninstalling, !terminating, !sleeping, !setupWizard.isRunning,
-              let hash = pairedUSBSetupHashes()[DeviceClass.iPhone.rawValue],
-              !offeredIPhoneShortcutHashes.contains(hash),
-              let file = IPhoneShortcutImport.bundledFile, let address = IPhoneShortcutHandshake.localAddress else { return }
+    private var onboardingIPhoneBackTapHash: String? {
+        guard let hash = pairedUSBSetupHashes()[DeviceClass.iPhone.rawValue],
+              UserDefaults.standard.string(forKey: OnboardingPolicy.skippedIPhoneBackTapKey) != hash else { return nil }
         let saved = IPhoneShortcutSettings.load().flatMap { $0.deviceHash == hash ? $0 : nil }
-        guard saved?.needsAutomaticImport != false else { return }
-        let destination = saved.flatMap { TargetKind(rawValue: $0.destination) } ?? .chatGPT
-        guard let settings = saveIPhoneShortcut(for: hash, destination: destination, automaticImport: true) else { return }
-        offeredIPhoneShortcutHashes.insert(hash)
-        openIPhoneShortcut(file, address: address, settings: settings)
+        return saved?.needsPhoneSetup == false ? nil : hash
+    }
+
+    private func setUpOnboardingIPhoneBackTap(in controller: OnboardingController) {
+        guard canShowIPhonePairing, permissionsReady, !setupWizard.isRunning,
+              let hash = pairedUSBSetupHashes()[DeviceClass.iPhone.rawValue] else { return }
+        guard IPhoneShortcutPairingPanel.bundledFile != nil else {
+            controller.setIPhonePairingError(L("Reinstall Toss and try again.", "请重新安装 Toss 再试。"))
+            return
+        }
+        guard let address = IPhoneShortcutHandshake.localAddress else {
+            controller.setIPhonePairingError(L("Set a local hostname in macOS Sharing settings and try again.", "请在 macOS「共享」设置里设置本地主机名，再试一次。"))
+            return
+        }
+        let saved = IPhoneShortcutSettings.load().flatMap { $0.deviceHash == hash ? $0 : nil }
+        let destination = saved.flatMap { TargetKind(rawValue: $0.destination) }?.rawValue ?? TargetKind.chatGPT.rawValue
+        // A skipped offer must never authenticate later against the previous saved receiver.
+        let settings = IPhoneShortcutSettings(deviceHash: hash, destination: destination, previous: nil, pendingPhoneSetup: true)
+        // Create the offer on entry. Start listening only when the user requests delivery.
+        iPhonePairingPanel.embedPairing(address: address, secret: settings.secret, in: controller.window,
+                                       prepare: { [weak self, weak controller] in
+            guard let self, let controller, controller.flow.step == .iPhoneBackTap,
+                  self.canShowIPhonePairing, self.pairedUSBSetupHashes()[DeviceClass.iPhone.rawValue] == hash else { return false }
+            self.onboardingIPhoneShortcutDraft = settings
+            return self.refreshIPhoneShortcut()
+        }, showContent: { [weak controller] content in
+            controller?.setIPhonePairingContent(content)
+        })
+    }
+
+    private func endOnboardingIPhoneBackTap(in window: NSWindow) {
+        iPhonePairingPanel.dismiss(from: window)
+        guard onboardingIPhoneShortcutDraft != nil else { return }
+        onboardingIPhoneShortcutDraft = nil
+        refreshIPhoneShortcut()
+    }
+
+    private func setUpIPhoneBackTap(for hash: String, destination: TargetKind, pendingPhoneSetup: Bool) {
+        guard canShowIPhonePairing else { return }
+        guard IPhoneShortcutPairingPanel.bundledFile != nil else {
+            showAlert(L("iPhone Shortcut Unavailable", "iPhone 快捷指令暂不可用"),
+                      L("Reinstall Toss and try again.", "请重新安装 Toss 再试。"))
+            return
+        }
+        guard let address = IPhoneShortcutHandshake.localAddress else {
+            showAlert(L("iPhone Shortcut Unavailable", "iPhone 快捷指令暂不可用"),
+                      L("Set a local hostname in macOS Sharing settings and try again.", "请在 macOS「共享」设置里设置本地主机名，再试一次。"))
+            return
+        }
+        guard let settings = saveIPhoneShortcut(for: hash, destination: destination, pendingPhoneSetup: pendingPhoneSetup) else { return }
+        iPhonePairingPanel.showPairing(address: address, secret: settings.secret)
     }
 
     @objc private func configureIPhoneShortcut() {
         guard let window = settingsWindow, window.attachedSheet == nil, !uninstalling, !setupWizard.isRunning,
+              onboardingIPhoneShortcutDraft == nil,
               hasPairing, let hash = pairedUSBSetupHashes()[DeviceClass.iPhone.rawValue] else { return }
         let saved = IPhoneShortcutSettings.load().flatMap { $0.deviceHash == hash ? $0 : nil }
         let enabled = saved?.isEnabled == true
         let destinations: [TargetKind] = [.chatGPT, .claude]
-        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 144, height: 26), pullsDown: false)
-        popup.addItems(withTitles: destinations.map(\.displayName))
-        popup.setAccessibilityLabel(L("Chat Destination", "聊天目标"))
-        if let index = destinations.firstIndex(where: { $0.rawValue == saved?.destination }) {
-            popup.selectItem(at: index)
-        }
-        let alert = NSAlert()
-        alert.messageText = L("iPhone Shortcut…", "iPhone 快捷指令…")
-        alert.informativeText = L("Add Toss iPhone on this Mac and allow access if asked. After it syncs, choose Toss iPhone in iPhone Settings → Accessibility → Touch → Back Tap. If it is missing or won’t connect, choose Pair on iPhone.",
-                                  "在 Mac 上添加 Toss iPhone，系统询问权限时点「允许」。同步后，在 iPhone「设置 → 辅助功能 → 触控 → 轻点背面」选 Toss iPhone。如果手机上找不到捷径或连不上，点「在 iPhone 上配对」。")
-        if enabled {
-            alert.informativeText += "\n\n" + (iPhoneShortcutVerified
-                ? L("Toss verified an iPhone request this session.", "Toss 本次运行已验证来自 iPhone 的请求。")
-                : L("Waiting for the first request from iPhone this session.", "Toss 本次运行正在等待 iPhone 的首次请求。"))
-        }
-        let file = IPhoneShortcutImport.bundledFile
-        func setupButton(_ title: String, action: IPhoneShortcutAction) -> NSButton {
-            let button = NSButton(title: title, target: self, action: #selector(finishIPhoneShortcutAccessory(_:)))
-            button.tag = action.rawValue
-            button.isEnabled = file != nil
+        let initialDestination = destinations.first { $0.rawValue == saved?.destination } ?? .chatGPT
+        let destinationButtons = destinations.map { destination in
+            let selected = destination == initialDestination
+            let button = SettingsPill(destination.displayName, kind: selected ? .filled : .ghost,
+                                      monochrome: true, target: self, action: #selector(selectIPhoneShortcutDestination(_:)))
+            button.setButtonType(.radio)
+            button.state = selected ? .on : .off
             return button
         }
-        let pairOnPhone = setupButton(L("Pair on iPhone…", "在 iPhone 上配对…"), action: .pairOnPhone)
-        var views: [NSView] = [popup]
-        if enabled { views.append(setupButton(L("Add Again…", "重新添加…"), action: .addAgain)) }
-        views.append(pairOnPhone)
-        let controls = NSStackView(views: views)
-        controls.spacing = 12
-        controls.frame.size = controls.fittingSize
-        alert.accessoryView = controls
-        alert.addButton(withTitle: enabled ? L("Save", "保存") : L("Add Shortcut…", "添加快捷指令…"))
-        alert.addButton(withTitle: L("Cancel", "取消"))
-        if enabled { alert.addButton(withTitle: L("Turn Off", "关闭")) }
-        alert.beginSheetModal(for: window) { [weak self] response in
-            guard let self, !self.uninstalling, destinations.indices.contains(popup.indexOfSelectedItem),
+        func row(_ views: [NSView]) -> NSStackView {
+            let stack = NSStackView(views: views)
+            stack.alignment = .centerY
+            stack.spacing = 10
+            return stack
+        }
+        func setupButton(_ title: String, action: IPhoneShortcutAction, kind: SettingsPill.Kind = .ghost) -> SettingsPill {
+            let button = SettingsPill(title, kind: kind, monochrome: true, target: self,
+                                      action: #selector(finishIPhoneShortcutAccessory(_:)))
+            button.tag = action.rawValue
+            return button
+        }
+        let title = L("iPhone Shortcut…", "iPhone 快捷指令…")
+        let heading = NSTextField(labelWithString: title)
+        heading.font = SettingsStyle.serif(22)
+        heading.textColor = SettingsStyle.ink
+        let info = NSTextField(wrappingLabelWithString:
+            L("Send Toss Tap directly to your iPhone, then choose it for Back Tap. If you prefer to sync through iCloud, add the shortcut on this Mac.",
+              "将 Toss Tap 直接发到 iPhone，然后在「轻点背面」中选用。如果你想通过 iCloud 同步，也可以在这台 Mac 上添加快捷指令。"))
+        let destinationLabel = NSTextField(labelWithString: L("Chat Destination", "聊天目标"))
+        destinationLabel.font = SettingsStyle.sans(13)
+        destinationLabel.textColor = SettingsStyle.ink
+        let destinationRow = row([destinationLabel] + destinationButtons)
+        let setupOnPhone = L("Set Up on iPhone…", "在 iPhone 上设置…")
+        var routes = [setupButton(L("Add on Mac…", "在 Mac 上添加…"), action: .addOnMac)]
+        if enabled { routes.insert(setupButton(setupOnPhone, action: .setupOnPhone), at: 0) }
+        let routeRow = row(routes)
+        let cancel = setupButton(L("Cancel", "取消"), action: .cancel)
+        cancel.keyEquivalent = "\u{1b}"
+        cancel.keyEquivalentModifierMask = []
+        let primary = setupButton(enabled ? L("Save", "保存") : setupOnPhone,
+                                  action: enabled ? .save : .setupOnPhone, kind: .filled)
+        primary.keyEquivalent = "\r"
+        primary.keyEquivalentModifierMask = []
+        let footerSpacer = NSView()
+        footerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        var footer: [NSView] = [footerSpacer, cancel, primary]
+        if enabled {
+            footer.insert(setupButton(L("Turn Off", "关闭"), action: .turnOff, kind: .quiet), at: 0)
+        }
+        let footerRow = row(footer)
+        let width = max(380, destinationRow.fittingSize.width, routeRow.fittingSize.width, footerRow.fittingSize.width)
+        let stack = NSStackView(views: [heading, info, destinationRow, routeRow, footerRow])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.edgeInsets = NSEdgeInsets(top: 24, left: 24, bottom: 24, right: 24)
+        footerRow.widthAnchor.constraint(equalToConstant: width).isActive = true
+        stack.setCustomSpacing(18, after: routeRow)
+        var messages = [info]
+        if enabled {
+            let status = NSTextField(wrappingLabelWithString: iPhoneShortcutVerified
+                ? L("Toss verified an iPhone request this session.", "Toss 本次运行已验证来自 iPhone 的请求。")
+                : L("Waiting for the first request from iPhone this session.", "Toss 本次运行正在等待 iPhone 的首次请求。"))
+            stack.insertArrangedSubview(status, at: 2)
+            messages.append(status)
+        }
+        for message in messages {
+            message.preferredMaxLayoutWidth = width
+            message.font = SettingsStyle.sans(13)
+            message.textColor = SettingsStyle.muted
+            message.widthAnchor.constraint(equalToConstant: width).isActive = true
+        }
+        let sheet = NSWindow(contentRect: .zero, styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
+        sheet.title = title
+        sheet.titleVisibility = .hidden
+        sheet.isReleasedWhenClosed = false
+        sheet.contentView = stack
+        sheet.setContentSize(stack.fittingSize)
+        SettingsStyle.applyUnifiedWindowStyle(in: sheet)
+        window.beginSheet(sheet) { [weak self] response in
+            guard let self, !self.uninstalling,
+                  let action = IPhoneShortcutAction(rawValue: response.rawValue), action != .cancel,
+                  let selected = destinationButtons.firstIndex(where: { $0.state == .on }),
                   self.pairedUSBSetupHashes()[DeviceClass.iPhone.rawValue] == hash else { return }
-            let destination = destinations[popup.indexOfSelectedItem]
-            if response == .alertThirdButtonReturn {
+            let destination = destinations[selected]
+            switch action {
+            case .turnOff:
                 self.saveIPhoneShortcut(for: hash, destination: destination, disabled: true)
                 return
-            }
-            let action = IPhoneShortcutAction(rawValue: response.rawValue)
-            guard response == .alertFirstButtonReturn || action != nil else { return }
-            if enabled, action == nil {
+            case .save:
                 self.saveIPhoneShortcut(for: hash, destination: destination)
                 return
+            case .setupOnPhone:
+                self.setUpIPhoneBackTap(for: hash, destination: destination, pendingPhoneSetup: !enabled)
+                return
+            case .cancel:
+                return
+            case .addOnMac:
+                break
             }
-            guard let file else {
+            guard let file = IPhoneShortcutImport.bundledFile else {
                 self.showAlert(L("iPhone Shortcut Unavailable", "iPhone 快捷指令暂不可用"),
                                L("Reinstall Toss and try again.", "请重新安装 Toss 再试。"))
                 return
@@ -3153,12 +3306,17 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
                                L("Set a local hostname in macOS Sharing settings and try again.", "请在 macOS「共享」设置里设置本地主机名，再试一次。"))
                 return
             }
-            guard let settings = self.saveIPhoneShortcut(for: hash, destination: destination) else { return }
-            if action == .pairOnPhone {
-                if self.canShowIPhonePairing { self.iPhonePairingPanel.showPairing(address: address, secret: settings.secret) }
-            } else {
-                self.openIPhoneShortcut(file, address: address, settings: settings)
-            }
+            guard let settings = self.saveIPhoneShortcut(for: hash, destination: destination, pendingPhoneSetup: !enabled) else { return }
+            self.openIPhoneShortcut(file, address: address, settings: settings)
+        }
+    }
+
+    @objc private func selectIPhoneShortcutDestination(_ sender: SettingsPill) {
+        guard let row = sender.superview as? NSStackView else { return }
+        for case let button as SettingsPill in row.arrangedSubviews {
+            let selected = button === sender
+            button.state = selected ? .on : .off
+            button.kind = selected ? .filled : .ghost
         }
     }
 
@@ -3169,11 +3327,11 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
 
     @discardableResult
     private func saveIPhoneShortcut(for hash: String, destination: TargetKind, disabled: Bool = false,
-                                    automaticImport: Bool = false) -> IPhoneShortcutSettings? {
+                                    pendingPhoneSetup: Bool = false) -> IPhoneShortcutSettings? {
         guard !sleeping, !terminating, !uninstalling else { return nil }
         let settings = IPhoneShortcutSettings(deviceHash: hash, destination: destination.rawValue,
                                               previous: IPhoneShortcutSettings.load(), disabled: disabled,
-                                              automaticImport: automaticImport)
+                                              pendingPhoneSetup: pendingPhoneSetup)
         do { try settings.save() } catch {
             showAlert(L("iPhone Shortcut Unavailable", "iPhone 快捷指令暂不可用"),
                       L("Could not save the iPhone shortcut settings.", "无法保存 iPhone 快捷指令设置。"))
@@ -3191,7 +3349,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
                 self.pairedUSBSetupHashes()[DeviceClass.iPhone.rawValue] == settings.deviceHash
         }, onFailure: { [weak self] in
             self?.showAlert(L("iPhone Shortcut Unavailable", "iPhone 快捷指令暂不可用"),
-                            L("Could not open Apple Shortcuts. Choose Pair on iPhone in Toss.", "无法打开苹果的「快捷指令」。请在 Toss 里点「在 iPhone 上配对」。"))
+                            L("Could not open Apple Shortcuts. Choose Set Up on iPhone in Toss.", "无法打开苹果的「快捷指令」。请在 Toss 里点「在 iPhone 上设置」。"))
         })
     }
 
@@ -3545,6 +3703,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func willSleep() {
         sleeping = true
+        onboardingIPhoneShortcutDraft = nil
         hideIPhonePairingPanel()
         iPhoneShortcutReceiver.stop()
         iPhoneShortcutImport.cancel()

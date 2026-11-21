@@ -41,7 +41,8 @@ final class SetupTextRecorder {
 @MainActor
 final class SetupOnboardingRecorder {
     private(set) var deviceClasses: [DeviceClass?] = []
-    func setupCode(_ code: String, final: Bool, ipados: String?, deviceClass: DeviceClass?, osVersion: String?) {
+    func setupCode(_ code: String, final: Bool, ipados: String?,
+                   deviceClass: DeviceClass?, osVersion: String?, downloadPercent: Int?) {
         deviceClasses.append(deviceClass)
     }
 }
@@ -55,6 +56,7 @@ final class DeviceCopyProgressFixture {
     var captureDeviceClass: DeviceClass?
     var guideAwaitsDevice = false
     var lastSetupCode = ""
+    var setupDownloadPercent: Int?
     var setupDeviceHash: String?
     var trustWaitStarted: TimeInterval?
     var setupRunning = false

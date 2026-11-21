@@ -125,17 +125,21 @@ final class SettingsPill: NSButton {
     enum Kind { case ghost, filled, quiet }
     var kind: Kind = .ghost { didSet { needsDisplay = true; updateGlass() } }
     private var compact = false
+    private var monochrome = false
     private var stylingTitle = false
     override var title: String { didSet { invalidateIntrinsicContentSize(); needsDisplay = true; updateGlassTitle() } }
 
-    convenience init(_ title: String, kind: Kind = .ghost, compact: Bool = true, target: AnyObject?, action: Selector?) {
+    convenience init(_ title: String, kind: Kind = .ghost, compact: Bool = true, monochrome: Bool = false,
+                     target: AnyObject?, action: Selector?) {
         self.init(frame: .zero)
         self.compact = compact
+        self.monochrome = monochrome
         self.kind = kind
         self.title = title
         self.target = target
         self.action = action
         isBordered = false
+        if monochrome { focusRingType = .none }
         setButtonType(.momentaryPushIn)
         updateGlass()
         setContentHuggingPriority(.required, for: .horizontal)
@@ -146,7 +150,7 @@ final class SettingsPill: NSButton {
     override var wantsUpdateLayer: Bool { usesNativeGlass }
     override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsets() }
     private var usesNativeGlass: Bool {
-        if #available(macOS 26.0, *) { return kind != .quiet }
+        if #available(macOS 26.0, *) { return !monochrome && kind != .quiet }
         return false
     }
     private func updateGlass() {
@@ -180,6 +184,16 @@ final class SettingsPill: NSButton {
     override var focusRingMaskBounds: NSRect { bounds }
     override func drawFocusRingMask() {
         NSBezierPath(roundedRect: bounds, xRadius: bounds.height / 2, yRadius: bounds.height / 2).fill()
+    }
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if monochrome && accepted { needsDisplay = true }
+        return accepted
+    }
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if monochrome && resigned { needsDisplay = true }
+        return resigned
     }
     private var textFont: NSFont { kind == .quiet ? SettingsStyle.sans(13) : SettingsStyle.sans(compact ? 12.5 : 13, .medium) }
     override var intrinsicContentSize: NSSize {
@@ -216,6 +230,11 @@ final class SettingsPill: NSButton {
             color = SettingsStyle.muted
         }
         drawTitle(in: bounds, color: color)
+        if monochrome && window?.firstResponder === self {
+            let focus = bounds.insetBy(dx: 2, dy: 2)
+            (kind == .filled ? SettingsStyle.background : SettingsStyle.ink).setStroke()
+            NSBezierPath(roundedRect: focus, xRadius: focus.height / 2, yRadius: focus.height / 2).stroke()
+        }
     }
     fileprivate func drawTitle(in rect: NSRect, color: NSColor? = nil) {
         var attributes: [NSAttributedString.Key: Any] = [.font: textFont]

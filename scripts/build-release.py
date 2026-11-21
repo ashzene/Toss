@@ -20,7 +20,10 @@ import sys
 import tempfile
 import time
 
-VERSION, BUILD = "1.1.0", "129"
+from artifact_name import artifact_name, release_version
+
+VERSION, BUILD = "1.1.0", "141"
+EDITION = "iPhone+iPad"
 DEFAULT_IDENTITY = "Toss Local Signing"
 
 project = Path(__file__).resolve().parent.parent
@@ -30,11 +33,20 @@ parser.add_argument("--runtime", type=Path, default=project.parent / "runtime/py
 parser.add_argument("--identity", default=os.environ.get("TOSS_SIGN_IDENTITY"),
                     help="code-signing identity; default: the stable local one if present, else ad-hoc")
 parser.add_argument("--dmg", action="store_true", help="also create the disk image next to the app")
-parser.add_argument("--zip", action="store_true", help=f"also create Toss {VERSION} Nightly for iPhone+iPad.app.zip next to the app")
+parser.add_argument("--zip", action="store_true", help="also create an app ZIP next to the app")
+parser.add_argument("--release-tag", help="prepare a GitHub Release DMG named after this exact tag")
 parser.add_argument("--trial-summary", help="build a DMG and sync it to the local Toss Version Manager with this summary")
 parser.add_argument("--trial-change", action="append", default=[], help="add a line to the local trial version notes (repeatable)")
 args = parser.parse_args()
 publish_trial = args.trial_summary is not None
+bundle_version = VERSION
+if args.release_tag is not None:
+    if publish_trial:
+        parser.error("--release-tag and --trial-summary are mutually exclusive")
+    try:
+        bundle_version = release_version(args.release_tag)
+    except ValueError as error:
+        parser.error(str(error))
 if publish_trial:
     if not args.trial_summary.strip() or any(not change.strip() for change in args.trial_change):
         parser.error("the trial summary and changes must contain text")
@@ -72,12 +84,14 @@ subprocess.run(["xcrun", "swiftc", "-swift-version", "5", "-parse-as-library", "
     "-o", str(macos / "Toss")], check=True)
 info = {"CFBundleIdentifier": "io.github.ashzene.toss", "CFBundleName": "Toss",
     "CFBundleDisplayName": "Toss", "CFBundleExecutable": "Toss",
-    "CFBundlePackageType": "APPL", "CFBundleShortVersionString": VERSION, "CFBundleVersion": BUILD,
+    "CFBundlePackageType": "APPL", "CFBundleShortVersionString": bundle_version, "CFBundleVersion": BUILD,
     "LSUIElement": True, "LSMinimumSystemVersion": "14.0", "NSHighResolutionCapable": True,
     "LSArchitecturePriority": ["arm64"],
     "CFBundleDevelopmentRegion": "en", "CFBundleLocalizations": ["en"],
     "NSLocalNetworkUsageDescription": "Connect to your paired devices and take a screenshot when you trigger Toss.",
     "NSBonjourServices": ["_remotepairing._tcp"]}
+if args.release_tag is not None:
+    info["TossReleaseTag"] = args.release_tag
 # App icon: Assets/Toss.icon (Icon Composer) compiles to Assets.car so macOS 26 draws the light,
 # dark, clear and tinted variants itself; Toss.icns from Toss.iconset covers older systems.
 # actool needs full Xcode 26 (Command Line Tools lack it); only actool gets DEVELOPER_DIR.
@@ -153,7 +167,7 @@ print("Built and signature-verified. App was NOT launched: " + str(app))
 subprocess.run(["/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
                 "-u", str(app)], check=False, stderr=subprocess.DEVNULL)
 
-if args.dmg or publish_trial:
+if args.dmg or publish_trial or args.release_tag is not None:
     subprocess.run([sys.executable, str(project / "scripts/package-installer.py"),
                     "--payload", str(app), "--output", str(out), "--identity", args.identity], check=True)
 
@@ -161,7 +175,7 @@ if args.zip:
     # --sequesterRsrc keeps extended attributes in __MACOSX/ instead of beside the files: without it
     # Finder's Archive Utility and unzip write ._ files next to the bundle's symlinks and the
     # extracted app fails its signature check (2026-10-29).
-    archive = out / f"Toss {VERSION} Nightly for iPhone+iPad.app.zip"
+    archive = out / (artifact_name(info, EDITION) + ".app.zip")
     if archive.exists():
         archive.unlink()
     subprocess.run(["/usr/bin/ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(app), str(archive)], check=True)

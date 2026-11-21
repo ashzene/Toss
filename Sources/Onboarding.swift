@@ -6,7 +6,7 @@ import AppKit
 // counts as set up: the wireless step turns green only on the final "ready" code.
 
 enum OnboardingStep: Int, CaseIterable {
-    case welcome, access, menubar, cable, trust, devmode, prepare, wifi, tryIt, done
+    case welcome, access, menubar, cable, trust, devmode, prepare, wifi, iPhoneBackTap, tryIt, done
     var isSetup: Bool { (OnboardingStep.cable.rawValue...OnboardingStep.wifi.rawValue).contains(rawValue) }
 }
 
@@ -56,10 +56,13 @@ struct OnboardingFlow: Equatable {
     var ipados: String?
     var deviceClass: DeviceClass?
     var osVersion: String?
+    private(set) var downloadPercent: Int?
     var waitingForUSBSince: Double?
     var developerModeNeededSince: Double?
     var trustSince: Double?      // first trust_needed, for the replug hint after 30 s
     var tossed = false
+    var includesIPhoneBackTap = false
+    var iPhoneShortcutPaired = false
     var tryItReadiness: OnboardingTryItReadiness = .preparing
     var showsShortcutRows: Bool { step == .done || (step == .tryIt && tryItReadiness == .ready) }
     var menuIcon: MenuIconVisibility = .visible
@@ -97,7 +100,8 @@ struct OnboardingFlow: Equatable {
         case "unsupported_device", "mixed_usb_devices": return .cable
         case "trust_needed": return .trust
         case "developer_mode_auto", "developer_mode_needed", "ipad_restarting", "developer_mode_confirm": return .devmode
-        case "pairing_wireless", "preparing_image", "pairing_failed", "developer_image_failed": return .prepare
+        case "pairing_wireless", "downloading_image", "preparing_image",
+             "pairing_failed", "developer_image_failed", "developer_image_download_failed": return .prepare
         case "wifi_waiting", "wifi_unreachable", "ready": return .wifi
         default: return nil
         }
@@ -111,9 +115,13 @@ struct OnboardingFlow: Equatable {
         // Decided on the Accessibility step, so a slow first draw at launch doesn't add the step.
         if value != .visible && (step == .access || step == .menubar) { includesMenuBar = true }
     }
-    var counted: Int { includesMenuBar ? 9 : 8 }
-    // Step number on screen; the menu-bar step only counts when it is part of this run.
-    var number: Int { step.rawValue + 1 - (!includesMenuBar && step.rawValue > OnboardingStep.menubar.rawValue ? 1 : 0) }
+    var counted: Int { (includesMenuBar ? 9 : 8) + (includesIPhoneBackTap ? 1 : 0) }
+    var number: Int {
+        var number = step.rawValue + 1
+        if !includesMenuBar && step.rawValue > OnboardingStep.menubar.rawValue { number -= 1 }
+        if !includesIPhoneBackTap && step.rawValue > OnboardingStep.iPhoneBackTap.rawValue { number -= 1 }
+        return number
+    }
 
     mutating func setDeviceClass(_ value: DeviceClass?) {
         if value == nil || deviceClass != value { ipados = nil; osVersion = nil }
@@ -121,10 +129,12 @@ struct OnboardingFlow: Equatable {
     }
 
     mutating func receive(code: String, final: Bool, ipados: String?,
-                          deviceClass: DeviceClass? = nil, osVersion: String? = nil, at now: Double) {
+                          deviceClass: DeviceClass? = nil, osVersion: String? = nil,
+                          downloadPercent: Int? = nil, at now: Double) {
         if self.code != code || self.final != final { developerModeNeededSince = nil }
         self.code = code
         self.final = final
+        self.downloadPercent = code == "downloading_image" && !final ? downloadPercent : nil
         updateTime(at: now)
         if ["no_usb_ipad", "multiple_usb_ipads", "mixed_usb_devices", "unsupported_device", "not_paired"].contains(code) {
             self.deviceClass = nil; self.ipados = nil; self.osVersion = nil
@@ -150,18 +160,30 @@ struct OnboardingFlow: Equatable {
         switch step {
         case .access where accessibility: return includesMenuBar && menuIcon != .visible ? .menubar : .cable
         case .menubar where menuIcon == .visible: return standaloneMenuBar ? nil : .cable
-        case .wifi where wirelessReady: return .tryIt
+        case .wifi where wirelessReady: return includesIPhoneBackTap ? .iPhoneBackTap : .tryIt
         case .tryIt where tossed: return .done
         default: return nil
         }
     }
     mutating func advance() { if let next = autoNext { step = next } }
+    var previousStep: OnboardingStep {
+        switch step {
+        case .cable: return includesMenuBar ? .menubar : .access
+        case .iPhoneBackTap: return wirelessReady ? .wifi : .welcome
+        case .tryIt: return includesIPhoneBackTap ? .iPhoneBackTap : .wifi
+        default: return OnboardingStep(rawValue: max(0, step.rawValue - 1)) ?? .welcome
+        }
+    }
+    mutating func skip() {
+        guard skippable else { return }
+        step = step == .iPhoneBackTap ? .tryIt : .done
+    }
     // Arriving on the cable step starts pairing unless it is running or already done.
     var needsSetupStart: Bool { step == .cable && (setupStage == nil || (final && code != "ready")) }
     // The main button only where the user has to act: start, open System Settings, retry, finish.
     func showsPrimary(at now: Double) -> Bool {
         switch step {
-        case .welcome, .done: return true
+        case .welcome, .iPhoneBackTap, .done: return true
         case .access: return !accessibility
         case .menubar: return menuIcon != .visible || standaloneMenuBar
         default: return mark(at: now) == .fail
@@ -173,6 +195,7 @@ struct OnboardingFlow: Equatable {
         case .welcome, .done: return .none
         case .access: return accessibility ? .ok : .wait
         case .menubar: return menuIcon == .visible ? .ok : .wait
+        case .iPhoneBackTap: return iPhoneShortcutPaired ? .ok : .none
         case .tryIt: return tossed ? .ok : .wait
         default:
             if let stage = setupStage, stage.rawValue > step.rawValue { return .ok }
@@ -187,12 +210,13 @@ struct OnboardingFlow: Equatable {
     func canContinue(at now: Double) -> Bool {
         switch step {
         case .welcome, .done: return true
+        case .iPhoneBackTap: return iPhoneShortcutPaired
         case .tryIt: return tossed
         default: return mark(at: now) == .ok
         }
     }
-    var showsBack: Bool { !standaloneMenuBar && [.access, .menubar, .cable, .tryIt, .done].contains(step) }
-    var skippable: Bool { step == .tryIt && !tossed }
+    var showsBack: Bool { !standaloneMenuBar && [.access, .menubar, .cable, .iPhoneBackTap, .tryIt, .done].contains(step) }
+    var skippable: Bool { (step == .tryIt && !tossed) || step == .iPhoneBackTap }
     // A waiting pairing step has no other button, so it can always be stopped.
     func showsCancel(setupRunning: Bool, at now: Double) -> Bool { setupRunning && step.isSetup && mark(at: now) == .wait }
 }
@@ -204,6 +228,7 @@ enum OnboardingPolicy {
     static let wirelessKey = "Toss.wirelessSetUp" // false after a failed wireless step or "cable only"
     static let resumeAccessKey = "Toss.onboardingResumeAccess" // set just before a relaunch from step 2
     static let autoRelaunchKey = "Toss.accessAutoRelaunchAt" // last automatic relaunch for Accessibility
+    static let skippedIPhoneBackTapKey = "Toss.skippedIPhoneBackTapForDevice"
     static func opensAutomatically(paired: Bool, firstRun: Bool, seen: Bool) -> Bool { !paired || (firstRun && !seen) }
     static func opensFromIcon(paired: Bool, guideVisible: Bool) -> Bool { !paired || guideVisible }
     // Closed on the welcome step before Start (2026-11-02: a stray close while Ashley worked in another
@@ -231,6 +256,14 @@ struct OnboardingCopy {
     var back: String { t("返回", "Back") }
     var skip: String { t("跳过", "Skip") }
     var cancel: String { t("取消", "Cancel") }
+    var tryAgain: String { t("再试一次", "Try Again") }
+    func backTapSteps(shortcutName: String?) -> [String] {
+        let path = t("在 iPhone 打开「设置 → 辅助功能 → 触控 → 轻点背面 → 轻点两下」。",
+                     "On iPhone, go to Settings → Accessibility → Touch → Back Tap → Double Tap.")
+        let select = t("选中下方的捷径，然后点返回生效。", "Select the shortcut below, then go back to apply.")
+        let fallback = t("如果 iPhone 没有自动跳转", "If Settings doesn't open")
+        return [select + (shortcutName.map { "\n" + $0 } ?? ""), fallback + "\n" + path]
+    }
     var cableOnly: String { t("先只用数据线", "Use cable only for now") }
     var developerModeHint: String { t("没看到「开发者模式」？把 \(deviceZH) 上的「设置」从后台划掉再打开。", "Don't see Developer Mode? Swipe Settings away and open it again.") }
     var reopen: String { t("重新打开 Toss", "Reopen Toss") }
@@ -249,6 +282,7 @@ struct OnboardingCopy {
         case .devmode: return t("打开开发者模式", "Turn On Developer Mode")
         case .prepare: return t("准备 \(deviceZH)", "Preparing Your \(deviceEN)")
         case .wifi: return t("设置无线连接", "Set Up the Wireless Connection")
+        case .iPhoneBackTap: return t("iPhone 轻点背面", "iPhone Back Tap")
         case .tryIt: return t("试一下", "Try It")
         case .done: return t("设置完成", "You're All Set")
         }
@@ -273,6 +307,8 @@ struct OnboardingCopy {
         case .devmode: return t("截图需要它，只开一次。\(deviceZH) 会重启一次，数据线别拔。", "Screenshots need it. Your \(deviceShortEN) restarts once; keep the cable in.")
         case .prepare: return t("正在建立无线配对、下载截图组件，可能要几分钟。", "Setting up wireless and screenshots. Can take a few minutes.")
         case .wifi: return t("拔掉线也能用。Mac 和 \(deviceZH) 要连同一个 Wi-Fi。", "Works without the cable. Mac and \(DeviceCopy.deviceClass ?? "your device") need the same Wi-Fi.")
+        case .iPhoneBackTap:
+            return t("也可以稍后在 Toss 设置里开启。", "Set this up later in Toss settings.")
         case .tryIt:
             if DeviceCopy.bothPaired {
                 return t("打开一个聊天：按一下发 iPad，快速按两下发 iPhone。", "Open a chat: press once for iPad, twice quickly for iPhone.")
@@ -304,7 +340,8 @@ struct OnboardingCopy {
                               t("打开后 Toss 会自己继续", "Toss continues by itself once it's on")]
         case .menubar: return [t("系统设置已经打开在「菜单栏」\n往下找到「允许在菜单栏中显示」", "System Settings is open at Menu Bar\nScroll to Allow in the Menu Bar"),
                                t("打开 Toss 的开关\n打开后 Toss 会自己继续", "Switch Toss on\nToss continues by itself")]
-        case .cable: return [t("用数据线把 \(deviceZH) 连到这台 Mac", "Connect the \(deviceEN) to this Mac with the cable"), t("解锁 \(deviceZH)", "Unlock the \(deviceEN)")]
+        case .cable: return [t("解锁 \(deviceZH)", "Unlock the \(deviceEN)"),
+                             t("用数据线把 \(deviceZH) 连到这台 Mac", "Connect the \(deviceEN) to this Mac with the cable")]
         case .trust: return [t("\(deviceZH) 上会弹出「要信任此电脑吗？」", "Your \(deviceEN) asks \u{201C}Trust This Computer?\u{201D}"),
                              t("点「信任」，再输入 \(deviceZH) 密码", "Tap Trust, then enter the \(deviceEN) passcode")]
         case .devmode: return [t("把「设置」从后台划掉，再重新打开\n「设置」重开后才会显示开关", "Swipe Settings away, then open it again\nSettings shows the switch only after a reopen"),
@@ -313,6 +350,8 @@ struct OnboardingCopy {
                                t("重启后解锁，在弹窗里点「打开」\n再输入一次锁屏密码", "After the restart, unlock and tap Turn On\nThen enter your passcode once")]
         case .wifi: return [t("macOS 问「Toss 想要查找本地网络上的设备」时，点「允许」", "If macOS asks to find devices on your network, click Allow"),
                             t("\(deviceZH) 保持解锁、连着 Wi-Fi", "Keep the \(deviceEN) unlocked and on Wi-Fi")]
+        case .iPhoneBackTap:
+            return [t("先添加捷径，再按顺序完成配对和授权。", "Add the shortcut, then follow the pairing and permission steps.")]
         case .prepare, .tryIt, .done: return []
         }
     }
@@ -333,7 +372,8 @@ struct OnboardingCopy {
         case .menubar: return flow.menuIcon == .hidden ? t("打开系统设置", "Open System Settings")
             : flow.standaloneMenuBar ? t("完成", "Done") : t("继续", "Continue")
         case .done: return t("完成", "Done")
-        default: return mark == .fail ? t("再试一次", "Try Again") : t("继续", "Continue")
+        case .iPhoneBackTap: return flow.iPhoneShortcutPaired ? t("已选好，继续", "Selected · Continue") : t("在 iPhone 上设置…", "Set Up on iPhone…")
+        default: return mark == .fail ? tryAgain : t("继续", "Continue")
         }
     }
 
@@ -344,6 +384,9 @@ struct OnboardingCopy {
         let device = flow.ipados.map { "\(DeviceCopy.label) · \(osEN) \($0)" } ?? DeviceCopy.label
         switch flow.step {
         case .welcome, .done: return (.none, "", nil)
+        case .iPhoneBackTap:
+            if flow.iPhoneShortcutPaired { return (.ok, t("捷径已配对。请在 iPhone 上选择。", "Shortcut paired. Select it on your iPhone."), nil) }
+            return (.none, "", nil)
         case .access:
             if mark == .ok { return (.ok, t("辅助功能已打开 ✓", "Accessibility is on ✓"), nil) }
             if flow.relaunching { return (.ok, t("已允许，正在重新打开 Toss…", "Allowed, reopening Toss…"), nil) }
@@ -394,6 +437,8 @@ struct OnboardingCopy {
                                          t("拔下数据线再插上，\(deviceZH) 会再问一次。", "Unplug the cable and plug it in again; the \(deviceEN) asks again."))
             case "pairing_failed": return (.fail, t("无线配对没有成功。", "Wireless pairing didn't finish."),
                                            t("保持 \(deviceZH) 解锁、数据线连着，再试一次。", "Keep the \(deviceEN) unlocked and connected, then try again."))
+            case "developer_image_download_failed": return (.fail, t("截图组件下载失败。", "The screenshot component couldn't download."),
+                                                            t("请检查网络连接，然后重试。", "Check your internet connection and try again."))
             case "developer_image_failed": return (.fail, t("截图组件没有装好。", "The screenshot component didn't install."),
                                                    t("Mac 要能上网，\(deviceZH) 保持解锁，再试一次。", "Needs internet and an unlocked \(deviceEN). Try again."))
             case "wifi_unreachable": return (.fail, t("在网络上找不到这台 \(deviceZH)。", "Can't find the \(deviceEN) on the network."),
@@ -423,7 +468,8 @@ struct OnboardingCopy {
         case "developer_mode_confirm": return (.wait, t("在 \(deviceZH) 的弹窗里点「打开」，输入锁屏密码", "On your \(deviceEN), tap Turn On and enter your passcode"),
                                                    t("输完 Toss 会自动继续。", "Toss continues by itself."))
         case "pairing_wireless": return (.wait, t("正在建立无线配对…", "Setting up wireless pairing…"), nil)
-        case "preparing_image": return (.wait, t("正在下载并安装截图组件…\n第一次要联网，网慢时要几分钟", "Downloading the screenshot component…\nNeeds internet the first time; can take a few minutes"), nil)
+        case "downloading_image": return (.wait, t("正在下载截图组件…", "Downloading the screenshot component…"), nil)
+        case "preparing_image": return (.wait, t("正在安装截图组件…", "Installing the screenshot component…"), nil)
         case "wifi_waiting": return (.wait, t("USB 已连接，正在设置无线连接…", "USB is connected; setting up wireless…"),
                                      t("插着线已经能截图，但这一步要等无线好了才算完成。", "USB already works, but this step needs wireless."))
         default: return (.wait, t("正在等待 \(deviceZH)…", "Waiting for the \(deviceEN)…"), nil)
@@ -442,13 +488,19 @@ final class OnboardingController: NSObject, NSWindowDelegate {
     var menuIconProbe: (() -> MenuIconVisibility)?
     var setupRunningProbe: (() -> Bool)?
     var onCancelSetup: () -> Void = {}
-    var onFinish: () -> Void = {}
+    var onSetUpIPhoneBackTap: () -> Void = {}
+    var onSkipIPhoneBackTap: () -> Void = {}
+    var onLeaveIPhoneBackTap: () -> Void = {}
     var onClose: () -> Void = {}
 
     private(set) var flow = OnboardingFlow()
+    private var verifiedIPhoneShortcutName: String?
     let copy: OnboardingCopy
     let window: NSWindow
     private let stack = NSStackView()
+    private let iPhonePairingSlot = NSStackView()
+    private var enteredIPhoneBackTap = false
+    private var iPhonePairingError: String?
     private var tick: Timer?
     var now: () -> Double = { ProcessInfo.processInfo.systemUptime }
 
@@ -469,6 +521,9 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         stack.alignment = .leading
         stack.spacing = 0
         stack.translatesAutoresizingMaskIntoConstraints = false
+        iPhonePairingSlot.orientation = .vertical
+        iPhonePairingSlot.alignment = .leading
+        iPhonePairingSlot.widthAnchor.constraint(equalToConstant: SettingsStyle.width - 2 * SettingsStyle.margin).isActive = true
         let content = window.contentView!
         content.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -486,12 +541,14 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         advanceTimer?.invalidate(); advanceTimer = nil
         flow = OnboardingFlow()
         transport = nil
+        verifiedIPhoneShortcutName = nil
         shown = nil
         render()
     }
 
     func show() {
         window.makeKeyAndOrderFront(nil)
+        render()
         tick?.invalidate()
         // Re-evaluates time-based hints (charge-only cable) once a second.
         tick = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
@@ -511,11 +568,57 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         flow.accessibility = granted; render(); scheduleAdvance()
     }
     func setupCode(_ code: String, final: Bool, ipados: String?,
-                   deviceClass: DeviceClass? = nil, osVersion: String? = nil) {
+                   deviceClass: DeviceClass? = nil, osVersion: String? = nil, downloadPercent: Int? = nil) {
         flow.receive(code: code, final: final, ipados: ipados,
-                     deviceClass: deviceClass, osVersion: osVersion, at: now()); render(); scheduleAdvance()
+                     deviceClass: deviceClass, osVersion: osVersion,
+                     downloadPercent: downloadPercent, at: now())
+        render()
+        scheduleAdvance()
     }
     func setDeviceClass(_ value: DeviceClass?) { flow.setDeviceClass(value); render() }
+    func setIncludesIPhoneBackTap(_ value: Bool) {
+        guard flow.includesIPhoneBackTap != value else { return }
+        flow.includesIPhoneBackTap = value; shown = nil; render()
+    }
+    func setIPhonePairingContent(_ view: NSView?) {
+        guard enteredIPhoneBackTap, flow.step == .iPhoneBackTap, !flow.iPhoneShortcutPaired else { return }
+        if iPhonePairingSlot.arrangedSubviews.first !== view {
+            removeIPhonePairingContent()
+            if let view {
+                iPhonePairingError = nil
+                iPhonePairingSlot.addArrangedSubview(view)
+            }
+            render()
+        }
+        fitWindow()
+    }
+    func setIPhonePairingError(_ message: String) {
+        guard enteredIPhoneBackTap, flow.step == .iPhoneBackTap, !flow.iPhoneShortcutPaired else { return }
+        iPhonePairingError = message
+        removeIPhonePairingContent()
+        render()
+    }
+    func markIPhoneShortcutPaired(shortcutName: String? = nil) {
+        guard flow.step == .iPhoneBackTap else { return }
+        // Later requests may arrive without the name of the imported shortcut.
+        if let shortcutName { verifiedIPhoneShortcutName = shortcutName }
+        flow.iPhoneShortcutPaired = true
+        iPhonePairingError = nil
+        removeIPhonePairingContent()
+        render()
+    }
+    private func removeIPhonePairingContent() {
+        guard let view = iPhonePairingSlot.arrangedSubviews.first else { return }
+        iPhonePairingSlot.removeArrangedSubview(view)
+        view.removeFromSuperview()
+    }
+    private func leaveIPhoneBackTap() {
+        guard enteredIPhoneBackTap else { return }
+        enteredIPhoneBackTap = false
+        iPhonePairingError = nil
+        removeIPhonePairingContent()
+        onLeaveIPhoneBackTap()
+    }
     func setTryItReadiness(_ value: OnboardingTryItReadiness) {
         guard flow.tryItReadiness != value else { return }
         flow.tryItReadiness = value
@@ -588,7 +691,15 @@ final class OnboardingController: NSObject, NSWindowDelegate {
                 flow.step = .cable
                 if flow.needsSetupStart { onStartSetup() }
             }
-        case .done: onFinish(); window.close(); return
+        case .iPhoneBackTap:
+            guard flow.iPhoneShortcutPaired else {
+                iPhonePairingError = nil
+                onSetUpIPhoneBackTap()
+                render()
+                return
+            }
+            flow.step = .tryIt
+        case .done: window.close(); return
         case .menubar:
             if flow.menuIcon == .hidden { flow.menuBarRequested = true; onOpenMenuBarSettings(); render(); return }
             // Under the notch the switch is already on; nothing more to do here.
@@ -602,11 +713,14 @@ final class OnboardingController: NSObject, NSWindowDelegate {
     }
     @objc private func cancelSetup() { onCancelSetup() }
     @objc private func back() {
-        let target: OnboardingStep = flow.step == .tryIt ? .wifi : OnboardingStep(rawValue: max(0, flow.step.rawValue - 1)) ?? .welcome
-        flow.step = flow.step == .cable ? (flow.includesMenuBar ? .menubar : .access) : target
-        render()
+        advanceTimer?.invalidate(); advanceTimer = nil
+        flow.step = flow.previousStep
+        render(); scheduleAdvance()
     }
-    @objc private func skip() { flow.step = .done; render() }
+    @objc private func skip() {
+        if flow.step == .iPhoneBackTap { onSkipIPhoneBackTap() }
+        flow.skip(); render()
+    }
     @objc private func cableOnly() { onCableOnly(); window.close() }
     // macOS may only re-read Accessibility when Toss starts; the relaunch comes back to this step.
     @objc private func reopen() { onReopen() }
@@ -614,6 +728,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         tick?.invalidate(); tick = nil
         advanceTimer?.invalidate(); advanceTimer = nil
+        leaveIPhoneBackTap()
         onClose()
     }
 
@@ -654,18 +769,42 @@ final class OnboardingController: NSObject, NSWindowDelegate {
     }
 
     private var shown: String?
+    private var downloadReadout: (bar: OnboardingDownloadProgress, label: NSTextField)?
 
     func render() {
+        let shortcutStep = flow.step == .iPhoneBackTap
+        if shortcutStep && !enteredIPhoneBackTap {
+            enteredIPhoneBackTap = true
+            if !flow.iPhoneShortcutPaired { onSetUpIPhoneBackTap() }
+        } else if !shortcutStep {
+            leaveIPhoneBackTap()
+        }
+        let hasEmbeddedPairing = shortcutStep && !iPhonePairingSlot.arrangedSubviews.isEmpty
         let t = now()
         flow.updateTime(at: t)
         // Rebuild only when something visible changed, so the pulsing dot and the activity bar keep running.
-        let (mark, text, sub) = copy.status(flow, at: t)
-        let why = flow.step == .tryIt && !flow.showsShortcutRows ? "" : copy.why(flow.step)
+        let (stageMark, stageText, sub) = copy.status(flow, at: t)
+        let pairingError = shortcutStep ? iPhonePairingError : nil
+        let mark: OnboardingMark = pairingError == nil ? stageMark : .fail
+        let text = pairingError ?? stageText
+        let primaryTitle = pairingError == nil ? copy.primary(flow, at: t) : copy.tryAgain
+        let why = hasEmbeddedPairing || (flow.step == .tryIt && !flow.showsShortcutRows) ? "" : copy.why(flow.step)
         let developerHint = flow.showsDeveloperModeHint(at: t) ? copy.developerModeHint : ""
         let cancellable = flow.showsCancel(setupRunning: setupRunningProbe?() == true, at: t)
-        let signature = "\(developerHint) \(flow.step) \(why) \(mark) \(text) \(sub ?? "") \(copy.primary(flow, at: t)) \(flow.showsPrimary(at: t)) \(flow.skippable) \(cancellable) \(transport ?? "")"
-        guard signature != shown else { return }
+        let prepareActivity = mark == .wait &&
+            (flow.step == .prepare || (flow.step == .wifi &&
+                                       (flow.code == "downloading_image" || flow.code == "preparing_image")))
+        let downloadPercent = prepareActivity ? flow.downloadPercent : nil
+        let signature = "\(developerHint) \(flow.step) \(why) \(mark) \(text) \(sub ?? "") \(primaryTitle) \(flow.showsPrimary(at: t)) \(flow.skippable) \(cancellable) \(transport ?? "") \(downloadPercent != nil) \(verifiedIPhoneShortcutName ?? "") \(hasEmbeddedPairing)"
+        if signature == shown {
+            if let downloadPercent, let readout = downloadReadout, readout.bar.percent != downloadPercent {
+                readout.bar.percent = downloadPercent
+                readout.label.stringValue = (Double(downloadPercent) / 100).formatted(.percent)
+            }
+            return
+        }
         shown = signature
+        downloadReadout = nil
         let inner = SettingsStyle.width - 2 * SettingsStyle.margin
         stack.arrangedSubviews.forEach { stack.removeArrangedSubview($0); $0.removeFromSuperview() }
         stack.addArrangedSubview(label(copy.stepLine(flow), SettingsStyle.sans(12), SettingsStyle.muted))
@@ -678,7 +817,12 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         stack.addArrangedSubview(gap(26))
         stack.addArrangedSubview(label(copy.title(flow.step), SettingsStyle.serif(26), SettingsStyle.ink, width: inner))
         if !why.isEmpty { stack.addArrangedSubview(gap(10)); stack.addArrangedSubview(label(why, SettingsStyle.sans(14), SettingsStyle.muted, width: inner)) }
-        let steps = copy.howto(flow.step)
+        if hasEmbeddedPairing {
+            stack.addArrangedSubview(gap(16))
+            stack.addArrangedSubview(iPhonePairingSlot)
+        }
+        let steps = hasEmbeddedPairing || pairingError != nil ? [] : shortcutStep && flow.iPhoneShortcutPaired
+            ? copy.backTapSteps(shortcutName: verifiedIPhoneShortcutName) : copy.howto(flow.step)
         if !steps.isEmpty {
             stack.addArrangedSubview(gap(22)); stack.addArrangedSubview(hairline(inner))
             for (i, s) in steps.enumerated() {
@@ -695,11 +839,24 @@ final class OnboardingController: NSObject, NSWindowDelegate {
                 stack.addArrangedSubview(row); stack.addArrangedSubview(hairline(inner))
             }
         }
-        if flow.step == .prepare && flow.mark(at: t) == .wait {
-            let bar = SettingsActivityBar(); bar.translatesAutoresizingMaskIntoConstraints = false
-            bar.widthAnchor.constraint(equalToConstant: inner).isActive = true
-            bar.heightAnchor.constraint(equalToConstant: 2).isActive = true
-            stack.addArrangedSubview(gap(18)); stack.addArrangedSubview(bar); bar.animating = true
+        if prepareActivity {
+            let bar = OnboardingDownloadProgress(percent: downloadPercent, label: text)
+            stack.addArrangedSubview(gap(18))
+            if let downloadPercent {
+                let percent = label((Double(downloadPercent) / 100).formatted(.percent),
+                                    SettingsStyle.sans(12.5), SettingsStyle.ink)
+                percent.setContentHuggingPriority(.required, for: .horizontal)
+                percent.setContentCompressionResistancePriority(.required, for: .horizontal)
+                let row = NSStackView(views: [bar, percent])
+                row.alignment = .centerY
+                row.spacing = 10
+                row.widthAnchor.constraint(equalToConstant: inner).isActive = true
+                stack.addArrangedSubview(row)
+                downloadReadout = (bar, percent)
+            } else {
+                bar.widthAnchor.constraint(equalToConstant: inner).isActive = true
+                stack.addArrangedSubview(bar)
+            }
         }
         if flow.showsShortcutRows {
             stack.addArrangedSubview(gap(22)); stack.addArrangedSubview(hairline(inner))
@@ -749,19 +906,22 @@ final class OnboardingController: NSObject, NSWindowDelegate {
             hint.heightAnchor.constraint(equalToConstant: 20).isActive = true
             stack.addArrangedSubview(hint)
         }
-        let backButton = SettingsPill(copy.back, kind: .quiet, target: self, action: #selector(back))
+        let backButton = SettingsPill(copy.back, kind: .quiet, monochrome: shortcutStep, target: self, action: #selector(back))
         backButton.isHidden = !flow.showsBack
         var right: [NSView] = []
         if cancellable { right.append(SettingsPill(copy.cancel, kind: .quiet, target: self, action: #selector(cancelSetup))) }
-        if flow.skippable { right.append(SettingsPill(copy.skip, kind: .quiet, target: self, action: #selector(skip))) }
+        if flow.skippable {
+            right.append(SettingsPill(copy.skip, kind: .quiet, monochrome: shortcutStep, target: self, action: #selector(skip)))
+        }
         if flow.showsStaleAccessHint(at: t) {
             right.append(SettingsPill(copy.reopen, kind: .quiet, target: self, action: #selector(reopen)))
         }
-        if flow.step == .wifi && flow.mark(at: t) == .fail {
+        if flow.step == .wifi && mark == .fail && flow.code != "developer_image_download_failed" {
             right.append(SettingsPill(copy.cableOnly, kind: .quiet, target: self, action: #selector(cableOnly)))
         }
-        if flow.showsPrimary(at: t) {
-            let main = SettingsPill(copy.primary(flow, at: t), kind: .filled, compact: false, target: self, action: #selector(primary))
+        if !hasEmbeddedPairing && flow.showsPrimary(at: t) {
+            let main = SettingsPill(primaryTitle, kind: .filled, compact: false,
+                                    monochrome: shortcutStep, target: self, action: #selector(primary))
             main.keyEquivalent = "\r"
             right.append(main)
         }
@@ -809,6 +969,86 @@ private final class OnboardingSegments: NSView {
         for i in 0..<total {
             (i < filled ? SettingsStyle.ink : SettingsStyle.line).setFill()
             NSBezierPath(roundedRect: NSRect(x: CGFloat(i) * (w + gap), y: 0, width: w, height: bounds.height), xRadius: 1, yRadius: 1).fill()
+        }
+    }
+}
+
+private final class OnboardingDownloadProgress: NSView {
+    private let fill = CALayer()
+    private var animatedWidth: CGFloat = 0
+    var percent: Int? {
+        didSet {
+            needsLayout = true
+            setAccessibilityValue(percent)
+        }
+    }
+
+    init(percent: Int?, label: String) {
+        self.percent = percent
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        heightAnchor.constraint(equalToConstant: 4).isActive = true
+        wantsLayer = true
+        layer?.masksToBounds = true
+        layer?.addSublayer(fill)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.progressIndicator)
+        setAccessibilityLabel(label)
+        if let percent {
+            setAccessibilityMinValue(0)
+            setAccessibilityMaxValue(100)
+            setAccessibilityValue(percent)
+        } else {
+            NSWorkspace.shared.notificationCenter.addObserver(
+                self, selector: #selector(updateMotion),
+                name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
+        }
+    }
+
+    required init?(coder: NSCoder) { return nil }
+
+    @objc private func updateMotion() { needsLayout = true }
+
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = SettingsStyle.line.cgColor
+            fill.backgroundColor = SettingsStyle.ink.cgColor
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    override func layout() {
+        super.layout()
+        let trackWidth = bounds.width
+        let radius = bounds.height / 2
+        let width = percent.map { trackWidth * CGFloat($0) / 100 } ?? trackWidth * 0.24
+        let x = percent == nil ? (trackWidth - width) / 2 : 0
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer?.cornerRadius = radius
+        fill.cornerRadius = min(radius, width / 2)
+        fill.frame = CGRect(x: x, y: 0, width: width, height: bounds.height)
+        CATransaction.commit()
+
+        guard percent == nil, trackWidth > 0, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            fill.removeAnimation(forKey: "slide")
+            return
+        }
+        if animatedWidth != trackWidth || fill.animation(forKey: "slide") == nil {
+            animatedWidth = trackWidth
+            let slide = CABasicAnimation(keyPath: "position.x")
+            slide.fromValue = width / 2
+            slide.toValue = trackWidth - width / 2
+            slide.duration = 1.2
+            slide.autoreverses = true
+            slide.repeatCount = .infinity
+            slide.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            fill.add(slide, forKey: "slide")
         }
     }
 }

@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import tempfile
 
+from artifact_name import artifact_name
+
 root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--payload', type=Path, default=root / 'build/release/Toss.app')
@@ -19,6 +21,7 @@ args = parser.parse_args()
 app = args.payload.resolve()
 out = args.output.resolve(); out.mkdir(parents=True, exist_ok=True)
 info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+package_name = artifact_name(info, 'iPhone+iPad')
 subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
 signature = subprocess.run(['codesign', '-dv', '--verbose=4', str(app)], capture_output=True, text=True, check=True)
 digest = re.search(r'^CDHash=(\w+)$', signature.stderr, re.MULTILINE).group(1)
@@ -35,21 +38,23 @@ metadata = {'CFBundleIdentifier': 'io.github.ashzene.toss.installer' + ('.qa' if
     'CFBundleShortVersionString': info['CFBundleShortVersionString'], 'CFBundleVersion': info['CFBundleVersion'],
     'LSMinimumSystemVersion': '14.0', 'LSUIElement': True, 'NSHighResolutionCapable': True,
     'TossPayloadIdentifier': info['CFBundleIdentifier'], 'TossPayloadHash': digest}
+if 'TossReleaseTag' in info:
+    metadata['TossReleaseTag'] = info['TossReleaseTag']
 (contents / 'Info.plist').write_bytes(plistlib.dumps(metadata))
 subprocess.run(['ditto', str(app), str(resources / 'Toss.app')], check=True)
 shutil.copyfile(app / 'Contents/Resources/Toss.icns', resources / 'Toss.icns')
 shutil.copyfile(root / 'User Guide.txt', resources / 'User Guide.txt')
-for name, target in [('background.tiff', 'background.tiff'), ('guide.icns', 'Guide.icns')]:
-    shutil.copyfile(root / 'Assets/DmgWindow' / name, resources / target)
+for source_asset, target in [('background.tiff', 'background.tiff'), ('guide.icns', 'Guide.icns')]:
+    shutil.copyfile(root / 'Assets/DmgWindow' / source_asset, resources / target)
 subprocess.run(['codesign', '--force', '--sign', args.identity, str(installer)], check=True)
 subprocess.run(['codesign', '--verify', '--deep', '--strict', str(installer)], check=True)
 if not args.no_dmg:
-    dmg = out / f"Toss {info['CFBundleShortVersionString']} Nightly for iPhone+iPad.dmg"
+    dmg = out / (package_name + '.dmg')
     with tempfile.TemporaryDirectory(prefix='toss-native-install-', dir='/private/tmp') as scratch:
         stage = Path(scratch) / 'stage'; stage.mkdir()
         subprocess.run(['ditto', str(installer), str(stage / installer.name)], check=True)
         image = Path(scratch) / 'Toss.dmg'
-        subprocess.run(['hdiutil', 'create', '-quiet', '-volname', 'Toss ' + info['CFBundleShortVersionString'] + ' iPhone+iPad',
+        subprocess.run(['hdiutil', 'create', '-quiet', '-volname', package_name,
             '-srcfolder', str(stage), '-format', 'ULMO', str(image)], check=True)
         subprocess.run(['hdiutil', 'verify', str(image)], check=True)
         shutil.copyfile(image, dmg)
