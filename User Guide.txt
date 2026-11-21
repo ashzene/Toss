@@ -34,9 +34,11 @@ Capture into the current chat
 Toss brings the target app forward and adds one new screenshot to its current chat. It preserves the existing draft and attachments. Review the attachment and send the message yourself. It never sends automatically or retries a paste that may already have happened.
 
 Trigger Toss from iPhone
-1. Pair the iPhone in Toss on the Mac. As soon as pairing succeeds, Toss opens the Apple Shortcuts setup form and fills it in. Click Add Shortcut once. Toss checks the connection so Shortcuts can show its permission prompt immediately. If prompted, click Allow, then wait for iCloud to sync to your iPhone.
+1. Pair the iPhone in Toss on the Mac. Toss fills in the Apple Shortcuts setup form. Click Add Shortcut and allow access if asked. This check runs on the Mac. If Shortcuts sync is on, the configured shortcut can then appear on iPhone.
 2. On iPhone, open Settings → Accessibility → Touch → Back Tap. Choose Toss iPhone under Double Tap or Triple Tap. Turn off Show Banner on the Back Tap screen to keep its notice out of screenshots. On an iPhone with an Action button, you can also select Toss iPhone in Settings → Action Button → Shortcut.
-3. If Shortcuts does not sync, open Toss Settings → More → iPhone Shortcut → Send to iPhone and select your phone. Open the received file, paste the configuration Toss copied when Shortcuts asks, and add it.
+3. If Toss iPhone is missing on your phone, or to update an older Toss Tap, open Toss Settings → More → iPhone Shortcut → Pair on iPhone on your Mac. Click Copy pairing configuration to use Universal Clipboard. Without Universal Clipboard, click AirDrop pairing text, send it to your own iPhone, open Toss Pairing.txt in Files and copy the entire line.
+4. Click Send via AirDrop in the same Mac window to send the Toss Tap shortcut to the iPhone. Paste the configuration when Shortcuts asks during setup, then tap Add Shortcut. Choose Replace if Toss Tap is already installed. You can now delete the pairing text file if you received one.
+5. Use the iPhone Camera to scan the verification code in the Mac window. Tap the prompt to run Toss Tap and choose Always Allow if Shortcuts asks to connect to your Mac. The window closes when the Mac verifies the phone. On iPhone, choose the new Toss Tap in Settings → Accessibility → Touch → Back Tap → Double Tap. Open the page you want to capture and double-tap the back of the phone.
 
 Keep the iPhone unlocked, connect both devices to the same local network, and leave Toss shortcuts enabled and the chosen chat app open on the Mac. The shortcut captures the paired iPhone and adds the screenshot to the current draft. Change the destination or turn off the phone trigger in Toss Settings → More → iPhone Shortcut.
 

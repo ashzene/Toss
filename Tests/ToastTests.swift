@@ -277,7 +277,6 @@ enum ToastTests {
         check(app.contains("startingQueuedPress = press.queued") &&
               app.contains("CapturePipeline.bindingMissing(queued: press.queued"),
               "a single key retains the ordinary activation and automatic-paste path")
-        check(app.contains(".now() + CaptureProgressPolicy.noticeDelay"), "pipeline and worker use the same two-second notice threshold")
         check(order("Sources/TossApp.swift", ["CaptureReceipt.validate(", "clipboard.publish(file: early.image)", "manualDeliveryPaused = true"],
                     from: "private func finishTargetlessCapture"), "failed early target lookup preserves a validated arrived image for manual paste")
 

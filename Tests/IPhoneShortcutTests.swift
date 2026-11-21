@@ -94,7 +94,14 @@ struct IPhoneShortcutTests {
         let receiver = IPhoneShortcutReceiver(port: port)
         defer { receiver.stop() }
         var admitted = 0
-        try receiver.start(secret: secret, onFailure: { preconditionFailure("Receiver did not start") }) {
+        var macChecks = 0, remoteEvents = 0
+        precondition(!IPhoneShortcutReceiver.isRemotePeer(.ipv4(.loopback)))
+        precondition(!IPhoneShortcutReceiver.isRemotePeer(.ipv6(.loopback)))
+        precondition(!IPhoneShortcutReceiver.isRemotePeer(NWEndpoint.Host("::ffff:127.0.0.1")))
+        precondition(IPhoneShortcutReceiver.isRemotePeer(NWEndpoint.Host("192.0.2.47")))
+        try receiver.start(secret: secret, onFailure: { preconditionFailure("Receiver did not start") },
+                           onLocalAuthorization: { macChecks += 1 }, onProofMismatch: { remoteEvents += 1 },
+                           onRemoteVerified: { remoteEvents += 1 }) {
             admitted += 1
             return .accepted
         }
@@ -112,13 +119,13 @@ struct IPhoneShortcutTests {
         precondition(status == 200 && UUID(uuidString: nonce) != nil)
         let validPath = capturePath(nonce, secret: secret)
         let wrong = try await request(capturePath(nonce, secret: "wrong"), method: "POST")
-        precondition(wrong.0 == 403 && admitted == 0)
+        precondition(wrong == (403, "TOSS_PAIRING_REQUIRED") && admitted == 0)
         let get = try await request(validPath)
         precondition(get.0 == 404 && admitted == 0)
         let accepted = try await request(validPath, method: "POST")
         precondition(accepted.0 == 204 && admitted == 1)
         let replay = try await request(validPath, method: "POST")
-        precondition(replay.0 == 403 && admitted == 1)
+        precondition(replay == (403, "") && admitted == 1)
         let (pastedStatus, pastedNonce) = try await request(IPhoneShortcutHandshake.challengePath)
         precondition(pastedStatus == 200 && UUID(uuidString: pastedNonce) != nil)
         let wrongPasted = try await request(capturePath(pastedNonce, secret: "wrong\n"), method: "POST")
@@ -138,6 +145,14 @@ struct IPhoneShortcutTests {
         precondition(authorizationReplay.0 == 403 && admitted == 2)
         let phoneCapture = try await request(capturePath(phoneNonce, secret: secret), method: "POST")
         precondition(phoneCapture.0 == 204 && admitted == 3, "An authorization check must not block concurrent phone captures")
+        let (pairStatus, pairNonce) = try await request(IPhoneShortcutHandshake.pairingPath)
+        precondition(pairStatus == 200 && UUID(uuidString: pairNonce) != nil)
+        let pairReceipt = try await request(capturePath(pairNonce, secret: secret), method: "POST")
+        precondition(pairReceipt == (200, "TOSS_PAIRED") && admitted == 3)
+        let (_, completeNonce) = try await request(IPhoneShortcutHandshake.pairingCompletePath)
+        let completion = try await request(capturePath(completeNonce, secret: secret), method: "POST")
+        precondition(completion == (200, "TOSS_SETUP_COMPLETE") && admitted == 3)
+        precondition(macChecks == 1 && remoteEvents == 0, "Local requests must not confirm a phone or display phone repair")
         receiver.stop()
         do {
             _ = try await request(IPhoneShortcutHandshake.challengePath)

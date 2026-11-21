@@ -78,8 +78,13 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     private var checkMenuItem: NSMenuItem?
     private var forgetMenuItem: NSMenuItem?
     private var iPhoneShortcutMenuItem: NSMenuItem?
+    private var iPhoneShortcutSetupButton: NSButton?
     private let iPhoneShortcutReceiver = IPhoneShortcutReceiver()
     private let iPhoneShortcutImport = IPhoneShortcutImport()
+    private let iPhonePairingPanel = IPhoneShortcutPairingPanel()
+    private var iPhoneShortcutSessionSecret: String?
+    private var iPhoneShortcutMismatchShown = false
+    private var iPhoneShortcutVerified = false
     private var offeredIPhoneShortcutHashes: Set<String> = []
     private var lastSetupCode = "not_run"
     private var setupDeviceHash: String?
@@ -525,6 +530,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         let menu = NSMenu()
         _ = add(menu, L("Settings…", "设置…"), #selector(showSettings))
+        _ = add(menu, L("About Toss", "关于 Toss"), #selector(showAbout))
         menu.addItem(.separator())
         statusItem = NSMenuItem(title: L("Status: Disabled", "状态：已关闭"), action: nil, keyEquivalent: "")
         menu.addItem(statusItem)
@@ -577,6 +583,10 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self,
             selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(hideIPhonePairingPanel),
+            name: NSWorkspace.sessionDidResignActiveNotification, object: nil)
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(hideIPhonePairingPanel),
+            name: Notification.Name("com.apple.screenIsLocked"), object: nil)
         for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didActivateApplicationNotification,
                      NSWorkspace.didTerminateApplicationNotification] {
             NSWorkspace.shared.notificationCenter.addObserver(self,
@@ -596,6 +606,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         let mainMenu = NSMenu()
         let appEntry = NSMenuItem()
         let appMenu = NSMenu(title: "Toss")
+        _ = add(appMenu, L("About Toss", "关于 Toss"), #selector(showAbout))
+        appMenu.addItem(.separator())
         _ = add(appMenu, L("Connection Status", "连接状态"), #selector(showMenuStatus))
         _ = add(appMenu, L("Settings…", "设置…"), #selector(showSettings))
         appMenu.addItem(.separator())
@@ -744,6 +756,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         pairState = pairStatus
         let pairButton = SettingsPill(hasPairing ? L("Check", "检查") : L("Pair", "配对"), kind: .filled, target: self, action: #selector(runSetup))
         setupButtons = [pairButton]
+        let phoneShortcut = SettingsPill(L("iPhone Shortcut…", "iPhone 快捷指令…"), target: self, action: #selector(configureIPhoneShortcut))
+        iPhoneShortcutSetupButton = phoneShortcut
         let accessDetail = detail(L("Turn on Toss in System Settings.", "在系统设置里打开 Toss。"))
         permissionHint = accessDetail
         let accessStatus = SettingsStatus()
@@ -765,7 +779,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         notifications.setAccessibilityLabel(ToastCopy.strings().notifications)
         notifications.state = toastPreferences.enabled ? .on : .off
         toastToggle = notifications
-        place(list([row(DeviceCopy.label, pairDetail, [pairStatus, pairButton]),
+        place(list([row(DeviceCopy.label, pairDetail, [pairStatus, pairButton, phoneShortcut]),
                     row(L("Accessibility", "辅助功能"), accessDetail, [accessStatus, accessButtonView]),
                     row(L("Connection", "连接"), networkDetailView, [networkStatus, networkButtonView]),
                     row(L("Launch at login", "登录时打开"), loginNote, [login]),
@@ -902,6 +916,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         forgetMenuItem?.isEnabled = paired && !pairing && !hasActiveWork
         iPhoneShortcutMenuItem?.isHidden = !pairedDeviceClasses.contains(.iPhone)
         iPhoneShortcutMenuItem?.isEnabled = !pairing
+        iPhoneShortcutSetupButton?.isHidden = pairing || !pairedDeviceClasses.contains(.iPhone) || iPhoneShortcutVerified
 
         accessState?.show(access ? L("Allowed", "已允许") : nil, dot: SettingsStyle.ok)
         accessButton?.isHidden = access
@@ -1019,13 +1034,33 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         window.setFrame(frame, display: true)
     }
 
+    private var tryItReadiness: OnboardingTryItReadiness {
+        if setupRunning || enableTask != nil || lastCode == "preparing_accessibility" { return .preparing }
+        if !enabled {
+            if !permissionsReady || lastCode == "enable_failed" || lastCode == "restore_failed" { return .unavailable }
+            if startup.firstEnableDone && !startup.desiredEnabled { return .shortcutsOff }
+            return runningTargetKinds().isEmpty ? .waitingForChat : .preparing
+        }
+        let connections = deviceConnections
+        // The onboarding tries the device just paired, even when another is already connected.
+        let device = onboarding?.flow.deviceClass ?? pairedDeviceClass
+        switch device.flatMap({ connections[$0] })?.state ?? .notChecked {
+        case .ready: return .ready
+        case .notChecked, .connecting: return .preparing
+        case .disconnected, .failed: return .deviceUnavailable
+        }
+    }
+
     // Read-only presentation of the live worker and the current transaction.
     // "Enabled" alone is never treated as evidence of an iPad connection.
     private func refreshMenuStatus() {
         var phase = TossTransferPhase.from(code: lastCode)
         if !capturePipeline.running.isEmpty || (phase == .preparing && earlyCapture != nil) { phase = .uploading }
         let summary = statusSummary
-        onboarding?.setTransport(currentConnection.state == .ready ? currentConnection.transportLabel : nil)
+        if let onboarding {
+            onboarding.setTryItReadiness(tryItReadiness)
+            onboarding.setTransport(currentConnection.state == .ready ? currentConnection.transportLabel : nil)
+        }
         menuStatus?.update(.init(connection: currentConnection,
             phase: phase, paired: hasPairing, enabled: enabled,
             canRecheck: !sleeping && !hasActiveWork && !anyWorkerBusy &&
@@ -1065,6 +1100,11 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     @objc private func showMenuStatus() {
         refreshMenuStatus()
         menuStatus?.showPanel()
+    }
+
+    @objc private func showAbout() {
+        NSApp.orderFrontStandardAboutPanel(nil)
+        NSApp.activate()
     }
 
     @objc private func showSettings() {
@@ -1631,8 +1671,13 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         // Paired with only USB working still turns the shortcuts on: Toss is never left dead,
         // but the onboarding stays on its wireless step and the status stays grey.
         guard result.code == "ready" || (result.code == "wifi_unreachable" && hasPairing) else { return }
-        if permissionsReady { autoEnableIfFirstRun() }
-        else if onboarding?.isVisible != true { lastPermissionStep = "accessibility"; requestMissingPermissions() }
+        if permissionsReady {
+            restoreIfPossible()
+            autoEnableIfFirstRun()
+        } else if onboarding?.isVisible != true {
+            lastPermissionStep = "accessibility"
+            requestMissingPermissions()
+        }
         offerIPhoneShortcutIfNeeded()
     }
 
@@ -1789,6 +1834,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         let controller = onboarding ?? makeOnboarding()
         controller.setAccessibility(permissionsReady)
+        controller.setTryItReadiness(tryItReadiness)
         // Back from "Reopen Toss": continue on the Accessibility step.
         if UserDefaults.standard.bool(forKey: OnboardingPolicy.resumeAccessKey) {
             UserDefaults.standard.removeObject(forKey: OnboardingPolicy.resumeAccessKey)
@@ -1914,6 +1960,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
                 UserDefaults.standard.removeObject(forKey: IPhoneShortcutSettings.key)
                 self.iPhoneShortcutReceiver.stop()
                 self.iPhoneShortcutImport.cancel()
+                self.setIPhoneShortcutSession(nil)
+                if let forgottenHash { self.offeredIPhoneShortcutHashes.remove(forgottenHash) }
             }
             let rest = Array(kinds.dropFirst())
             if result.code == "not_paired", !rest.isEmpty {
@@ -2946,21 +2994,64 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
               settings.isEnabled, pairedUSBSetupHashes()[DeviceClass.iPhone.rawValue] == settings.deviceHash else {
             iPhoneShortcutReceiver.stop()
             iPhoneShortcutImport.cancel()
+            setIPhoneShortcutSession(nil)
             return false
         }
+        setIPhoneShortcutSession(settings.secret)
         let showFailure = { [weak self] in
             guard reportFailure else { return }
             self?.showAlert(L("iPhone Shortcut Unavailable", "iPhone 快捷指令暂不可用"),
                             L("Toss could not start receiving requests. Reopen Toss and try again.", "Toss 无法接收请求。请重新打开 Toss 再试。"))
         }
         do {
-            try iPhoneShortcutReceiver.start(secret: settings.secret, onFailure: showFailure) { [weak self] in
+            try iPhoneShortcutReceiver.start(secret: settings.secret, onFailure: showFailure, onLocalAuthorization: {
+                try? IPhoneShortcutSettings.markImportPrepared(secret: settings.secret)
+            }, onProofMismatch: { [weak self] in
+                self?.suggestIPhonePairing(secret: settings.secret)
+            }, onRemoteVerified: { [weak self] in
+                guard let self, self.iPhoneShortcutSessionSecret == settings.secret else { return }
+                if !self.iPhoneShortcutVerified {
+                    try? IPhoneShortcutSettings.markImportPrepared(secret: settings.secret)
+                    self.iPhoneShortcutVerified = true
+                    self.iPhoneShortcutSetupButton?.isHidden = true
+                }
+                self.hideIPhonePairingPanel()
+            }) { [weak self] in
                 self?.receiveIPhoneShortcut(secret: settings.secret) ?? .unavailable("")
             }
             return true
         } catch {
             showFailure()
             return false
+        }
+    }
+
+    private func setIPhoneShortcutSession(_ secret: String?) {
+        guard secret != iPhoneShortcutSessionSecret else { return }
+        hideIPhonePairingPanel()
+        iPhoneShortcutSessionSecret = secret
+        iPhoneShortcutMismatchShown = false
+        iPhoneShortcutVerified = false
+    }
+
+    @objc private func hideIPhonePairingPanel() { iPhonePairingPanel.dismiss() }
+
+    private var canShowIPhonePairing: Bool {
+        guard !screensAsleep, !sleeping, !terminating, !uninstalling,
+              let session = CGSessionCopyCurrentDictionary() as? [String: Any],
+              session[kCGSessionOnConsoleKey as String] as? Bool == true else { return false }
+        return session["CGSSessionScreenIsLocked"] as? Bool != true
+    }
+
+    private func suggestIPhonePairing(secret: String) {
+        guard !iPhoneShortcutMismatchShown, iPhoneShortcutSessionSecret == secret, canShowIPhonePairing else { return }
+        iPhoneShortcutMismatchShown = true
+        iPhonePairingPanel.showMismatch { [weak self] in
+            guard let self, self.iPhoneShortcutSessionSecret == secret,
+                  let current = IPhoneShortcutSettings.load(), current.secret == secret, current.isEnabled,
+                  self.pairedUSBSetupHashes()[DeviceClass.iPhone.rawValue] == current.deviceHash,
+                  let address = IPhoneShortcutHandshake.localAddress, self.canShowIPhonePairing else { return }
+            self.iPhonePairingPanel.showPairing(address: address, secret: secret)
         }
     }
 
@@ -2983,7 +3074,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             ? .accepted : .unavailable(L("Toss is busy. Try again in a moment.", "Toss 正忙，请稍后再试。"))
     }
 
-    private enum IPhoneShortcutAction: Int { case addAgain = 1100, airDrop }
+    private enum IPhoneShortcutAction: Int { case addAgain = 1100, pairOnPhone }
 
     private func offerIPhoneShortcutIfNeeded() {
         // The guide can still be open on Try It after pairing has completed.
@@ -3013,8 +3104,13 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         }
         let alert = NSAlert()
         alert.messageText = L("iPhone Shortcut…", "iPhone 快捷指令…")
-        alert.informativeText = L("Add Toss iPhone on this Mac, then click Allow if Shortcuts asks. After it syncs to your iPhone, choose Toss iPhone in Settings → Accessibility → Touch → Back Tap.",
-                                  "在 Mac 上添加 Toss iPhone。如果「快捷指令」弹出授权提示，点允许。同步到 iPhone 后，在「设置 → 辅助功能 → 触控 → 轻点背面」选 Toss iPhone。")
+        alert.informativeText = L("Add Toss iPhone on this Mac and allow access if asked. After it syncs, choose Toss iPhone in iPhone Settings → Accessibility → Touch → Back Tap. If it is missing or won’t connect, choose Pair on iPhone.",
+                                  "在 Mac 上添加 Toss iPhone，系统询问权限时点「允许」。同步后，在 iPhone「设置 → 辅助功能 → 触控 → 轻点背面」选 Toss iPhone。如果手机上找不到捷径或连不上，点「在 iPhone 上配对」。")
+        if enabled {
+            alert.informativeText += "\n\n" + (iPhoneShortcutVerified
+                ? L("Toss verified an iPhone request this session.", "Toss 本次运行已验证来自 iPhone 的请求。")
+                : L("Waiting for the first request from iPhone this session.", "Toss 本次运行正在等待 iPhone 的首次请求。"))
+        }
         let file = IPhoneShortcutImport.bundledFile
         func setupButton(_ title: String, action: IPhoneShortcutAction) -> NSButton {
             let button = NSButton(title: title, target: self, action: #selector(finishIPhoneShortcutAccessory(_:)))
@@ -3022,10 +3118,10 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             button.isEnabled = file != nil
             return button
         }
-        let airDrop = setupButton(L("Send to iPhone…", "传到 iPhone…"), action: .airDrop)
+        let pairOnPhone = setupButton(L("Pair on iPhone…", "在 iPhone 上配对…"), action: .pairOnPhone)
         var views: [NSView] = [popup]
         if enabled { views.append(setupButton(L("Add Again…", "重新添加…"), action: .addAgain)) }
-        views.append(airDrop)
+        views.append(pairOnPhone)
         let controls = NSStackView(views: views)
         controls.spacing = 12
         controls.frame.size = controls.fittingSize
@@ -3058,8 +3154,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             guard let settings = self.saveIPhoneShortcut(for: hash, destination: destination) else { return }
-            if action == .airDrop {
-                self.sendIPhoneShortcut(file, address: address, settings: settings)
+            if action == .pairOnPhone {
+                if self.canShowIPhonePairing { self.iPhonePairingPanel.showPairing(address: address, secret: settings.secret) }
             } else {
                 self.openIPhoneShortcut(file, address: address, settings: settings)
             }
@@ -3093,24 +3189,10 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
                   let current = IPhoneShortcutSettings.load(), current.isEnabled else { return false }
             return current.secret == settings.secret &&
                 self.pairedUSBSetupHashes()[DeviceClass.iPhone.rawValue] == settings.deviceHash
-        }, onAdded: {
-            try? IPhoneShortcutSettings.markImportPrepared(secret: settings.secret)
         }, onFailure: { [weak self] in
             self?.showAlert(L("iPhone Shortcut Unavailable", "iPhone 快捷指令暂不可用"),
-                            L("Could not open Apple Shortcuts. Try Send to iPhone in Toss.", "无法打开苹果的「快捷指令」。可在 Toss 里点「传到 iPhone」。"))
+                            L("Could not open Apple Shortcuts. Choose Pair on iPhone in Toss.", "无法打开苹果的「快捷指令」。请在 Toss 里点「在 iPhone 上配对」。"))
         })
-    }
-
-    private func sendIPhoneShortcut(_ file: URL, address: String, settings: IPhoneShortcutSettings) {
-        guard let airDrop = NSSharingService(named: .sendViaAirDrop), airDrop.canPerform(withItems: [file]) else {
-            showAlert(L("iPhone Shortcut Unavailable", "iPhone 快捷指令暂不可用"),
-                      L("AirDrop is unavailable. Check Wi-Fi and Bluetooth on both devices.", "隔空投送暂不可用。请检查两台设备的 Wi-Fi 和蓝牙。"))
-            return
-        }
-        let clipboard = NSPasteboard.general
-        clipboard.clearContents()
-        clipboard.setString(address + "|" + settings.secret, forType: .string)
-        airDrop.perform(withItems: [file])
     }
 
     // A black screenshot means that device is off: hand the press to the other one, once, if it is connected.
@@ -3230,6 +3312,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
             return false
         }
         if capturePipeline.running.count + capturePipeline.waitingCount > 1 { busyRepeatsTotal += 1 }
+        captureAnimation.detachToast()
+        updateTransferNotice()
         pumpCaptures()
         // A busy press binds at admission. The first press uses the ordinary
         // activate/locate path immediately, including when its app is in the back.
@@ -3288,12 +3372,6 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         if press.allowsDeviceFallback, lockedAlternate(for: slot) != nil {
             finishWithoutTransfer(reason: "alternate_device_locked")
             return
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + CaptureProgressPolicy.noticeDelay) { [weak self] in
-            guard let self, self.pipelineCaptures[press.id]?.uuid == uuid ||
-                (self.deliveryCaptureID == uuid && self.core.isBusy) else { return }
-            self.slowPipelineIDs.insert(uuid)
-            self.updateTransferNotice()
         }
         let worker = captureWorkers[slot]!
         do {
@@ -3362,20 +3440,23 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateTransferNotice() {
-        let candidates = capturePipeline.running.values.sorted { $0.at < $1.at } + capturePipeline.ready
-        let current = deliveryCaptureID.flatMap { core.isBusy && slowPipelineIDs.contains($0) ? $0 : nil }
-        let waiting = candidates.compactMap { pipelineCaptures[$0.id]?.uuid }
-            .first { slowPipelineIDs.contains($0) }
-        guard let uuid = current ?? waiting else { captureAnimation.hideTransferNotice(); return }
-        let progress = pipelineProgress[uuid]
+        guard let press = capturePipeline.transferNoticePress(deliveryActive: core.isBusy) else {
+            captureAnimation.hideTransferNotice()
+            return
+        }
+        // The press already exists while queued, before a worker assigns a transfer UUID.
+        let uuid = capturePipeline.delivering?.id == press.id ? deliveryCaptureID : pipelineCaptures[press.id]?.uuid
+        let progress = uuid.flatMap { pipelineProgress[$0] }
+        let queued = capturePipeline.waiting.filter { $0.id != press.id }.count
         let title = TransferNotice.text(received: progress?.received ?? 0,
-            expected: progress?.expected ?? 0, queued: capturePipeline.waitingCount)
-        captureAnimation.showTransferNotice(title, requestID: uuid) { [weak self] in
-            guard let self, self.slowPipelineIDs.contains(uuid),
-                  self.deliveryCaptureID == uuid || self.pipelineCaptures.values.contains(where: { $0.uuid == uuid }) else { return }
+            expected: progress?.expected ?? 0, queued: queued)
+        captureAnimation.showTransferNotice(title, requestID: String(press.id)) { [weak self] in
+            guard let self, self.capturePipeline.transferNoticePress(deliveryActive: self.core.isBusy)?.id == press.id else { return }
             self.cancelCurrent()
         }
-        if !core.isBusy { setStatus(title.replacingOccurrences(of: "\n", with: " · "), code: "capture_slow") }
+        if !core.isBusy, let uuid, slowPipelineIDs.contains(uuid) {
+            setStatus(title.replacingOccurrences(of: "\n", with: " · "), code: "capture_slow")
+        }
     }
 
     // Only a complete, valid image survives a link-wide failure. A pending request is
@@ -3464,6 +3545,7 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func willSleep() {
         sleeping = true
+        hideIPhonePairingPanel()
         iPhoneShortcutReceiver.stop()
         iPhoneShortcutImport.cancel()
         // Do not carry an in-flight keypress or old wireless transport across
@@ -3747,6 +3829,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
         stop(reason: L("Quit", "退出")); NSApp.terminate(nil)
     }
     func applicationWillTerminate(_ notification: Notification) {
+        setIPhoneShortcutSession(nil)
+        iPhonePairingPanel.removeStagedFile()
         iPhoneShortcutReceiver.stop()
         iPhoneShortcutImport.cancel()
         stopUSBSetupObserver()
@@ -3948,6 +4032,8 @@ final class TossDelegate: NSObject, NSApplicationDelegate {
     // Stop event sources without the normal capture cleanup's path-based file
     // removals. The allowlist remover owns ALL file deletion during uninstall.
     private func quiesceForUninstall() {
+        setIPhoneShortcutSession(nil)
+        iPhonePairingPanel.removeStagedFile()
         stopUSBSetupObserver()
         iPhoneShortcutReceiver.stop()
         iPhoneShortcutImport.cancel()

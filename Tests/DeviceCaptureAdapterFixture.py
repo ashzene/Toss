@@ -5,7 +5,7 @@ source, scaffold, destination = map(Path, sys.argv[1:])
 text = source.read_text()
 names = ['deviceThatIsOn', 'lockedAlternate', 'selectCapture', 'selectionDeadline', 'retargetPipelineCapture', 'retargetCapture', 'admitCapture',
          'pumpCaptures', 'startPipelineCapture', 'fallBackFromBlackFrame', 'receivePipelineCapture', 'startQueuedPress', 'deliverCaptureResult',
-         'startCapture', 'isCurrentActivation', 'locateAfterActivation']
+         'startCapture', 'isCurrentActivation', 'locateAfterActivation', 'updateTransferNotice']
 methods = []
 for name in names:
     found = list(re.finditer(r'^    private func ' + name + r'\(.*?^    \}', text, re.M | re.S))

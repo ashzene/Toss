@@ -26,6 +26,11 @@ struct DeviceCapturePipeline {
     var waitingCount: Int { waiting.count }
     var isBusy: Bool { !waiting.isEmpty || !running.isEmpty || !ready.isEmpty || delivering != nil }
 
+    func transferNoticePress(deliveryActive: Bool) -> Press? {
+        if deliveryActive, let delivering { return delivering }
+        return ready.first ?? running.values.min { $0.at < $1.at } ?? waiting.first
+    }
+
     func press(at: Double) -> Press? {
         (waiting + Array(running.values) + ready + [delivering].compactMap { $0 }).first { $0.at == at }
     }

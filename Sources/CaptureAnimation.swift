@@ -318,8 +318,7 @@ enum CapturePatchSample {
     }
 }
 
-// The corner shows only the result toast: 280 x 56, 16 pt from the visible frame's
-// right and bottom edges. Nothing is shown there while capturing.
+// Progress and results share a 280 x 56 card, inset 16 pt from the visible corner.
 enum CaptureCardLayout {
     static let width: CGFloat = 280
     static let height: CGFloat = 56
@@ -525,9 +524,10 @@ final class CaptureAnimation {
 
     // All lifecycle methods return immediately. In particular, none must be
     // awaited before capture, paste, verification, or the confirmation sound.
-    // Nothing appears in the corner while capturing; begin only remembers the screen.
+    // Admission may already have shown progress before the delivery transaction starts.
     func begin(requestID: UInt64, screen: NSScreen? = nil) {
-        dismiss()
+        let keepProgress = transferNoticeShowing && transferNoticeRequestID != nil
+        dismiss(preservingTransferNotice: keepProgress)
         state.begin(requestID)
         lastArrivalStatus = "idle"
         confirmedOffset = nil
@@ -535,6 +535,7 @@ final class CaptureAnimation {
             $0.frame.contains(NSEvent.mouseLocation)
         }) ?? NSScreen.main
         guard let toastScreen else { return }
+        if keepProgress { panel?.setFrameOrigin(CaptureCardLayout.panelFrame(in: toastScreen.visibleFrame).origin) }
         if !reduceMotion { spareFlight = Self.makePanel(frame: toastScreen.frame, allSpaces: false, prepared: true) }
         spareToast = Self.makePanel(frame: CaptureCardLayout.panelFrame(in: toastScreen.visibleFrame),
                                     allSpaces: true, prepared: true)
@@ -755,7 +756,7 @@ final class CaptureAnimation {
         pointerShield = nil
     }
 
-    func dismiss() {
+    func dismiss(preservingTransferNotice: Bool = false) {
         if flightPanel != nil && lastArrivalStatus == "landing" { lastArrivalStatus = "cancelled" }
         dismissal?.cancel()
         dismissal = nil
@@ -764,13 +765,16 @@ final class CaptureAnimation {
         earlyTileAX = nil
         thumbnail = nil
         clearFlight()
-        feedback?.clear()
-        panel?.orderOut(nil)
-        panel?.contentView = nil
-        feedback = nil
-        panel = nil
+        if !preservingTransferNotice {
+            feedback?.clear()
+            panel?.orderOut(nil)
+            panel?.contentView = nil
+            feedback = nil
+            panel = nil
+            transferNoticeShowing = false
+            transferNoticeRequestID = nil
+        }
         toastFadeAt = nil
-        transferNoticeShowing = false
         spareFlight?.orderOut(nil)
         spareToast?.orderOut(nil)
         spareFlight = nil
@@ -857,6 +861,10 @@ final class CaptureAnimation {
         panel.ignoresMouseEvents = onCancel == nil
         panel.alphaValue = 1
         panel.orderFrontRegardless()
+        if requestID != nil {
+            panel.displayIfNeeded()
+            CATransaction.flush()
+        }
     }
 
     func hideTransferNotice() {

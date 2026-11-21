@@ -7,6 +7,29 @@ struct DeviceCapturePipelineTests {
         precondition(value(), label); checks += 1
     }
     static func main() {
+        do {
+            var pipeline = DeviceCapturePipeline()
+            let first = pipeline.admit(.options, at: 1, deviceClass: .iPad)!
+            let phone = pipeline.admit(.shifts, at: 2, deviceClass: .iPhone, source: .iPhoneShortcut)!
+            let next = pipeline.admit(.options, at: 3, deviceClass: .iPad)!
+            check(pipeline.transferNoticePress(deliveryActive: false) == first, "first waiting press is visible before either worker starts")
+            _ = pipeline.startAvailable()
+            check(pipeline.transferNoticePress(deliveryActive: false) == first, "oldest running press is visible across devices")
+            _ = pipeline.completed(phone.id, slot: .iPhone)
+            check(pipeline.transferNoticePress(deliveryActive: false) == phone, "a ready image takes the next delivery slot")
+            _ = pipeline.takeForTargeting()
+            _ = pipeline.completed(first.id, slot: .iPad)
+            _ = pipeline.startAvailable()
+            check(pipeline.transferNoticePress(deliveryActive: true) == phone, "active delivery has priority over ready and running work")
+            check(pipeline.transferNoticePress(deliveryActive: false) == first, "a completed delivery gives way to the next ready image")
+            pipeline.deliveryFinished()
+            _ = pipeline.takeForTargeting()
+            pipeline.deliveryFinished()
+            check(pipeline.transferNoticePress(deliveryActive: false) == next, "the remaining worker owns the notice")
+            _ = pipeline.completed(next.id, slot: .iPad)
+            _ = pipeline.takeForTargeting()
+            check(pipeline.transferNoticePress(deliveryActive: false) == nil, "finished work cannot replace its own result with a transfer notice")
+        }
         var drop = USBDropNotice()
         check(!drop.shouldShow(.iPhone, externalConnected: false, usbBack: false, at: 1), "really unplugged: no notice")
         check(!drop.shouldShow(.iPhone, externalConnected: nil, usbBack: false, at: 1), "unknown power: no notice")

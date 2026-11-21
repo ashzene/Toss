@@ -1,6 +1,5 @@
 import Foundation
 
-func L(_ en: String, _ zh: String) -> String { en }
 enum TargetKind: String { case chatGPT, claude; var displayName: String { rawValue } }
 protocol ChatLease { var name: String { get }; func sameDestination(as other: any ChatLease) -> Bool }
 extension ChatLease { func sameDestination(as other: any ChatLease) -> Bool { name == other.name } }
@@ -61,6 +60,7 @@ struct CaptureRecord {
     let kind: DeviceClass
     var pending: Pending?
     var starts: [String] = []
+    var onCaptureStart: ((String) -> Void)?
     var isBusy: Bool { pending != nil }
     struct Connection { enum State { case ready, failed }; var state = State.ready }
     var connectionStatus = Connection()
@@ -70,6 +70,7 @@ struct CaptureRecord {
         precondition(configuration.deviceClass == kind, "worker device mismatch")
         precondition(pending == nil, "overlapping same-device RPC")
         precondition(file.lastPathComponent.hasPrefix(kind.rawValue + "-"), "wrong image device filename")
+        onCaptureStart?(requestID)
         starts.append(requestID); pending = Pending(id: requestID, file: file, done: completion)
     }
     func finish(reason: String? = nil) {
@@ -80,7 +81,6 @@ struct CaptureRecord {
         request.done(data, reason == nil ? 0 : 1)
     }
 }
-enum CaptureProgressPolicy { static let noticeDelay = 2.0 }
 @MainActor final class DeviceCaptureAdapterFixture {
     struct EarlyCapture {
         let id: UInt64; let uuid: String; let image: URL; let deviceClass: DeviceClass
@@ -99,11 +99,25 @@ enum CaptureProgressPolicy { static let noticeDelay = 2.0 }
     }
     final class Animation {
         var isLanding = false
-        func begin(requestID: UInt64) {}
-        func showTransferNotice(_ text: String) {}
+        var holdingResult = false
+        var noticeID: String?
+        var noticeText: String?
+        var cancelNotice: (() -> Void)?
+        func begin(requestID: UInt64) { hideTransferNotice() }
+        func showTransferNotice(_ text: String, requestID: String? = nil, onCancel: (() -> Void)? = nil) {
+            guard !holdingResult else { return }
+            noticeID = requestID
+            noticeText = text
+            cancelNotice = onCancel
+        }
+        func hideTransferNotice() {
+            noticeID = nil
+            noticeText = nil
+            cancelNotice = nil
+        }
         func cancel(requestID: UInt64) {}
         func detachLanding() {}
-        func detachToast() {}
+        func detachToast() { holdingResult = false }
     }
     final class Menu { func nudge() {} }
     final class Removals { func removeItem(at: URL) throws {} }
@@ -175,7 +189,8 @@ enum CaptureProgressPolicy { static let noticeDelay = 2.0 }
     }
     func refreshMenuStatus() {}
     func writeLastRun() {}
-    func updateTransferNotice() {}
+    var cancellationCount = 0
+    func cancelCurrent() { cancellationCount += 1 }
     var targetlessFinishes = 0
     final class Interaction {
         var isObserving = false

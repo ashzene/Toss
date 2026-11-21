@@ -104,7 +104,7 @@ final class IPhoneShortcutImport {
     }
 
     func open(_ file: URL, setup: String, isCurrent: @escaping () -> Bool,
-              onAdded: @escaping () -> Void, onFailure: @escaping () -> Void) {
+              onFailure: @escaping () -> Void) {
         cancel()
         let application = URL(fileURLWithPath: "/System/Applications/Shortcuts.app", isDirectory: true)
         autofill = Task {
@@ -120,7 +120,7 @@ final class IPhoneShortcutImport {
                    Self.setupMatches(setup, field: field) {
                     iPhoneShortcutLog.notice("Resumed the open iPhone shortcut setup in Shortcuts.")
                     await Self.authorizeAfterAdding(to: existingIDs, shortcuts: running, window: window,
-                                                   isCurrent: isCurrent, onAdded: onAdded)
+                                                   isCurrent: isCurrent)
                     return
                 }
             }
@@ -150,7 +150,7 @@ final class IPhoneShortcutImport {
                         if Self.fillSetup(setup, field: control) {
                             if let existingIDs {
                                 await Self.authorizeAfterAdding(to: existingIDs, shortcuts: shortcuts, window: window,
-                                                               isCurrent: isCurrent, onAdded: onAdded)
+                                                               isCurrent: isCurrent)
                             }
                             return
                         }
@@ -162,7 +162,7 @@ final class IPhoneShortcutImport {
     }
 
     private static func authorizeAfterAdding(to existingIDs: Set<UUID>, shortcuts: NSRunningApplication, window: AXUIElement,
-                                             isCurrent: () -> Bool, onAdded: () -> Void) async {
+                                             isCurrent: () -> Bool) async {
         let ax = AXUIElementCreateApplication(shortcuts.processIdentifier)
         AXUIElementSetMessagingTimeout(ax, 0.25)
         var libraryDeadline: ContinuousClock.Instant?
@@ -180,7 +180,6 @@ final class IPhoneShortcutImport {
                     let added = ids.subtracting(existingIDs)
                     if !added.isEmpty {
                         guard added.count == 1, let id = added.first else { return }
-                        onAdded()
                         requestAuthorization(for: id)
                         return
                     }
@@ -337,9 +336,11 @@ struct IPhoneShortcutHandshake {
     static let challengePath = "/toss/iphone/challenge"
     static let authorizationSuffix = "/authorize"
     static let authorizationPath = challengePath + authorizationSuffix
+    static let pairingPath = challengePath + "/pair"
+    static let pairingCompletePath = pairingPath + "/complete"
     static let capturePath = "/toss/iphone/capture/"
     private static let lifetime: TimeInterval = 25
-    enum Purpose: Equatable { case capture, authorization }
+    enum Purpose: Equatable { case capture, authorization, pairing, pairingComplete }
     private struct Challenge {
         let expiresAt: TimeInterval
         let purpose: Purpose
@@ -366,7 +367,7 @@ struct IPhoneShortcutHandshake {
         return nonce
     }
 
-    mutating func authorize(path: String, at now: TimeInterval) -> Purpose? {
+    mutating func authorize(path: String, at now: TimeInterval, onMismatch: () -> Void = {}) -> Purpose? {
         guard path.hasPrefix(Self.capturePath) else { return nil }
         let parts = path.dropFirst(Self.capturePath.count).split(separator: "/", omittingEmptySubsequences: false)
         guard parts.count == 2, parts[0].utf8.count == 36, parts[1].utf8.count == 64 else {
@@ -393,6 +394,7 @@ struct IPhoneShortcutHandshake {
         // Both spellings still cover the same single-use challenge and the full pairing secret.
         guard min(difference(for: message), difference(for: message + "\n")) == 0 else {
             iPhoneShortcutLog.notice("Capture proof did not match the current pairing.")
+            onMismatch()
             return nil
         }
         challenges.removeValue(forKey: String(parts[0]))
@@ -413,6 +415,9 @@ final class IPhoneShortcutReceiver {
     private var handshake: IPhoneShortcutHandshake?
     private var connections: [UUID: NWConnection] = [:]
     private var trigger: (() -> Admission)?
+    private var onLocalAuthorization: (() -> Void)?
+    private var onProofMismatch: (() -> Void)?
+    private var onRemoteVerified: (() -> Void)?
     private static let headerEnd = Data([13, 10, 13, 10])
     private static let headerLimit = 4_096
 
@@ -420,17 +425,22 @@ final class IPhoneShortcutReceiver {
         self.port = port
     }
 
-    func start(secret: String, onFailure: @escaping () -> Void, trigger: @escaping () -> Admission) throws {
+    func start(secret: String, onFailure: @escaping () -> Void, onLocalAuthorization: @escaping () -> Void = {},
+               onProofMismatch: @escaping () -> Void = {},
+               onRemoteVerified: @escaping () -> Void = {}, trigger: @escaping () -> Admission) throws {
+        let reuseListener = self.secret == secret && listener != nil
+        if !reuseListener { stop() }
         self.trigger = trigger
-        if self.secret == secret, listener != nil { return }
-        stop()
+        self.onLocalAuthorization = onLocalAuthorization
+        self.onProofMismatch = onProofMismatch
+        self.onRemoteVerified = onRemoteVerified
+        if reuseListener { return }
         let parameters = NWParameters.tcp
         parameters.acceptLocalOnly = true
         let listener = try NWListener(using: parameters, on: port)
         self.listener = listener
         self.secret = secret
         self.handshake = IPhoneShortcutHandshake(secret: secret)
-        self.trigger = trigger
         listener.stateUpdateHandler = { [weak self, weak listener] state in
             Task { @MainActor in
                 guard let self, let listener, self.listener === listener else { return }
@@ -457,6 +467,38 @@ final class IPhoneShortcutReceiver {
         secret = nil
         handshake = nil
         trigger = nil
+        onLocalAuthorization = nil
+        onProofMismatch = nil
+        onRemoteVerified = nil
+    }
+
+    // Running the imported copy on the Mac also connects to the Mac's .local address.
+    // Only an identifiable peer outside this host can confirm the phone installation.
+    nonisolated static func isRemotePeer(_ host: NWEndpoint.Host) -> Bool {
+        func bytes(_ host: NWEndpoint.Host) -> Data? {
+            switch host {
+            case .ipv4(let address): return address.isLoopback ? nil : address.rawValue
+            case .ipv6(let address):
+                if let v4 = address.asIPv4 { return v4.isLoopback ? nil : v4.rawValue }
+                return address.isLoopback ? nil : address.rawValue
+            default: return nil
+            }
+        }
+        guard let peer = bytes(host) else { return false }
+        var first: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&first) == 0, let first else { return false }
+        defer { freeifaddrs(first) }
+        var entry: UnsafeMutablePointer<ifaddrs>? = first
+        while let current = entry {
+            entry = current.pointee.ifa_next
+            guard let addr = current.pointee.ifa_addr,
+                  addr.pointee.sa_family == AF_INET || addr.pointee.sa_family == AF_INET6 else { continue }
+            var name = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(addr, socklen_t(addr.pointee.sa_len), &name, socklen_t(name.count), nil, 0, NI_NUMERICHOST) == 0
+            else { return false }
+            if bytes(NWEndpoint.Host(String(cString: name))) == peer { return false }
+        }
+        return true
     }
 
     private func begin(_ connection: NWConnection) {
@@ -503,16 +545,43 @@ final class IPhoneShortcutReceiver {
         }
         let now = ProcessInfo.processInfo.systemUptime
         let path = String(fields[1])
-        if fields[0] == "GET", path == IPhoneShortcutHandshake.challengePath || path == IPhoneShortcutHandshake.authorizationPath {
-            let purpose: IPhoneShortcutHandshake.Purpose = path == IPhoneShortcutHandshake.authorizationPath ? .authorization : .capture
+        if fields[0] == "GET" {
+            let purpose: IPhoneShortcutHandshake.Purpose
+            switch path {
+            case IPhoneShortcutHandshake.challengePath: purpose = .capture
+            case IPhoneShortcutHandshake.authorizationPath: purpose = .authorization
+            case IPhoneShortcutHandshake.pairingPath: purpose = .pairing
+            case IPhoneShortcutHandshake.pairingCompletePath: purpose = .pairingComplete
+            default: respond(id, status: "404 Not Found"); return
+            }
             if let challenge = handshake?.challenge(at: now, purpose: purpose) { respond(id, status: "200 OK", body: challenge) }
             else { respond(id, status: "429 Too Many Requests") }
         } else if fields[0] == "POST", path.hasPrefix(IPhoneShortcutHandshake.capturePath) {
-            guard let purpose = handshake?.authorize(path: path, at: now), let trigger else {
-                respond(id, status: "403 Forbidden")
+            let remote: Bool
+            if case .hostPort(let host, _) = connections[id]?.endpoint {
+                remote = Self.isRemotePeer(host)
+            } else { remote = false }
+            var mismatch = false
+            guard let purpose = handshake?.authorize(path: path, at: now, onMismatch: { mismatch = true }), let trigger else {
+                respond(id, status: "403 Forbidden", body: mismatch ? "TOSS_PAIRING_REQUIRED" : "")
+                if remote && mismatch { onProofMismatch?() }
+                return
+            }
+            if purpose == .pairing {
+                // The phone still has to save the configuration and prove it can read it back.
+                respond(id, status: "200 OK", body: "TOSS_PAIRED")
+                return
+            }
+            if remote {
+                iPhoneShortcutLog.notice("Remote shortcut verified with the current pairing.")
+                onRemoteVerified?()
+            }
+            if purpose == .pairingComplete {
+                respond(id, status: "200 OK", body: "TOSS_SETUP_COMPLETE")
                 return
             }
             if purpose == .authorization {
+                if !remote { onLocalAuthorization?() }
                 iPhoneShortcutLog.notice("First-run authorization check succeeded.")
                 respond(id, status: "204 No Content")
                 return

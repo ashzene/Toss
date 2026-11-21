@@ -16,6 +16,67 @@ struct DeviceCaptureAdapterTests {
         return f
     }
     static func main() async throws {
+        for source in [DeviceCapturePipeline.Source.macKeyboard, .iPhoneShortcut] {
+            let f = fixture()
+            let now = ProcessInfo.processInfo.systemUptime
+            let device: DeviceClass = source == .macKeyboard ? .iPad : .iPhone
+            f.captureAnimation.holdingResult = true
+            var checkedBeforeCapture = false
+            f.captureWorkers[device]!.onCaptureStart = { [weak f] _ in
+                guard let f, let press = f.capturePipeline.press(at: now) else { preconditionFailure("press missing") }
+                check(f.captureAnimation.noticeID == String(press.id), "accepted \(source.rawValue) press has a notice before the worker starts")
+                check(f.captureAnimation.noticeText == TransferNotice.text(received: 0, expected: 0, queued: 0),
+                      "immediate notice does not promise a percentage before bytes arrive")
+                checkedBeforeCapture = true
+            }
+            if source == .macKeyboard {
+                f.selectCapture(.options, at: now)
+            } else {
+                check(f.admitCapture(.options, at: now, deviceClass: device, source: source), "phone press admitted")
+            }
+            check(checkedBeforeCapture, "checked synchronous notice at worker entry")
+            let press = f.capturePipeline.press(at: now)!
+            let uuid = f.captureWorkers[device]!.pending!.id
+            f.pipelineProgress[uuid] = (received: 2, expected: 5)
+            f.updateTransferNotice()
+            check(f.captureAnimation.noticeID == String(press.id) &&
+                      f.captureAnimation.noticeText == TransferNotice.text(received: 2, expected: 5, queued: 0),
+                  "the first progress event updates the original notice without a slow-transfer event")
+        }
+        do {
+            let f = fixture()
+            check(!f.admitCapture(.options, at: .nan, deviceClass: .iPhone, source: .iPhoneShortcut),
+                  "an invalid phone capture is rejected before starting a worker")
+            check(f.captureWorkers[.iPhone]!.starts.isEmpty && f.captureAnimation.noticeID == nil &&
+                      f.captureAnimation.cancelNotice == nil, "a rejected press cannot leave an active transfer notice")
+        }
+        do {
+            let f = fixture()
+            let now = ProcessInfo.processInfo.systemUptime
+            f.admitCapture(.options, at: now, deviceClass: .iPhone, source: .iPhoneShortcut)
+            let first = f.capturePipeline.press(at: now)!
+            let cancelFirst = f.captureAnimation.cancelNotice!
+            f.admitCapture(.options, at: now + 0.1, deviceClass: .iPhone, source: .iPhoneShortcut)
+            let second = f.capturePipeline.press(at: now + 0.1)!
+            check(f.captureAnimation.noticeID == String(first.id) &&
+                      f.captureAnimation.noticeText == TransferNotice.text(received: 0, expected: 0, queued: 1),
+                  "a queued press immediately updates the count and keeps the first press visible")
+            f.captureWorkers[.iPhone]!.finish()
+            f.handle(f.core.observe(ModifierSnapshot(), at: ProcessInfo.processInfo.systemUptime, allowNewCapture: false))
+            try await settle()
+            check(f.captureAnimation.noticeID == String(second.id), "queue hands the notice to the next press")
+            cancelFirst()
+            check(f.cancellationCount == 0, "a retired notice cannot cancel the next press")
+            let cancelSecond = f.captureAnimation.cancelNotice!
+            cancelSecond()
+            check(f.cancellationCount == 1, "the current notice can cancel the displayed press")
+            f.captureWorkers[.iPhone]!.finish()
+            f.handle(f.core.observe(ModifierSnapshot(), at: ProcessInfo.processInfo.systemUptime, allowNewCapture: false))
+            try await settle()
+            cancelSecond()
+            check(f.captureAnimation.noticeID == nil && f.cancellationCount == 1,
+                  "the last press retires its notice and the retained click is inert")
+        }
         // Reproduces the reported cycle with actual startCapture/locateAfterActivation:
         // a visible composer has no current-chat marker until it is focused.
         do {

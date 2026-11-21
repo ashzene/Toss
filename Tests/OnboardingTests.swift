@@ -539,6 +539,11 @@ struct OnboardingTests {
         if !app.isEmpty {
             check(app.contains("let result = onboarding?.isVisible == true ? nil : result"))
             check(app.contains("result.code == \"ready\" || (result.code == \"wifi_unreachable\" && hasPairing)"))
+            // A re-pair must resume saved shortcuts directly, even if the chat app stays in front.
+            let finish = app.range(of: "private func setupFinished(")!
+            let finishEnd = app.range(of: "\n    }", range: finish.upperBound..<app.endIndex)!
+            let callback = app[finish.upperBound..<finishEnd.lowerBound]
+            check(callback.contains("restoreIfPossible()") && callback.contains("autoEnableIfFirstRun()"))
             check(app.contains("onboarding?.setupCode(result.code, final: true"))
             check(app.contains("self.onboarding?.tossed()"))
             check(app.contains("if !hasPairing { showOnboarding(); return }"))
@@ -546,7 +551,8 @@ struct OnboardingTests {
             check(app.contains("if openSetupIfNeeded() { return true }"))
             check(app.contains("self.onboarding?.setupCode(\"setup_unavailable\", final: true"))
             check(app.contains("if setupWizard.isRunning, permissionsReady, controller.flow.step"))
-            check(app.contains("else if onboarding?.isVisible != true { lastPermissionStep"))
+            check(callback.contains("else if onboarding?.isVisible != true")
+                  && callback.contains("lastPermissionStep = \"accessibility\""))
             check(app.contains("currentConnection.transport != \"wifi\""))
             check(app.contains("for key in [OnboardingPolicy.seenKey, OnboardingPolicy.wirelessKey, OnboardingPolicy.resumeAccessKey,"))
             check(app.contains("guard output == \"ax=true post=true\", onboarding?.isVisible == true, !permissionsReady"))
@@ -590,6 +596,34 @@ struct OnboardingTests {
 
         // The delayed footer is one grey line and does not move any of the four steps.
         func views(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(views) }
+
+        // The Try It window gives instructions only while a shortcut can actually run.
+        do {
+            let controller = OnboardingController(language: .english)
+            controller.jump(to: .tryIt)
+            let content = controller.window.contentView!
+            func showsKeycaps() -> Bool { views(content).contains { $0 is SettingsKeycap } }
+            func showsText(_ text: String) -> Bool {
+                views(content).compactMap { $0 as? NSTextField }.contains { $0.stringValue == text }
+            }
+            let prompt = "Waiting for a shortcut…"
+            let instructions = controller.copy.why(.tryIt)
+            check(!showsKeycaps() && !showsText(instructions) && !showsText(prompt) && controller.flow.skippable)
+            let unavailableStates: [(OnboardingTryItReadiness, String)] = [
+                (.preparing, "Turning on…"),
+                (.waitingForChat, "Waiting for ChatGPT / Codex or Claude to open."),
+                (.shortcutsOff, "Off · Shortcuts are paused"),
+                (.unavailable, "Not ready"),
+                (.deviceUnavailable, "Not ready for screenshots. Toss will retry.")
+            ]
+            for (state, message) in unavailableStates {
+                controller.setTryItReadiness(.ready)
+                check(showsKeycaps() && showsText(instructions) && showsText(prompt))
+                controller.setTryItReadiness(state)
+                check(!showsKeycaps() && !showsText(instructions) && !showsText(prompt) && controller.flow.skippable)
+                check(showsText(message))
+            }
+        }
         for device in ["iPad", "iPhone"] {
         DeviceCopy.deviceClass = device
         for language in [OnboardingLanguage.chinese, .english] + AppLanguage.allCases.filter({ ![.system, .chinese, .english].contains($0) }).map({ OnboardingLanguage.other($0) }) {

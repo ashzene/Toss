@@ -12,6 +12,10 @@ enum OnboardingStep: Int, CaseIterable {
 
 enum OnboardingMark: Equatable { case none, wait, ok, fail }
 
+enum OnboardingTryItReadiness: Equatable {
+    case preparing, waitingForChat, shortcutsOff, unavailable, deviceUnavailable, ready
+}
+
 // Whether Toss's menu-bar icon can be seen (Ashley 2026-10-30: 「顶上没有 toss」). macOS 26 has no API to
 // turn on an app's own "Allow in the Menu Bar" switch, so Toss detects it and walks the user to it.
 enum MenuIconVisibility: Equatable { case visible, hidden, notch }
@@ -56,6 +60,8 @@ struct OnboardingFlow: Equatable {
     var developerModeNeededSince: Double?
     var trustSince: Double?      // first trust_needed, for the replug hint after 30 s
     var tossed = false
+    var tryItReadiness: OnboardingTryItReadiness = .preparing
+    var showsShortcutRows: Bool { step == .done || (step == .tryIt && tryItReadiness == .ready) }
     var menuIcon: MenuIconVisibility = .visible
     var includesMenuBar = false      // the menu-bar step is part of this run (sticky once shown)
     var menuBarRequested = false     // System Settings was opened at Menu Bar
@@ -352,8 +358,18 @@ struct OnboardingCopy {
                                  t("菜单栏图标太多，放不下了。", "The menu bar is too full to show it."))
             case .hidden: return (.wait, t("正在等你打开 Toss 的开关…", "Waiting for you to switch Toss on…"), nil)
             }
-        case .tryIt: return mark == .ok ? (.ok, t("截图已经贴进输入框 ✓", "The screenshot is in the message box ✓"), nil)
-                                        : (.wait, t("正在等你按快捷键…", "Waiting for a shortcut…"), nil)
+        case .tryIt:
+            if mark == .ok { return (.ok, t("截图已经贴进输入框 ✓", "The screenshot is in the message box ✓"), nil) }
+            switch flow.tryItReadiness {
+            case .preparing: return (.wait, t("正在准备 Toss…", "Turning on…"), nil)
+            case .waitingForChat: return (.wait, t("等 ChatGPT / Codex 或 Claude 打开。", "Waiting for ChatGPT / Codex or Claude to open."), nil)
+            case .shortcutsOff: return (.wait, t("已关闭 · 快捷键暂停", "Off · Shortcuts are paused"), nil)
+            case .unavailable:
+                return (.fail, t("还没准备好", "Not ready"),
+                        t("自动恢复没准备好。在设置里检查配对和权限。", "Auto-resume is not ready. Check pairing and permissions in Settings."))
+            case .deviceUnavailable: return (.wait, t("截图还没准备好，Toss 会重试。", "Not ready for screenshots. Toss will retry."), nil)
+            case .ready: return (.wait, t("正在等你按快捷键…", "Waiting for a shortcut…"), nil)
+            }
         default: break
         }
         if mark == .ok {
@@ -500,6 +516,11 @@ final class OnboardingController: NSObject, NSWindowDelegate {
                      deviceClass: deviceClass, osVersion: osVersion, at: now()); render(); scheduleAdvance()
     }
     func setDeviceClass(_ value: DeviceClass?) { flow.setDeviceClass(value); render() }
+    func setTryItReadiness(_ value: OnboardingTryItReadiness) {
+        guard flow.tryItReadiness != value else { return }
+        flow.tryItReadiness = value
+        if flow.step == .tryIt { render() }
+    }
     // "USB" or "Wi-Fi" for the done step's iPad row, from the live connection.
     private(set) var transport: String?
     func setTransport(_ label: String?) { guard transport != label else { return }; transport = label; shown = nil; render() }
@@ -639,9 +660,10 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         flow.updateTime(at: t)
         // Rebuild only when something visible changed, so the pulsing dot and the activity bar keep running.
         let (mark, text, sub) = copy.status(flow, at: t)
+        let why = flow.step == .tryIt && !flow.showsShortcutRows ? "" : copy.why(flow.step)
         let developerHint = flow.showsDeveloperModeHint(at: t) ? copy.developerModeHint : ""
         let cancellable = flow.showsCancel(setupRunning: setupRunningProbe?() == true, at: t)
-        let signature = "\(developerHint) \(flow.step) \(mark) \(text) \(sub ?? "") \(copy.primary(flow, at: t)) \(flow.showsPrimary(at: t)) \(flow.skippable) \(cancellable) \(transport ?? "")"
+        let signature = "\(developerHint) \(flow.step) \(why) \(mark) \(text) \(sub ?? "") \(copy.primary(flow, at: t)) \(flow.showsPrimary(at: t)) \(flow.skippable) \(cancellable) \(transport ?? "")"
         guard signature != shown else { return }
         shown = signature
         let inner = SettingsStyle.width - 2 * SettingsStyle.margin
@@ -655,7 +677,6 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         stack.addArrangedSubview(segments)
         stack.addArrangedSubview(gap(26))
         stack.addArrangedSubview(label(copy.title(flow.step), SettingsStyle.serif(26), SettingsStyle.ink, width: inner))
-        let why = copy.why(flow.step)
         if !why.isEmpty { stack.addArrangedSubview(gap(10)); stack.addArrangedSubview(label(why, SettingsStyle.sans(14), SettingsStyle.muted, width: inner)) }
         let steps = copy.howto(flow.step)
         if !steps.isEmpty {
@@ -680,7 +701,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
             bar.heightAnchor.constraint(equalToConstant: 2).isActive = true
             stack.addArrangedSubview(gap(18)); stack.addArrangedSubview(bar); bar.animating = true
         }
-        if flow.step == .tryIt || flow.step == .done {
+        if flow.showsShortcutRows {
             stack.addArrangedSubview(gap(22)); stack.addArrangedSubview(hairline(inner))
             func keys(_ symbol: String) -> NSView {
                 let plus = label("+", SettingsStyle.sans(12), SettingsStyle.muted)

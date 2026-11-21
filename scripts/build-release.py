@@ -20,7 +20,7 @@ import sys
 import tempfile
 import time
 
-VERSION, BUILD = "1.0.8", "122"
+VERSION, BUILD = "1.1.0", "129"
 DEFAULT_IDENTITY = "Toss Local Signing"
 
 project = Path(__file__).resolve().parent.parent
@@ -31,7 +31,18 @@ parser.add_argument("--identity", default=os.environ.get("TOSS_SIGN_IDENTITY"),
                     help="code-signing identity; default: the stable local one if present, else ad-hoc")
 parser.add_argument("--dmg", action="store_true", help="also create the disk image next to the app")
 parser.add_argument("--zip", action="store_true", help=f"also create Toss {VERSION} Nightly for iPhone+iPad.app.zip next to the app")
+parser.add_argument("--trial-summary", help="build a DMG and sync it to the local Toss Version Manager with this summary")
+parser.add_argument("--trial-change", action="append", default=[], help="add a line to the local trial version notes (repeatable)")
 args = parser.parse_args()
+publish_trial = args.trial_summary is not None
+if publish_trial:
+    if not args.trial_summary.strip() or any(not change.strip() for change in args.trial_change):
+        parser.error("the trial summary and changes must contain text")
+    trial_publisher = project.parents[1] / "Toss 版本管理器" / "publish-trial.py"
+    if not trial_publisher.is_file():
+        parser.error("the trial build must be made from the 2opt workspace with Toss Version Manager")
+elif args.trial_change:
+    parser.error("--trial-change requires --trial-summary")
 if args.identity is None:
     found = subprocess.run(["/usr/bin/security", "find-identity", "-p", "codesigning"],
                            capture_output=True, text=True).stdout
@@ -82,7 +93,8 @@ with tempfile.TemporaryDirectory() as partial:
 subprocess.run(["/usr/bin/iconutil", "-c", "icns", str(project / "Assets/Toss.iconset"),
                 "-o", str(resources / "Toss.icns")], check=True)
 (app / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
-shutil.copyfile(project / "Assets/Toss iPhone.shortcut", resources / "Toss iPhone.shortcut")
+for name in ("Toss iPhone.shortcut", "Toss iPhone Phone Setup.shortcut"):
+    shutil.copyfile(project / "Assets" / name, resources / name)
 ignore = shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store", "tests")
 shutil.copytree(project / "Backend", resources / "Backend", ignore=ignore)
 # ditto keeps the runtime's symlinks and precompiled bytecode intact.
@@ -141,7 +153,7 @@ print("Built and signature-verified. App was NOT launched: " + str(app))
 subprocess.run(["/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
                 "-u", str(app)], check=False, stderr=subprocess.DEVNULL)
 
-if args.dmg:
+if args.dmg or publish_trial:
     subprocess.run([sys.executable, str(project / "scripts/package-installer.py"),
                     "--payload", str(app), "--output", str(out), "--identity", args.identity], check=True)
 
@@ -155,3 +167,7 @@ if args.zip:
     subprocess.run(["/usr/bin/ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(app), str(archive)], check=True)
     digest = subprocess.run(["/usr/bin/shasum", "-a", "256", str(archive)], capture_output=True, text=True, check=True)
     print("Zip: " + str(archive) + "\n" + digest.stdout.strip())
+
+if publish_trial:
+    subprocess.run([sys.executable, str(trial_publisher), "--project", str(project), "--output", str(out),
+                    f"--summary={args.trial_summary}", *[f"--change={change}" for change in args.trial_change]], check=True)
